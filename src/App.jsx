@@ -394,18 +394,23 @@ export default function SlotDataTracker() {
 
   const machineSummaries = useMemo(() => {
     return selectedMachines.map((no) => {
-      let totalSada = 0;
       let dataCount = 0;
+      let cum = 0;
+      let started = false;
       const series = [];
       visibleTimelineDates.forEach((date) => {
         const entry = historyByDate[date];
         const m = entry ? entry.machines.find((mm) => mm.no === no) : null;
         if (m && m.sada !== null) {
-          totalSada += m.sada;
+          cum += m.sada;
+          started = true;
           dataCount += 1;
         }
-        series.push({ date, value: m ? m.sada : null });
+        // carry the running total forward on days with no data, instead of
+        // breaking the line, so it always ends exactly at the total shown
+        series.push({ date, value: started ? cum : null });
       });
+      const totalSada = cum;
       const seriesDates = new Set(series.map((s) => s.date));
       const strongInSeries = strongEvents.filter((se) => seriesDates.has(se.date));
       const closedInSeries = closedDays.filter((c) => seriesDates.has(c.date));
