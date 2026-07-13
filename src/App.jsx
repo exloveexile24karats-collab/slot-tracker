@@ -24,6 +24,7 @@ import {
   Star,
   ChevronDown,
   ChevronRight,
+  Lock,
 } from "lucide-react";
 import { storage } from "./storage";
 
@@ -209,6 +210,15 @@ export default function SlotDataTracker() {
   const [customEnd, setCustomEnd] = useState("");
   const [luckyDigit, setLuckyDigit] = useState(null);
   const [analysisWindow, setAnalysisWindow] = useState(10);
+
+  // ---- PIN lock for the data-entry panels (session-only, never persisted) ----
+  const UNLOCK_PIN = "5246";
+  const [unlocked, setUnlocked] = useState(false);
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState(false);
+
+  // ---- day-detail viewer ----
+  const [viewDate, setViewDate] = useState(todayStr());
 
   // ---- load pages + global registries on mount ----
   useEffect(() => {
@@ -630,6 +640,22 @@ export default function SlotDataTracker() {
     persistClosedDays(closedDays.filter((c) => c.date !== date));
   }
 
+  function handleUnlock() {
+    if (pinInput.trim() === UNLOCK_PIN) {
+      setUnlocked(true);
+      setPinInput("");
+      setPinError(false);
+    } else {
+      setPinError(true);
+    }
+  }
+
+  const viewDateMachines = useMemo(() => {
+    const entry = historyByDate[viewDate];
+    if (!entry) return null;
+    return [...entry.machines].sort((a, b) => (b.sada ?? -Infinity) - (a.sada ?? -Infinity));
+  }, [historyByDate, viewDate]);
+
   function renderThresholdResult(result, label) {
     if (!result) {
       return (
@@ -791,6 +817,8 @@ export default function SlotDataTracker() {
       >
         {/* LEFT: input panel */}
         <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+          {unlocked ? (
+          <>
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "12px", color: "#c7cbd4" }}>
               データ入力
@@ -1081,6 +1109,54 @@ export default function SlotDataTracker() {
               )}
             </div>
           </div>
+
+          <button
+            onClick={() => { setUnlocked(false); setPinInput(""); setPinError(false); }}
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
+              width: "100%", background: "transparent", border: "1px solid #2a323f", borderRadius: "8px",
+              padding: "8px", color: "#5a6272", fontSize: "12px", cursor: "pointer",
+            }}
+          >
+            <Lock size={12} /> データ入力をロックする
+          </button>
+          </>
+          ) : (
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
+              <Lock size={14} /> データ入力はロック中です
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+              暗証番号を入力すると、データ入力・強いイベント・店休日を編集できます。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
+            </div>
+            <div style={{ display: "flex", gap: "8px" }}>
+              <input
+                type="password"
+                inputMode="numeric"
+                value={pinInput}
+                onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
+                onKeyDown={(e) => { if (e.key === "Enter") handleUnlock(); }}
+                placeholder="暗証番号"
+                style={{
+                  flex: 1, background: "#12161d", border: "1px solid " + (pinError ? "#e5697a" : "#2a323f"),
+                  borderRadius: "6px", padding: "8px", color: "#e7e9ee", fontSize: "13px",
+                }}
+              />
+              <button
+                onClick={handleUnlock}
+                style={{
+                  background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
+                  padding: "0 16px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
+                }}
+              >
+                解除
+              </button>
+            </div>
+            {pinError && (
+              <div style={{ marginTop: "8px", fontSize: "11px", color: "#e5697a" }}>暗証番号が違います。</div>
+            )}
+          </div>
+          )}
         </div>
 
         {/* RIGHT: chart + summary */}
@@ -1221,6 +1297,46 @@ export default function SlotDataTracker() {
                 );
               })}
             </div>
+          </div>
+
+          {/* day-detail viewer: pick one date, see every machine's 差枚 that day */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "10px" }}>
+              日別データを見る
+            </div>
+            <input
+              type="date"
+              value={viewDate}
+              onChange={(e) => setViewDate(e.target.value)}
+              style={{
+                background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", marginBottom: "12px",
+              }}
+            />
+            {viewDateMachines === null ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>この日のデータはまだありません。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "300px", overflowY: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+                  <thead>
+                    <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>台番</th>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>差枚</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {viewDateMachines.map((m) => (
+                      <tr key={m.no} style={{ borderTop: "1px solid #232b37" }}>
+                        <td className="mono" style={{ padding: "6px 8px", color: "#c7cbd4" }}>{m.no}</td>
+                        <td className="mono" style={{ padding: "6px 8px", color: m.sada >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+                          {m.sada === null ? "―" : (m.sada >= 0 ? "+" : "") + fmtNum(m.sada) + "枚"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
 
           {/* site777-style mini chart cards, one per machine */}
