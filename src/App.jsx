@@ -47,7 +47,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "1.5";
+const APP_VERSION = "1.6";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -734,7 +734,7 @@ export default function SlotDataTracker() {
       msg: `${entryDate} のデータを保存しました（${parsedMachines.length}台分）。`,
     });
     setPasteText("");
-    const nextDate = addDays(entryDate, 1);
+    const nextDate = addDays(entryDate, -1);
     setEntryDate(nextDate);
     setEntryEvent(dateEventMap[nextDate] || "");
   }
