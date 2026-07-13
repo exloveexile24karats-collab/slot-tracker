@@ -40,6 +40,8 @@ const PALETTE = [
 ];
 
 const STRONG_COLORS = ["#e5484d", "#f2a541", "#4fd1c5", "#7aa2f7", "#bb9af7", "#9ece6a"];
+const DIGIT2_COLOR = "#7dcfff";
+const DIGIT7_COLOR = "#f6a04d";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -114,6 +116,52 @@ function fmtNum(v) {
   return v.toLocaleString();
 }
 
+// Build (trailing N-day total, next day's differential) pairs from a
+// chronological series of {date, sada} for one machine.
+function buildTrailingPairs(series, windowSize) {
+  const pairs = [];
+  for (let k = windowSize - 1; k < series.length - 1; k++) {
+    let sum = 0;
+    for (let j = k - windowSize + 1; j <= k; j++) sum += series[j].sada;
+    const next = series[k + 1];
+    pairs.push({ trailingSum: sum, nextSada: next.sada, nextDate: next.date });
+  }
+  return pairs;
+}
+
+// Search candidate thresholds and find the "total >= T" and "total <= T"
+// splits that give the best next-day-positive win rate (with a minimum
+// sample size so it isn't just picking a fluke single data point).
+function findBestThresholds(pairs, minSample = 5) {
+  if (pairs.length < 8) return null;
+  const thresholds = Array.from(new Set(pairs.map((p) => p.trailingSum))).sort((a, b) => a - b);
+
+  let bestAbove = null;
+  let bestBelow = null;
+  thresholds.forEach((T) => {
+    const above = pairs.filter((p) => p.trailingSum >= T);
+    if (above.length >= minSample) {
+      const wins = above.filter((p) => p.nextSada > 0).length;
+      const winRate = wins / above.length;
+      const avgNext = above.reduce((a, p) => a + p.nextSada, 0) / above.length;
+      if (!bestAbove || winRate > bestAbove.winRate || (winRate === bestAbove.winRate && above.length > bestAbove.sampleSize)) {
+        bestAbove = { threshold: T, winRate, sampleSize: above.length, avgNext };
+      }
+    }
+    const below = pairs.filter((p) => p.trailingSum <= T);
+    if (below.length >= minSample) {
+      const wins = below.filter((p) => p.nextSada > 0).length;
+      const winRate = wins / below.length;
+      const avgNext = below.reduce((a, p) => a + p.nextSada, 0) / below.length;
+      if (!bestBelow || winRate > bestBelow.winRate || (winRate === bestBelow.winRate && below.length > bestBelow.sampleSize)) {
+        bestBelow = { threshold: T, winRate, sampleSize: below.length, avgNext };
+      }
+    }
+  });
+
+  return { totalPairs: pairs.length, bestAbove, bestBelow };
+}
+
 // On a categorical date axis, a single day has zero width, so widen it by
 // one neighboring day so the hatched band is actually visible.
 function getBandRange(dateList, date) {
@@ -160,6 +208,7 @@ export default function SlotDataTracker() {
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
   const [luckyDigit, setLuckyDigit] = useState(null);
+  const [analysisWindow, setAnalysisWindow] = useState(10);
 
   // ---- load pages + global registries on mount ----
   useEffect(() => {
@@ -382,6 +431,16 @@ export default function SlotDataTracker() {
     return closedDays.filter((c) => visibleDates.has(c.date));
   }, [closedDays, visibleTimelineDates]);
 
+  // "2のつく日" (2nd/12th/22nd) and "7のつく日" (7th/17th/27th) — auto-detected, no registration needed
+  const digit2DatesInView = useMemo(
+    () => visibleTimelineDates.filter((d) => parseInt(d.slice(-2), 10) % 10 === 2),
+    [visibleTimelineDates]
+  );
+  const digit7DatesInView = useMemo(
+    () => visibleTimelineDates.filter((d) => parseInt(d.slice(-2), 10) % 10 === 7),
+    [visibleTimelineDates]
+  );
+
   const strongDateSet = useMemo(() => new Set(strongEvents.map((s) => s.date)), [strongEvents]);
 
   // ordinary (non-strong) events, shown as a gold star marker
@@ -415,7 +474,9 @@ export default function SlotDataTracker() {
       const seriesDates = new Set(series.map((s) => s.date));
       const strongInSeries = strongEvents.filter((se) => seriesDates.has(se.date));
       const closedInSeries = closedDays.filter((c) => seriesDates.has(c.date));
-      return { no, totalSada, dataCount, series, strongInSeries, closedInSeries };
+      const digit2InSeries = series.map((s) => s.date).filter((d) => parseInt(d.slice(-2), 10) % 10 === 2);
+      const digit7InSeries = series.map((s) => s.date).filter((d) => parseInt(d.slice(-2), 10) % 10 === 7);
+      return { no, totalSada, dataCount, series, strongInSeries, closedInSeries, digit2InSeries, digit7InSeries };
     });
   }, [selectedMachines, visibleTimelineDates, historyByDate, strongEvents, closedDays]);
 
@@ -440,6 +501,28 @@ export default function SlotDataTracker() {
       .map(([no, v]) => ({ no: parseInt(no, 10), avg: v.sum / v.count, count: v.count }))
       .sort((a, b) => b.avg - a.avg);
   }, [luckyDigit, sortedHistory]);
+
+  // for each selected machine: does a big trailing-N-day total tend to predict
+  // whether the next day is positive? (both "total is high" and "total is low" directions)
+  const thresholdAnalyses = useMemo(() => {
+    return selectedMachines.map((no) => {
+      const series = sortedHistory
+        .map((h) => {
+          const m = h.machines.find((mm) => mm.no === no);
+          return m && m.sada !== null ? { date: h.date, sada: m.sada } : null;
+        })
+        .filter(Boolean);
+
+      const allPairs = buildTrailingPairs(series, analysisWindow);
+      const overall = findBestThresholds(allPairs);
+      const digit2Pairs = allPairs.filter((p) => parseInt(p.nextDate.slice(-2), 10) % 10 === 2);
+      const digit7Pairs = allPairs.filter((p) => parseInt(p.nextDate.slice(-2), 10) % 10 === 7);
+      const digit2 = findBestThresholds(digit2Pairs, 3);
+      const digit7 = findBestThresholds(digit7Pairs, 3);
+
+      return { no, overall, digit2, digit7 };
+    });
+  }, [selectedMachines, sortedHistory, analysisWindow]);
 
   function handleSave() {
     if (!activePageId) return;
@@ -545,6 +628,38 @@ export default function SlotDataTracker() {
 
   function handleRemoveClosedDay(date) {
     persistClosedDays(closedDays.filter((c) => c.date !== date));
+  }
+
+  function renderThresholdResult(result, label) {
+    if (!result) {
+      return (
+        <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "6px" }}>{label}：十分なデータがありません</div>
+      );
+    }
+    const { bestAbove, bestBelow } = result;
+    return (
+      <div style={{ marginBottom: "8px" }}>
+        <div style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "2px" }}>{label}</div>
+        {bestAbove ? (
+          <div style={{ fontSize: "12px", color: "#c7cbd4" }}>
+            総差枚が <span className="mono" style={{ color: "#e8b34c" }}>{bestAbove.threshold >= 0 ? "+" : ""}{fmtNum(Math.round(bestAbove.threshold))}枚</span> 以上 →
+            翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(bestAbove.winRate * 100)}%</span>
+            （{bestAbove.sampleSize}件中、平均{bestAbove.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(bestAbove.avgNext))}枚）
+          </div>
+        ) : (
+          <div style={{ fontSize: "11px", color: "#5a6272" }}>以上パターン：データ不足</div>
+        )}
+        {bestBelow ? (
+          <div style={{ fontSize: "12px", color: "#c7cbd4" }}>
+            総差枚が <span className="mono" style={{ color: "#e8b34c" }}>{bestBelow.threshold >= 0 ? "+" : ""}{fmtNum(Math.round(bestBelow.threshold))}枚</span> 以下 →
+            翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(bestBelow.winRate * 100)}%</span>
+            （{bestBelow.sampleSize}件中、平均{bestBelow.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(bestBelow.avgNext))}枚）
+          </div>
+        ) : (
+          <div style={{ fontSize: "11px", color: "#5a6272" }}>以下パターン：データ不足</div>
+        )}
+      </div>
+    );
   }
 
   if (!pagesLoaded) {
@@ -1048,6 +1163,14 @@ export default function SlotDataTracker() {
                         label={{ value: "休", position: "insideTop", fill: "#c7cbd4", fontSize: 10 }} />
                     );
                   })}
+                  {digit2DatesInView.map((d) => (
+                    <ReferenceLine key={"d2-" + d} x={d} stroke={DIGIT2_COLOR} strokeDasharray="2 2" strokeOpacity={0.55}
+                      label={{ value: "2", position: "top", fill: DIGIT2_COLOR, fontSize: 9 }} />
+                  ))}
+                  {digit7DatesInView.map((d) => (
+                    <ReferenceLine key={"d7-" + d} x={d} stroke={DIGIT7_COLOR} strokeDasharray="2 2" strokeOpacity={0.55}
+                      label={{ value: "7", position: "top", fill: DIGIT7_COLOR, fontSize: 9 }} />
+                  ))}
                   {strongDatesInView.map((se) => (
                     <ReferenceLine key={"strong-" + se.date} x={se.date} stroke={se.color || "#e5484d"} strokeDasharray="5 3" strokeWidth={2}
                       label={{ value: se.name, position: "top", fill: se.color || "#e5697a", fontSize: 10 }} />
@@ -1064,7 +1187,7 @@ export default function SlotDataTracker() {
               </ResponsiveContainer>
             )}
             <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "6px" }}>
-              単位：枚　★ = 通常イベント　点線 = 強いイベント　グレー帯 = 店休日
+              単位：枚　★ = 通常イベント　点線(色付き) = 強いイベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日
             </div>
           </div>
 
@@ -1125,6 +1248,12 @@ export default function SlotDataTracker() {
                             if (!band) return null;
                             return <ReferenceArea key={"m-closed-" + c.date} x1={band.x1} x2={band.x2} fill="#5a6272" fillOpacity={0.28} stroke="none" />;
                           })}
+                          {s.digit2InSeries.map((d) => (
+                            <ReferenceLine key={"m-d2-" + d} x={d} stroke={DIGIT2_COLOR} strokeDasharray="2 2" strokeOpacity={0.5} strokeWidth={1} />
+                          ))}
+                          {s.digit7InSeries.map((d) => (
+                            <ReferenceLine key={"m-d7-" + d} x={d} stroke={DIGIT7_COLOR} strokeDasharray="2 2" strokeOpacity={0.5} strokeWidth={1} />
+                          ))}
                           {s.strongInSeries.map((se) => (
                             <ReferenceLine key={"m-strong-" + se.date} x={se.date} stroke={se.color || "#e5484d"} strokeDasharray="4 2" strokeWidth={1.5} />
                           ))}
@@ -1191,6 +1320,45 @@ export default function SlotDataTracker() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+            )}
+          </div>
+
+          {/* trailing-window threshold analysis */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              総差枚しきい値分析（翌日プラスになりやすいライン）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              選んでいる台ごとに、直近N日間の総差枚が「いくら以上／以下」だと翌日プラスになりやすいかを、このページの全期間データから探します
+            </div>
+            <div style={{ display: "flex", gap: "6px", marginBottom: "12px" }}>
+              {[10, 20, 30].map((w) => (
+                <button key={w} onClick={() => setAnalysisWindow(w)} className="chip" style={{
+                  fontSize: "12px", padding: "6px 10px", borderRadius: "6px",
+                  border: "1px solid " + (analysisWindow === w ? "#4fd1c5" : "#2a323f"),
+                  background: analysisWindow === w ? "rgba(79,209,197,0.12)" : "transparent",
+                  color: analysisWindow === w ? "#4fd1c5" : "#c7cbd4",
+                }}>
+                  {w}日足
+                </button>
+              ))}
+            </div>
+
+            {thresholdAnalyses.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>台を選ぶと、ここに分析結果が表示されます。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "420px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "14px" }}>
+                {thresholdAnalyses.map((a) => (
+                  <div key={a.no} style={{ borderTop: "1px solid #232b37", paddingTop: "10px" }}>
+                    <div className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c", marginBottom: "6px" }}>
+                      {a.no}番
+                    </div>
+                    {renderThresholdResult(a.overall, "全日")}
+                    {renderThresholdResult(a.digit2, "翌日が2のつく日のみ")}
+                    {renderThresholdResult(a.digit7, "翌日が7のつく日のみ")}
+                  </div>
+                ))}
               </div>
             )}
           </div>
