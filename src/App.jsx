@@ -375,6 +375,17 @@ export default function SlotDataTracker() {
     }
   }, []);
 
+  // race-safe upsert: merges against the LATEST state (via the functional
+  // setState form) instead of a value captured in a stale closure, so
+  // saving several dates back-to-back can't silently drop earlier entries
+  const upsertDateEvent = useCallback((date, name) => {
+    setDateEventMap((prev) => {
+      const next = { ...prev, [date]: name };
+      storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch(() => {});
+      return next;
+    });
+  }, []);
+
   function rememberEventName(name) {
     const trimmed = (name || "").trim();
     if (!trimmed) return;
@@ -689,7 +700,7 @@ export default function SlotDataTracker() {
     persistPageHistory(activePageId, next);
     rememberEventName(trimmedEvent);
     if (trimmedEvent) {
-      persistDateEventMap({ ...dateEventMap, [entryDate]: trimmedEvent });
+      upsertDateEvent(entryDate, trimmedEvent);
     }
     setStatus({
       type: "ok",
