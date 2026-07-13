@@ -184,8 +184,7 @@ export default function SlotDataTracker() {
 
   // ---- global event registries ----
   const [eventNames, setEventNames] = useState([]);
-  const [strongEvents, setStrongEvents] = useState([]); // [{date,name,color}]
-  const [strongDate, setStrongDate] = useState(todayStr());
+  const [strongEvents, setStrongEvents] = useState([]); // [{name,color}] - matched by event NAME, not a specific date
   const [strongName, setStrongName] = useState("");
   const [strongColor, setStrongColor] = useState(STRONG_COLORS[0]);
   const [strongStatus, setStrongStatus] = useState(null);
@@ -253,7 +252,19 @@ export default function SlotDataTracker() {
       }
       try {
         const r3 = await storage.get(STRONG_EVENTS_KEY, false);
-        if (r3 && r3.value) setStrongEvents(JSON.parse(r3.value));
+        if (r3 && r3.value) {
+          const raw = JSON.parse(r3.value);
+          if (Array.isArray(raw)) {
+            // migrate old {date,name,color} records -> unique-by-name {name,color}
+            const byName = {};
+            raw.forEach((item) => {
+              const name = (item.name || "").trim();
+              if (!name) return;
+              if (!byName[name]) byName[name] = { name, color: item.color || STRONG_COLORS[0] };
+            });
+            setStrongEvents(Object.values(byName));
+          }
+        }
       } catch (e) {
         // none yet
       }
@@ -432,11 +443,28 @@ export default function SlotDataTracker() {
     });
   }, [visibleTimelineDates, historyByDate, closedDateSet, selectedMachines]);
 
+  const strongEventColorByName = useMemo(() => {
+    const map = {};
+    strongEvents.forEach((s) => {
+      map[s.name] = s.color;
+    });
+    return map;
+  }, [strongEvents]);
+
+  // every date in THIS page's history whose event name matches a registered
+  // strong-event name — so registering a name once flags every occurrence,
+  // past or future, without re-registering each date
+  const strongDatesInHistory = useMemo(() => {
+    return sortedHistory
+      .filter((h) => h.event && strongEventColorByName[h.event.trim()])
+      .map((h) => ({ date: h.date, name: h.event.trim(), color: strongEventColorByName[h.event.trim()] }));
+  }, [sortedHistory, strongEventColorByName]);
+
   // dates flagged as "strong" / "closed" that actually fall within the visible chart
   const strongDatesInView = useMemo(() => {
     const visibleDates = new Set(visibleTimelineDates);
-    return strongEvents.filter((se) => visibleDates.has(se.date));
-  }, [strongEvents, visibleTimelineDates]);
+    return strongDatesInHistory.filter((se) => visibleDates.has(se.date));
+  }, [strongDatesInHistory, visibleTimelineDates]);
 
   const closedDatesInView = useMemo(() => {
     const visibleDates = new Set(visibleTimelineDates);
@@ -453,7 +481,14 @@ export default function SlotDataTracker() {
     [visibleTimelineDates]
   );
 
-  const strongDateSet = useMemo(() => new Set(strongEvents.map((s) => s.date)), [strongEvents]);
+  const strongDateSet = useMemo(() => new Set(strongDatesInHistory.map((s) => s.date)), [strongDatesInHistory]);
+  const strongColorByDate = useMemo(() => {
+    const map = {};
+    strongDatesInHistory.forEach((s) => {
+      map[s.date] = s.color;
+    });
+    return map;
+  }, [strongDatesInHistory]);
 
   // ordinary (non-strong) events, shown as a gold star marker
   const eventDates = useMemo(
@@ -484,13 +519,13 @@ export default function SlotDataTracker() {
       });
       const totalSada = cum;
       const seriesDates = new Set(series.map((s) => s.date));
-      const strongInSeries = strongEvents.filter((se) => seriesDates.has(se.date));
+      const strongInSeries = strongDatesInHistory.filter((se) => seriesDates.has(se.date));
       const closedInSeries = closedDays.filter((c) => seriesDates.has(c.date));
       const digit2InSeries = series.map((s) => s.date).filter((d) => parseInt(d.slice(-2), 10) % 10 === 2);
       const digit7InSeries = series.map((s) => s.date).filter((d) => parseInt(d.slice(-2), 10) % 10 === 7);
       return { no, totalSada, dataCount, series, strongInSeries, closedInSeries, digit2InSeries, digit7InSeries };
     });
-  }, [selectedMachines, visibleTimelineDates, historyByDate, strongEvents, closedDays]);
+  }, [selectedMachines, visibleTimelineDates, historyByDate, strongDatesInHistory, closedDays]);
 
   // "○のつく日" (e.g. digit 2 → the 2nd/12th/22nd) average 差枚 per machine,
   // computed across this page's entire recorded history (not limited by range)
@@ -677,24 +712,23 @@ export default function SlotDataTracker() {
   }
 
   function handleAddStrongEvent() {
-    if (!strongDate) {
-      setStrongStatus({ type: "error", msg: "日付を入力してください。" });
+    const name = strongName.trim();
+    if (!name) {
+      setStrongStatus({ type: "error", msg: "イベント名を入力してください。" });
       return;
     }
-    const name = strongName.trim() || "重要日";
-    const next = [
-      ...strongEvents.filter((s) => s.date !== strongDate),
-      { date: strongDate, name, color: strongColor },
-    ];
+    const next = [...strongEvents.filter((s) => s.name !== name), { name, color: strongColor }];
     persistStrongEvents(next);
     rememberEventName(name);
-    setStrongStatus({ type: "ok", msg: `${strongDate} を強いイベントとして登録しました。` });
+    setStrongStatus({
+      type: "ok",
+      msg: `「${name}」を強いイベントとして登録しました。このイベント名が付いた日付は、過去・今後を問わず自動で強いイベント扱いになります。`,
+    });
     setStrongName("");
-    setStrongDate(addDays(strongDate, 1));
   }
 
-  function handleRemoveStrongEvent(date) {
-    persistStrongEvents(strongEvents.filter((s) => s.date !== date));
+  function handleRemoveStrongEvent(name) {
+    persistStrongEvents(strongEvents.filter((s) => s.name !== name));
   }
 
   function handleAddClosedDay() {
@@ -1001,8 +1035,8 @@ export default function SlotDataTracker() {
                     <div>
                       <span className="mono">{h.date}</span>
                       {strongDateSet.has(h.date) && (
-                        <span style={{ marginLeft: "6px", color: "#e5697a" }}>
-                          <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill="#e5697a" />
+                        <span style={{ marginLeft: "6px", color: strongColorByDate[h.date] || "#e5697a" }}>
+                          <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={strongColorByDate[h.date] || "#e5697a"} />
                         </span>
                       )}
                       {h.event && (
@@ -1059,25 +1093,16 @@ export default function SlotDataTracker() {
               強いイベント（全ページ共通）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              チェックした日付は、全ページのグラフに赤い帯で表示されます
+              イベント名を1度登録すれば、そのイベント名が付いた日付は過去・今後を問わず全ページのグラフに自動で表示されます（日付ごとの再登録は不要です）
             </div>
 
             <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
-              <input
-                type="date"
-                value={strongDate}
-                onChange={(e) => setStrongDate(e.target.value)}
-                style={{
-                  flex: "0 0 130px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
-                  padding: "7px 6px", color: "#e7e9ee", fontSize: "12px",
-                }}
-              />
               <input
                 type="text"
                 list={DATALIST_ID}
                 value={strongName}
                 onChange={(e) => setStrongName(e.target.value)}
-                placeholder="イベント名（任意）"
+                placeholder="イベント名（例：末尾7の日）"
                 style={{
                   flex: 1, background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
                   padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", minWidth: 0,
@@ -1114,17 +1139,16 @@ export default function SlotDataTracker() {
             )}
 
             <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
-              {[...strongEvents].sort((a, b) => b.date.localeCompare(a.date)).map((s) => (
-                <div key={s.date} style={{
+              {[...strongEvents].sort((a, b) => a.name.localeCompare(b.name)).map((s) => (
+                <div key={s.name} style={{
                   display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
                   background: "#12161d", border: "1px solid #2a2229", borderRadius: "6px", padding: "5px 8px",
                 }}>
                   <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
                     <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: s.color || "#e5484d", display: "inline-block" }} />
-                    <span className="mono" style={{ color: s.color || "#e5697a" }}>{s.date}</span>
                     <span style={{ color: "#c7cbd4" }}>{s.name}</span>
                   </span>
-                  <button onClick={() => handleRemoveStrongEvent(s.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                  <button onClick={() => handleRemoveStrongEvent(s.name)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
                     <Trash2 size={12} />
                   </button>
                 </div>
