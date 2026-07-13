@@ -549,8 +549,30 @@ export default function SlotDataTracker() {
     });
   }, [selectedMachines, sortedHistory, analysisWindow]);
 
-  // machines whose CURRENT trailing-N-day total already meets a historically
-  // favorable threshold (computed across all machines this page has ever seen)
+  // evaluate one window size for one machine's series: does the CURRENT
+  // trailing total already meet a historically favorable threshold?
+  function evaluateWindow(series, windowSize) {
+    if (series.length < windowSize + 1) return null;
+    const pairs = buildTrailingPairs(series, windowSize);
+    const result = findBestThresholds(pairs);
+    if (!result) return null;
+    const currentWindow = series.slice(-windowSize);
+    if (currentWindow.length < windowSize) return null;
+    const currentTrailing = currentWindow.reduce((a, s) => a + s.sada, 0);
+    const reasons = [];
+    if (result.bestAbove && currentTrailing >= result.bestAbove.threshold) {
+      reasons.push({ direction: "above", ...result.bestAbove });
+    }
+    if (result.bestBelow && currentTrailing <= result.bestBelow.threshold) {
+      reasons.push({ direction: "below", ...result.bestBelow });
+    }
+    return { currentTrailing, reasons };
+  }
+
+  // machines whose CURRENT trailing total already meets a historically
+  // favorable threshold, checked across the 10/20/30-day windows together,
+  // with a combined "総合判断" verdict (computed across all machines this
+  // page has ever seen)
   const pickList = useMemo(() => {
     const results = [];
     allMachineNumbers.forEach((no) => {
@@ -560,35 +582,33 @@ export default function SlotDataTracker() {
           return m && m.sada !== null ? { date: h.date, sada: m.sada } : null;
         })
         .filter(Boolean);
-      if (series.length < analysisWindow + 1) return;
-
-      const pairs = buildTrailingPairs(series, analysisWindow);
-      const result = findBestThresholds(pairs);
-      if (!result) return;
-
-      const currentWindow = series.slice(-analysisWindow);
-      if (currentWindow.length < analysisWindow) return;
-      const currentTrailing = currentWindow.reduce((a, s) => a + s.sada, 0);
+      if (series.length === 0) return;
       const lastDate = series[series.length - 1].date;
 
-      const reasons = [];
-      if (result.bestAbove && currentTrailing >= result.bestAbove.threshold) {
-        reasons.push({ direction: "above", ...result.bestAbove });
-      }
-      if (result.bestBelow && currentTrailing <= result.bestBelow.threshold) {
-        reasons.push({ direction: "below", ...result.bestBelow });
-      }
-      if (reasons.length > 0) {
-        results.push({ no, currentTrailing, lastDate, reasons });
-      }
+      const windows = [10, 20, 30].map((w) => ({ windowSize: w, result: evaluateWindow(series, w) }));
+      const matchedWindows = windows.filter((w) => w.result && w.result.reasons.length > 0);
+      if (matchedWindows.length === 0) return;
+
+      const evaluableCount = windows.filter((w) => w.result).length;
+      const avgWinRate =
+        matchedWindows.reduce((a, w) => a + Math.max(...w.result.reasons.map((r) => r.winRate)), 0) /
+        matchedWindows.length;
+
+      results.push({
+        no,
+        lastDate,
+        windows,
+        matchedCount: matchedWindows.length,
+        evaluableCount,
+        avgWinRate,
+      });
     });
     results.sort((a, b) => {
-      const aBest = Math.max(...a.reasons.map((r) => r.winRate));
-      const bBest = Math.max(...b.reasons.map((r) => r.winRate));
-      return bBest - aBest;
+      if (b.matchedCount !== a.matchedCount) return b.matchedCount - a.matchedCount;
+      return b.avgWinRate - a.avgWinRate;
     });
     return results;
-  }, [allMachineNumbers, sortedHistory, analysisWindow]);
+  }, [allMachineNumbers, sortedHistory]);
 
   function handleSave() {
     if (!activePageId) return;
@@ -1512,29 +1532,47 @@ export default function SlotDataTracker() {
           {/* pick-up: machines currently matching a historically favorable pattern */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              本日のピックアップ（{analysisWindow}日足）
+              本日のピックアップ（10日足・20日足・30日足）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-              直近{analysisWindow}日間の総差枚が、過去データで見つかった「翌日プラスになりやすい条件」に今まさに当てはまっている台をリストアップします（このページの全ての台が対象）
+              10日足・20日足・30日足それぞれの直近総差枚を、過去データで見つかった「翌日プラスになりやすい条件」と照らし合わせ、当てはまる台をリストアップします（このページの全ての台が対象）
             </div>
             {pickList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
             ) : (
-              <div className="scrollbar" style={{ maxHeight: "320px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "10px" }}>
+              <div className="scrollbar" style={{ maxHeight: "420px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
                 {pickList.map((p) => (
                   <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
                       <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
-                      <span className="mono" style={{ fontSize: "11px", color: p.currentTrailing >= 0 ? "#9ece6a" : "#e5697a" }}>
-                        直近{analysisWindow}日 {p.currentTrailing >= 0 ? "+" : ""}{fmtNum(p.currentTrailing)}枚（{p.lastDate}時点）
-                      </span>
+                      <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}時点</span>
                     </div>
-                    {p.reasons.map((r, i) => (
-                      <div key={i} style={{ fontSize: "11px", color: "#8b93a3" }}>
-                        条件：総差枚が <span className="mono" style={{ color: "#c7cbd4" }}>
-                          {r.threshold >= 0 ? "+" : ""}{fmtNum(Math.round(r.threshold))}枚{r.direction === "above" ? "以上" : "以下"}
-                        </span> の時、過去データで翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(r.winRate * 100)}%</span>
-                        （{r.sampleSize}件中、平均{r.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(r.avgNext))}枚）
+
+                    <div style={{ fontSize: "11px", color: "#c7cbd4", marginBottom: "6px", padding: "6px 8px", background: "rgba(79,209,197,0.08)", borderRadius: "6px" }}>
+                      総合判断：<span style={{ color: "#4fd1c5", fontWeight: 700 }}>{p.evaluableCount}期間中{p.matchedCount}期間</span>でプラス条件に該当
+                      （平均勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.avgWinRate * 100)}%</span>）
+                    </div>
+
+                    {p.windows.map((w) => (
+                      <div key={w.windowSize} style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "3px" }}>
+                        <span className="mono" style={{ color: "#c7cbd4" }}>{w.windowSize}日足</span>：
+                        {!w.result ? (
+                          <span>データ不足</span>
+                        ) : w.result.reasons.length === 0 ? (
+                          <span>
+                            条件非該当（直近合計 {w.result.currentTrailing >= 0 ? "+" : ""}{fmtNum(w.result.currentTrailing)}枚）
+                          </span>
+                        ) : (
+                          w.result.reasons.map((r, i) => (
+                            <span key={i}>
+                              条件該当（直近合計 {w.result.currentTrailing >= 0 ? "+" : ""}{fmtNum(w.result.currentTrailing)}枚 ／ しきい値
+                              <span className="mono" style={{ color: "#c7cbd4" }}>
+                                {" "}{r.threshold >= 0 ? "+" : ""}{fmtNum(Math.round(r.threshold))}枚{r.direction === "above" ? "以上" : "以下"}
+                              </span>
+                              ／ 過去勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(r.winRate * 100)}%</span>（{r.sampleSize}件中））
+                            </span>
+                          ))
+                        )}
                       </div>
                     ))}
                   </div>
