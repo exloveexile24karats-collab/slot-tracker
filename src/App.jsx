@@ -45,6 +45,10 @@ const STRONG_COLORS = ["#e5484d", "#f2a541", "#4fd1c5", "#7aa2f7", "#bb9af7", "#
 const DIGIT2_COLOR = "#7dcfff";
 const DIGIT7_COLOR = "#f6a04d";
 
+// bump this on every change shipped, so the person can glance at the header
+// and confirm whether a deploy actually took effect
+const APP_VERSION = "1.5";
+
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
   { key: 20, label: "20日足" },
@@ -447,6 +451,29 @@ export default function SlotDataTracker() {
   const entryDateHasExisting = !!historyByDate[entryDate];
 
   const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
+
+  // warn if the date being entered was already registered as a closed (店休日) day
+  const entryDateIsClosed = closedDateSet.has(entryDate);
+
+  // warn if there's a gap between the last recorded date (for this page) and
+  // the date being entered, with days in between that are neither recorded
+  // nor registered as closed
+  const dateGapWarning = useMemo(() => {
+    if (!entryDate || sortedHistory.length === 0) return null;
+    const priorDates = sortedHistory.map((h) => h.date).filter((d) => d < entryDate);
+    if (priorDates.length === 0) return null;
+    const lastDate = priorDates[priorDates.length - 1];
+    const missing = [];
+    let cursor = addDays(lastDate, 1);
+    let guard = 0;
+    while (cursor < entryDate && guard < 400) {
+      if (!historyByDate[cursor] && !closedDateSet.has(cursor)) missing.push(cursor);
+      cursor = addDays(cursor, 1);
+      guard += 1;
+    }
+    if (missing.length === 0) return null;
+    return { lastDate, missing };
+  }, [entryDate, sortedHistory, historyByDate, closedDateSet]);
 
   // merge in closed days (within the recorded date range) so they appear on the axis
   const timelineDates = useMemo(() => {
@@ -881,8 +908,9 @@ export default function SlotDataTracker() {
         <div style={{ fontSize: "12px", letterSpacing: "0.14em", color: "#e8b34c", fontWeight: 600 }}>
           SLOT HALL DATA TERMINAL
         </div>
-        <h1 style={{ fontSize: "22px", fontWeight: 700, margin: "4px 0 2px" }}>
+        <h1 style={{ fontSize: "22px", fontWeight: 700, margin: "4px 0 2px", display: "flex", alignItems: "baseline", gap: "8px" }}>
           台データ推移トラッカー
+          <span className="mono" style={{ fontSize: "12px", fontWeight: 600, color: "#5a6272" }}>v{APP_VERSION}</span>
         </h1>
         <div style={{ fontSize: "13px", color: "#8b93a3" }}>
           表を貼り付けるだけで台ごとに自動集計・グラフ化します
@@ -994,8 +1022,19 @@ export default function SlotDataTracker() {
               </div>
             </div>
             {entryDateHasExisting && (
-              <div style={{ fontSize: "11px", color: "#e8b34c", marginBottom: "10px", marginTop: "-4px" }}>
+              <div style={{ fontSize: "11px", color: "#e8b34c", marginBottom: "8px", marginTop: "-4px" }}>
                 この日付はすでにデータがあります。保存すると上書きされます。
+              </div>
+            )}
+            {entryDateIsClosed && (
+              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
+                ⚠ この日付は店休日として登録されています。本当にデータを入力しますか？
+              </div>
+            )}
+            {dateGapWarning && (
+              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
+                ⚠ 前回の記録（{dateGapWarning.lastDate}）からこの日付までに、{dateGapWarning.missing.length}日分データがありません（
+                {dateGapWarning.missing.join("、")}）。店休日であれば登録しておくとこの警告は出なくなります。
               </div>
             )}
 
