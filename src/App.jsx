@@ -33,6 +33,7 @@ const historyKey = (pageId) => `slot-history-${pageId}`;
 const EVENT_NAMES_KEY = "slot-event-names-v1";
 const STRONG_EVENTS_KEY = "slot-strong-events-v1";
 const CLOSED_DAYS_KEY = "slot-closed-days-v1";
+const DATE_EVENT_MAP_KEY = "slot-date-event-map-v1";
 const DATALIST_ID = "slot-event-name-options";
 
 const PALETTE = [
@@ -194,6 +195,11 @@ export default function SlotDataTracker() {
   const [closedDate, setClosedDate] = useState(todayStr());
   const [closedStatus, setClosedStatus] = useState(null);
 
+  // ---- date -> event name (global, shared across all pages, so an event
+  // typed while entering one page's data auto-fills for the same date on
+  // every other page, even after a reload / on another device) ----
+  const [dateEventMap, setDateEventMap] = useState({});
+
   // ---- per-page form / view state ----
   const [pasteText, setPasteText] = useState("");
   const [entryDate, setEntryDate] = useState(todayStr());
@@ -274,6 +280,16 @@ export default function SlotDataTracker() {
       } catch (e) {
         // none yet
       }
+      try {
+        const r5 = await storage.get(DATE_EVENT_MAP_KEY, false);
+        if (r5 && r5.value) {
+          const parsedMap = JSON.parse(r5.value);
+          setDateEventMap(parsedMap);
+          setEntryEvent((prev) => (prev ? prev : parsedMap[entryDate] || prev));
+        }
+      } catch (e) {
+        // none yet
+      }
     })();
   }, []);
 
@@ -345,6 +361,15 @@ export default function SlotDataTracker() {
     setClosedDays(next);
     try {
       await storage.set(CLOSED_DAYS_KEY, JSON.stringify(next), false);
+    } catch (e) {
+      // ignore
+    }
+  }, []);
+
+  const persistDateEventMap = useCallback(async (next) => {
+    setDateEventMap(next);
+    try {
+      await storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false);
     } catch (e) {
       // ignore
     }
@@ -656,19 +681,24 @@ export default function SlotDataTracker() {
       setStatus({ type: "error", msg: "日付を入力してください。" });
       return;
     }
+    const trimmedEvent = entryEvent.trim();
     const next = [
       ...currentHistory.filter((h) => h.date !== entryDate),
-      { date: entryDate, event: entryEvent.trim(), machines: parsedMachines },
+      { date: entryDate, event: trimmedEvent, machines: parsedMachines },
     ];
     persistPageHistory(activePageId, next);
-    rememberEventName(entryEvent);
+    rememberEventName(trimmedEvent);
+    if (trimmedEvent) {
+      persistDateEventMap({ ...dateEventMap, [entryDate]: trimmedEvent });
+    }
     setStatus({
       type: "ok",
       msg: `${entryDate} のデータを保存しました（${parsedMachines.length}台分）。`,
     });
     setPasteText("");
-    setEntryEvent("");
-    setEntryDate(addDays(entryDate, 1));
+    const nextDate = addDays(entryDate, 1);
+    setEntryDate(nextDate);
+    setEntryEvent(dateEventMap[nextDate] || "");
   }
 
   function handleDeleteDate(date) {
@@ -940,7 +970,11 @@ export default function SlotDataTracker() {
                 <input
                   type="date"
                   value={entryDate}
-                  onChange={(e) => { setEntryDate(e.target.value); setEntryEvent(""); }}
+                  onChange={(e) => {
+                    const newDate = e.target.value;
+                    setEntryDate(newDate);
+                    setEntryEvent(dateEventMap[newDate] || "");
+                  }}
                   style={{
                     width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
                     borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", boxSizing: "border-box",
