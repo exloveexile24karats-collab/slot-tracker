@@ -283,10 +283,12 @@ export default function SlotDataTracker() {
   }, [activePageId]);
 
   // ---- reset ephemeral per-page UI state when switching pages ----
+  // note: entryEvent is intentionally NOT cleared here, so an event typed
+  // while entering one page's data carries over to other pages for the
+  // same date (see the entryDate-based reset effect below).
   useEffect(() => {
     setSelectedMachines([]);
     setPasteText("");
-    setEntryEvent("");
     setStatus(null);
     setConfirmDeleteDate(null);
   }, [activePageId]);
@@ -830,7 +832,7 @@ export default function SlotDataTracker() {
                 <input
                   type="date"
                   value={entryDate}
-                  onChange={(e) => setEntryDate(e.target.value)}
+                  onChange={(e) => { setEntryDate(e.target.value); setEntryEvent(""); }}
                   style={{
                     width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
                     borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", boxSizing: "border-box",
