@@ -514,6 +514,19 @@ export default function SlotDataTracker() {
       .sort((a, b) => b.avg - a.avg);
   }, [luckyDigit, sortedHistory]);
 
+  // "○のつく日" overall total: for each matching date, sum every machine's
+  // 差枚 that day, then average that daily total across all matching dates
+  const luckyDayOverall = useMemo(() => {
+    if (luckyDigit === null) return null;
+    const matchingEntries = sortedHistory.filter((h) => parseInt(h.date.slice(-2), 10) % 10 === luckyDigit);
+    if (matchingEntries.length === 0) return null;
+    const dailyTotals = matchingEntries.map((h) =>
+      h.machines.reduce((sum, m) => sum + (m.sada ?? 0), 0)
+    );
+    const avgTotal = dailyTotals.reduce((a, b) => a + b, 0) / dailyTotals.length;
+    return { avgTotal, dayCount: matchingEntries.length };
+  }, [luckyDigit, sortedHistory]);
+
   // for each selected machine: does a big trailing-N-day total tend to predict
   // whether the next day is positive? (both "total is high" and "total is low" directions)
   const thresholdAnalyses = useMemo(() => {
@@ -535,6 +548,47 @@ export default function SlotDataTracker() {
       return { no, overall, digit2, digit7 };
     });
   }, [selectedMachines, sortedHistory, analysisWindow]);
+
+  // machines whose CURRENT trailing-N-day total already meets a historically
+  // favorable threshold (computed across all machines this page has ever seen)
+  const pickList = useMemo(() => {
+    const results = [];
+    allMachineNumbers.forEach((no) => {
+      const series = sortedHistory
+        .map((h) => {
+          const m = h.machines.find((mm) => mm.no === no);
+          return m && m.sada !== null ? { date: h.date, sada: m.sada } : null;
+        })
+        .filter(Boolean);
+      if (series.length < analysisWindow + 1) return;
+
+      const pairs = buildTrailingPairs(series, analysisWindow);
+      const result = findBestThresholds(pairs);
+      if (!result) return;
+
+      const currentWindow = series.slice(-analysisWindow);
+      if (currentWindow.length < analysisWindow) return;
+      const currentTrailing = currentWindow.reduce((a, s) => a + s.sada, 0);
+      const lastDate = series[series.length - 1].date;
+
+      const reasons = [];
+      if (result.bestAbove && currentTrailing >= result.bestAbove.threshold) {
+        reasons.push({ direction: "above", ...result.bestAbove });
+      }
+      if (result.bestBelow && currentTrailing <= result.bestBelow.threshold) {
+        reasons.push({ direction: "below", ...result.bestBelow });
+      }
+      if (reasons.length > 0) {
+        results.push({ no, currentTrailing, lastDate, reasons });
+      }
+    });
+    results.sort((a, b) => {
+      const aBest = Math.max(...a.reasons.map((r) => r.winRate));
+      const bBest = Math.max(...b.reasons.map((r) => r.winRate));
+      return bBest - aBest;
+    });
+    return results;
+  }, [allMachineNumbers, sortedHistory, analysisWindow]);
 
   function handleSave() {
     if (!activePageId) return;
@@ -1417,6 +1471,18 @@ export default function SlotDataTracker() {
             ) : luckyDayStats.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>該当する日付のデータがまだありません。</div>
             ) : (
+              <>
+                {luckyDayOverall && (
+                  <div style={{
+                    background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px",
+                    padding: "10px 12px", marginBottom: "12px", display: "flex", justifyContent: "space-between", alignItems: "center",
+                  }}>
+                    <span style={{ fontSize: "12px", color: "#8b93a3" }}>全体合計差枚の平均（{luckyDayOverall.dayCount}日分）</span>
+                    <span className="mono" style={{ fontSize: "16px", fontWeight: 800, color: luckyDayOverall.avgTotal >= 0 ? "#9ece6a" : "#e5697a" }}>
+                      {luckyDayOverall.avgTotal >= 0 ? "+" : ""}{fmtNum(Math.round(luckyDayOverall.avgTotal))}枚
+                    </span>
+                  </div>
+                )}
               <div className="scrollbar" style={{ maxHeight: "260px", overflowY: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
                   <thead>
@@ -1438,6 +1504,41 @@ export default function SlotDataTracker() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+              </>
+            )}
+          </div>
+
+          {/* pick-up: machines currently matching a historically favorable pattern */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              本日のピックアップ（{analysisWindow}日足）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+              直近{analysisWindow}日間の総差枚が、過去データで見つかった「翌日プラスになりやすい条件」に今まさに当てはまっている台をリストアップします（このページの全ての台が対象）
+            </div>
+            {pickList.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "320px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "10px" }}>
+                {pickList.map((p) => (
+                  <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
+                      <span className="mono" style={{ fontSize: "11px", color: p.currentTrailing >= 0 ? "#9ece6a" : "#e5697a" }}>
+                        直近{analysisWindow}日 {p.currentTrailing >= 0 ? "+" : ""}{fmtNum(p.currentTrailing)}枚（{p.lastDate}時点）
+                      </span>
+                    </div>
+                    {p.reasons.map((r, i) => (
+                      <div key={i} style={{ fontSize: "11px", color: "#8b93a3" }}>
+                        条件：総差枚が <span className="mono" style={{ color: "#c7cbd4" }}>
+                          {r.threshold >= 0 ? "+" : ""}{fmtNum(Math.round(r.threshold))}枚{r.direction === "above" ? "以上" : "以下"}
+                        </span> の時、過去データで翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(r.winRate * 100)}%</span>
+                        （{r.sampleSize}件中、平均{r.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(r.avgNext))}枚）
+                      </div>
+                    ))}
+                  </div>
+                ))}
               </div>
             )}
           </div>
