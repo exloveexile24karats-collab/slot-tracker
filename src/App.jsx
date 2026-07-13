@@ -47,7 +47,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "1.6";
+const APP_VERSION = "1.7";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -567,7 +567,8 @@ export default function SlotDataTracker() {
       let dataCount = 0;
       let cum = 0;
       let started = false;
-      const series = [];
+      let lastSeenDate = null;
+      const rawSeries = [];
       visibleTimelineDates.forEach((date) => {
         const entry = historyByDate[date];
         const m = entry ? entry.machines.find((mm) => mm.no === no) : null;
@@ -575,11 +576,18 @@ export default function SlotDataTracker() {
           cum += m.sada;
           started = true;
           dataCount += 1;
+          lastSeenDate = date;
         }
         // carry the running total forward on days with no data, instead of
         // breaking the line, so it always ends exactly at the total shown
-        series.push({ date, value: started ? cum : null });
+        rawSeries.push({ date, value: started ? cum : null });
       });
+      // once the machine stops appearing for good (e.g. 新台入れ替え), cut the
+      // line off there instead of flat-lining all the way to the end —
+      // a temporary one-off gap in the middle still just bridges through
+      const series = rawSeries.map((pt) =>
+        lastSeenDate && pt.date > lastSeenDate ? { ...pt, value: null } : pt
+      );
       const totalSada = cum;
       const seriesDates = new Set(series.map((s) => s.date));
       const strongInSeries = strongDatesInHistory.filter((se) => seriesDates.has(se.date));
