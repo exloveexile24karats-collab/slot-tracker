@@ -156,12 +156,10 @@ export default function SlotDataTracker() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteDate, setConfirmDeleteDate] = useState(null);
   const [dateListOpen, setDateListOpen] = useState(true);
-
-  // ---- backup / multi-device transfer ----
-  const [exportText, setExportText] = useState("");
-  const [importText, setImportText] = useState("");
-  const [backupStatus, setBackupStatus] = useState(null);
-  const [confirmImport, setConfirmImport] = useState(false);
+  const [useCustomRange, setUseCustomRange] = useState(false);
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
+  const [luckyDigit, setLuckyDigit] = useState(null);
 
   // ---- load pages + global registries on mount ----
   useEffect(() => {
@@ -353,9 +351,12 @@ export default function SlotDataTracker() {
   }, [sortedHistory, closedDays]);
 
   const visibleTimelineDates = useMemo(() => {
+    if (useCustomRange && customStart && customEnd) {
+      return timelineDates.filter((d) => d >= customStart && d <= customEnd);
+    }
     if (range === "all" || timelineDates.length === 0) return timelineDates;
     return timelineDates.slice(-range);
-  }, [timelineDates, range]);
+  }, [timelineDates, range, useCustomRange, customStart, customEnd]);
 
   const chartData = useMemo(() => {
     return visibleTimelineDates.map((date) => {
@@ -417,6 +418,28 @@ export default function SlotDataTracker() {
       return { no, totalSada, dataCount, series, strongInSeries, closedInSeries };
     });
   }, [selectedMachines, visibleTimelineDates, historyByDate, strongEvents, closedDays]);
+
+  // "○のつく日" (e.g. digit 2 → the 2nd/12th/22nd) average 差枚 per machine,
+  // computed across this page's entire recorded history (not limited by range)
+  const luckyDayStats = useMemo(() => {
+    if (luckyDigit === null) return [];
+    const matchingEntries = sortedHistory.filter((h) => {
+      const day = parseInt(h.date.slice(-2), 10);
+      return day % 10 === luckyDigit;
+    });
+    const map = {};
+    matchingEntries.forEach((h) => {
+      h.machines.forEach((m) => {
+        if (m.sada === null) return;
+        if (!map[m.no]) map[m.no] = { sum: 0, count: 0 };
+        map[m.no].sum += m.sada;
+        map[m.no].count += 1;
+      });
+    });
+    return Object.entries(map)
+      .map(([no, v]) => ({ no: parseInt(no, 10), avg: v.sum / v.count, count: v.count }))
+      .sort((a, b) => b.avg - a.avg);
+  }, [luckyDigit, sortedHistory]);
 
   function handleSave() {
     if (!activePageId) return;
@@ -522,82 +545,6 @@ export default function SlotDataTracker() {
 
   function handleRemoveClosedDay(date) {
     persistClosedDays(closedDays.filter((c) => c.date !== date));
-  }
-
-  async function handleExport() {
-    try {
-      const allHistories = {};
-      for (const p of pages) {
-        let hist = pageHistories[p.id];
-        if (hist === undefined) {
-          try {
-            const res = await storage.get(historyKey(p.id), false);
-            hist = res && res.value ? JSON.parse(res.value) : [];
-          } catch (e) {
-            hist = [];
-          }
-        }
-        allHistories[p.id] = hist;
-      }
-      const payload = {
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        pages,
-        histories: allHistories,
-        eventNames,
-        strongEvents,
-        closedDays,
-      };
-      setExportText(JSON.stringify(payload));
-      setBackupStatus({ type: "ok", msg: "エクスポートしました。下のテキストをコピーして他の端末に貼り付けてください。" });
-    } catch (e) {
-      setBackupStatus({ type: "error", msg: "エクスポートに失敗しました。" });
-    }
-  }
-
-  async function handleCopyExport() {
-    try {
-      await navigator.clipboard.writeText(exportText);
-      setBackupStatus({ type: "ok", msg: "コピーしました。" });
-    } catch (e) {
-      setBackupStatus({ type: "error", msg: "コピーできませんでした。テキストを長押しして選択・コピーしてください。" });
-    }
-  }
-
-  async function handleImport() {
-    if (!importText.trim()) {
-      setBackupStatus({ type: "error", msg: "貼り付けるデータがありません。" });
-      return;
-    }
-    if (!confirmImport) {
-      setConfirmImport(true);
-      setBackupStatus({ type: "error", msg: "現在のデータは上書きされます。もう一度「インポート実行」を押すと確定します。" });
-      return;
-    }
-    try {
-      const payload = JSON.parse(importText);
-      if (!payload || !Array.isArray(payload.pages)) throw new Error("invalid payload");
-
-      await persistPages(payload.pages);
-      const newHistories = {};
-      for (const p of payload.pages) {
-        const hist = (payload.histories && payload.histories[p.id]) || [];
-        await storage.set(historyKey(p.id), JSON.stringify(hist), false);
-        loadedHistoryRef.current.add(p.id);
-        newHistories[p.id] = hist;
-      }
-      setPageHistories(newHistories);
-      if (Array.isArray(payload.eventNames)) await persistEventNames(payload.eventNames);
-      if (Array.isArray(payload.strongEvents)) await persistStrongEvents(payload.strongEvents);
-      if (Array.isArray(payload.closedDays)) await persistClosedDays(payload.closedDays);
-      setActivePageId(payload.pages[0] ? payload.pages[0].id : null);
-      setImportText("");
-      setConfirmImport(false);
-      setBackupStatus({ type: "ok", msg: "インポートが完了しました。" });
-    } catch (e) {
-      setConfirmImport(false);
-      setBackupStatus({ type: "error", msg: "データの読み込みに失敗しました。正しいバックアップデータか確認してください。" });
-    }
   }
 
   if (!pagesLoaded) {
@@ -1019,98 +966,55 @@ export default function SlotDataTracker() {
               )}
             </div>
           </div>
-
-          {/* backup / multi-device transfer */}
-          <div className="card" style={{ padding: "18px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              データのバックアップ（他の端末に移す）
-            </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              全ページ分のデータをテキストとして書き出し、別の端末でこの画面に貼り付ければ同じデータを見られます
-            </div>
-
-            <button
-              onClick={handleExport}
-              style={{
-                width: "100%", background: "#3a4150", color: "#e7e9ee", border: "none", borderRadius: "8px",
-                padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer", marginBottom: "8px",
-              }}
-            >
-              エクスポート（書き出す）
-            </button>
-            {exportText && (
-              <>
-                <textarea
-                  readOnly
-                  value={exportText}
-                  onFocus={(e) => e.target.select()}
-                  rows={4}
-                  className="mono scrollbar"
-                  style={{
-                    width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
-                    padding: "8px", color: "#8b93a3", fontSize: "10px", boxSizing: "border-box", marginBottom: "6px",
-                  }}
-                />
-                <button
-                  onClick={handleCopyExport}
-                  style={{
-                    width: "100%", background: "transparent", color: "#4fd1c5", border: "1px solid #2a323f", borderRadius: "8px",
-                    padding: "7px", fontWeight: 700, fontSize: "12px", cursor: "pointer", marginBottom: "6px",
-                  }}
-                >
-                  コピー
-                </button>
-              </>
-            )}
-
-            <div style={{ borderTop: "1px solid #2a323f", marginTop: "10px", paddingTop: "10px" }}>
-              <label style={{ fontSize: "11px", color: "#8b93a3" }}>他の端末で書き出したデータを貼り付け</label>
-              <textarea
-                value={importText}
-                onChange={(e) => { setImportText(e.target.value); setConfirmImport(false); }}
-                rows={4}
-                className="mono scrollbar"
-                placeholder="ここにエクスポートしたテキストを貼り付け"
-                style={{
-                  width: "100%", marginTop: "4px", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
-                  padding: "8px", color: "#d7dae0", fontSize: "10px", boxSizing: "border-box", marginBottom: "6px",
-                }}
-              />
-              <button
-                onClick={handleImport}
-                style={{
-                  width: "100%", background: confirmImport ? "#e5697a" : "#3a4150", color: confirmImport ? "#2b0d12" : "#e7e9ee",
-                  border: "none", borderRadius: "8px", padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
-                }}
-              >
-                {confirmImport ? "インポート実行（現在のデータを上書き）" : "インポート"}
-              </button>
-            </div>
-
-            {backupStatus && (
-              <div style={{ marginTop: "8px", fontSize: "11px", color: backupStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
-                {backupStatus.msg}
-              </div>
-            )}
-          </div>
         </div>
 
         {/* RIGHT: chart + summary */}
         <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
           <div className="card" style={{ padding: "18px" }}>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "14px", justifyContent: "flex-end", alignItems: "center", marginBottom: "14px" }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", justifyContent: "flex-end", alignItems: "center", marginBottom: "10px" }}>
               <div style={{ display: "flex", gap: "6px" }}>
                 {RANGE_OPTIONS.map((r) => (
-                  <button key={r.key} onClick={() => setRange(r.key)} className="chip" style={{
+                  <button key={r.key} onClick={() => { setRange(r.key); setUseCustomRange(false); }} className="chip" style={{
                     fontSize: "12px", padding: "6px 10px", borderRadius: "6px",
-                    border: "1px solid " + (range === r.key ? "#4fd1c5" : "#2a323f"),
-                    background: range === r.key ? "rgba(79,209,197,0.12)" : "transparent",
-                    color: range === r.key ? "#4fd1c5" : "#c7cbd4",
+                    border: "1px solid " + (!useCustomRange && range === r.key ? "#4fd1c5" : "#2a323f"),
+                    background: !useCustomRange && range === r.key ? "rgba(79,209,197,0.12)" : "transparent",
+                    color: !useCustomRange && range === r.key ? "#4fd1c5" : "#c7cbd4",
                   }}>
                     {r.label}
                   </button>
                 ))}
               </div>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center", justifyContent: "flex-end", marginBottom: "14px" }}>
+              <span style={{ fontSize: "11px", color: "#5a6272" }}>期間を指定：</span>
+              <input type="date" value={customStart} onChange={(e) => setCustomStart(e.target.value)} style={{
+                background: "#12161d", border: "1px solid " + (useCustomRange ? "#4fd1c5" : "#2a323f"), borderRadius: "6px",
+                padding: "5px 6px", color: "#e7e9ee", fontSize: "11px",
+              }} />
+              <span style={{ fontSize: "11px", color: "#5a6272" }}>〜</span>
+              <input type="date" value={customEnd} onChange={(e) => setCustomEnd(e.target.value)} style={{
+                background: "#12161d", border: "1px solid " + (useCustomRange ? "#4fd1c5" : "#2a323f"), borderRadius: "6px",
+                padding: "5px 6px", color: "#e7e9ee", fontSize: "11px",
+              }} />
+              <button
+                onClick={() => setUseCustomRange(true)}
+                disabled={!customStart || !customEnd}
+                style={{
+                  fontSize: "11px", padding: "5px 10px", borderRadius: "6px", border: "1px solid #4fd1c5",
+                  background: useCustomRange ? "rgba(79,209,197,0.12)" : "transparent", color: "#4fd1c5",
+                  cursor: customStart && customEnd ? "pointer" : "not-allowed", opacity: customStart && customEnd ? 1 : 0.5,
+                }}
+              >
+                適用
+              </button>
+              {useCustomRange && (
+                <button onClick={() => setUseCustomRange(false)} style={{
+                  fontSize: "11px", padding: "5px 10px", borderRadius: "6px", border: "1px solid #2a323f",
+                  background: "transparent", color: "#8b93a3", cursor: "pointer",
+                }}>
+                  解除
+                </button>
+              )}
             </div>
 
             {historyLoading ? (
@@ -1124,14 +1028,6 @@ export default function SlotDataTracker() {
             ) : (
               <ResponsiveContainer width="100%" height={340}>
                 <LineChart data={chartData} margin={{ top: 6, right: 12, left: 0, bottom: 6 }}>
-                  <defs>
-                    {strongDatesInView.map((se) => (
-                      <pattern key={"pat-" + se.date} id={"strongHatch-" + se.date} patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
-                        <rect width="6" height="6" fill="transparent" />
-                        <line x1="0" y1="0" x2="0" y2="6" stroke={se.color || "#e5484d"} strokeWidth="2" />
-                      </pattern>
-                    ))}
-                  </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#232b37" />
                   <XAxis dataKey="date" tick={{ fontSize: 11, fill: "#8b93a3" }} />
                   <YAxis tick={{ fontSize: 11, fill: "#8b93a3" }} width={56} />
@@ -1152,18 +1048,10 @@ export default function SlotDataTracker() {
                         label={{ value: "休", position: "insideTop", fill: "#c7cbd4", fontSize: 10 }} />
                     );
                   })}
-                  {strongDatesInView.map((se) => {
-                    const dateList = chartData.map((d) => d.date);
-                    const band = getBandRange(dateList, se.date);
-                    if (!band) return null;
-                    return (
-                      <React.Fragment key={"strong-" + se.date}>
-                        <ReferenceArea x1={band.x1} x2={band.x2} fill={"url(#strongHatch-" + se.date + ")"} stroke="none" />
-                        <ReferenceLine x={se.date} stroke={se.color || "#e5484d"} strokeWidth={2}
-                          label={{ value: se.name, position: "top", fill: se.color || "#e5697a", fontSize: 10 }} />
-                      </React.Fragment>
-                    );
-                  })}
+                  {strongDatesInView.map((se) => (
+                    <ReferenceLine key={"strong-" + se.date} x={se.date} stroke={se.color || "#e5484d"} strokeDasharray="5 3" strokeWidth={2}
+                      label={{ value: se.name, position: "top", fill: se.color || "#e5697a", fontSize: 10 }} />
+                  ))}
                   {eventDates.map((e) => (
                     <ReferenceLine key={"event-" + e.date} x={e.date} stroke="#e8b34c" strokeDasharray="4 3"
                       label={{ value: "★", position: "top", fill: "#e8b34c", fontSize: 11 }} />
@@ -1176,7 +1064,7 @@ export default function SlotDataTracker() {
               </ResponsiveContainer>
             )}
             <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "6px" }}>
-              単位：枚　★ = 通常イベント　斜線帯 = 強いイベント　グレー帯 = 店休日
+              単位：枚　★ = 通常イベント　点線 = 強いイベント　グレー帯 = 店休日
             </div>
           </div>
 
@@ -1227,14 +1115,6 @@ export default function SlotDataTracker() {
                     <div style={{ position: "relative", height: "130px" }}>
                       <ResponsiveContainer width="100%" height="100%">
                         <LineChart data={s.series} margin={{ top: 10, right: 8, left: 0, bottom: 0 }}>
-                          <defs>
-                            {s.strongInSeries.map((se) => (
-                              <pattern key={"pm-" + se.date} id={"strongHatchMini-" + s.no + "-" + se.date} patternUnits="userSpaceOnUse" width="5" height="5" patternTransform="rotate(45)">
-                                <rect width="5" height="5" fill="transparent" />
-                                <line x1="0" y1="0" x2="0" y2="5" stroke={se.color || "#e5484d"} strokeWidth="1.5" />
-                              </pattern>
-                            ))}
-                          </defs>
                           <CartesianGrid vertical={false} stroke="#232b37" strokeDasharray="2 3" />
                           <YAxis hide={false} width={38} tick={{ fontSize: 9, fill: "#4a5262" }} axisLine={false} tickLine={false} />
                           <XAxis dataKey="date" hide />
@@ -1245,17 +1125,9 @@ export default function SlotDataTracker() {
                             if (!band) return null;
                             return <ReferenceArea key={"m-closed-" + c.date} x1={band.x1} x2={band.x2} fill="#5a6272" fillOpacity={0.28} stroke="none" />;
                           })}
-                          {s.strongInSeries.map((se) => {
-                            const dateList = s.series.map((d) => d.date);
-                            const band = getBandRange(dateList, se.date);
-                            if (!band) return null;
-                            return (
-                              <React.Fragment key={"m-strong-" + se.date}>
-                                <ReferenceArea x1={band.x1} x2={band.x2} fill={"url(#strongHatchMini-" + s.no + "-" + se.date + ")"} stroke="none" />
-                                <ReferenceLine x={se.date} stroke={se.color || "#e5484d"} strokeWidth={1.5} />
-                              </React.Fragment>
-                            );
-                          })}
+                          {s.strongInSeries.map((se) => (
+                            <ReferenceLine key={"m-strong-" + se.date} x={se.date} stroke={se.color || "#e5484d"} strokeDasharray="4 2" strokeWidth={1.5} />
+                          ))}
                           <Line type="monotone" dataKey="value" stroke="#3ecf8e" strokeWidth={1.75} dot={false} connectNulls />
                         </LineChart>
                       </ResponsiveContainer>
@@ -1271,6 +1143,57 @@ export default function SlotDataTracker() {
               </div>
             </div>
           )}
+
+          {/* "○のつく日" (digit day) average differential per machine */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              〇のつく日 平均差枚
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              数字を選ぶと、その数字で終わる日付（例：2 なら 2日・12日・22日）の平均差枚を台ごとに計算します（このページの全期間データが対象）
+            </div>
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "12px" }}>
+              {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((d) => (
+                <button key={d} onClick={() => setLuckyDigit(d === luckyDigit ? null : d)} className="mono" style={{
+                  width: "32px", height: "32px", borderRadius: "8px", cursor: "pointer",
+                  border: "1px solid " + (luckyDigit === d ? "#e8b34c" : "#2a323f"),
+                  background: luckyDigit === d ? "rgba(232,179,76,0.15)" : "transparent",
+                  color: luckyDigit === d ? "#e8b34c" : "#c7cbd4", fontSize: "13px", fontWeight: 700,
+                }}>
+                  {d}
+                </button>
+              ))}
+            </div>
+
+            {luckyDigit === null ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>上の数字を選んでください。</div>
+            ) : luckyDayStats.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>該当する日付のデータがまだありません。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "260px", overflowY: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+                  <thead>
+                    <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>台番</th>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>平均差枚</th>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>該当日数</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {luckyDayStats.map((s) => (
+                      <tr key={s.no} style={{ borderTop: "1px solid #232b37" }}>
+                        <td className="mono" style={{ padding: "6px 8px", color: "#c7cbd4" }}>{s.no}</td>
+                        <td className="mono" style={{ padding: "6px 8px", color: s.avg >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+                          {s.avg >= 0 ? "+" : ""}{Math.round(s.avg).toLocaleString()}枚
+                        </td>
+                        <td className="mono" style={{ padding: "6px 8px", color: "#5a6272" }}>{s.count}日</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
