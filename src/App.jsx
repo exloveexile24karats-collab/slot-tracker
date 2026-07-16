@@ -47,7 +47,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "1.7";
+const APP_VERSION = "1.8";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -228,6 +228,7 @@ export default function SlotDataTracker() {
 
   // ---- day-detail viewer ----
   const [viewDate, setViewDate] = useState(todayStr());
+  const [viewWindow, setViewWindow] = useState(7);
 
   // ---- load pages + global registries on mount ----
   useEffect(() => {
@@ -841,6 +842,36 @@ export default function SlotDataTracker() {
     if (!entry) return null;
     return [...entry.machines].sort((a, b) => (b.sada ?? -Infinity) - (a.sada ?? -Infinity));
   }, [historyByDate, viewDate]);
+
+  // for each machine present on the picked date, a cumulative 差枚 trend for
+  // the trailing `viewWindow` days ending on (and including) that date
+  const viewWindowDates = useMemo(() => {
+    const datesUpTo = sortedHistory.map((h) => h.date).filter((d) => d <= viewDate);
+    return datesUpTo.slice(-viewWindow);
+  }, [sortedHistory, viewDate, viewWindow]);
+
+  const viewWindowSeries = useMemo(() => {
+    if (!viewDateMachines) return [];
+    return viewDateMachines.map((vm) => {
+      const no = vm.no;
+      let cum = 0;
+      let started = false;
+      let lastSeenDate = null;
+      const raw = [];
+      viewWindowDates.forEach((date) => {
+        const entry = historyByDate[date];
+        const m = entry ? entry.machines.find((mm) => mm.no === no) : null;
+        if (m && m.sada !== null) {
+          cum += m.sada;
+          started = true;
+          lastSeenDate = date;
+        }
+        raw.push({ date, value: started ? cum : null });
+      });
+      const series = raw.map((pt) => (lastSeenDate && pt.date > lastSeenDate ? { ...pt, value: null } : pt));
+      return { no, total: cum, series };
+    });
+  }, [viewDateMachines, viewWindowDates, historyByDate]);
 
   function renderThresholdResult(result, label) {
     if (!result) {
@@ -1508,26 +1539,74 @@ export default function SlotDataTracker() {
             {viewDateMachines === null ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>この日のデータはまだありません。</div>
             ) : (
-              <div className="scrollbar" style={{ maxHeight: "300px", overflowY: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
-                  <thead>
-                    <tr style={{ color: "#5a6272", textAlign: "left" }}>
-                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>台番</th>
-                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>差枚</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {viewDateMachines.map((m) => (
-                      <tr key={m.no} style={{ borderTop: "1px solid #232b37" }}>
-                        <td className="mono" style={{ padding: "6px 8px", color: "#c7cbd4" }}>{m.no}</td>
-                        <td className="mono" style={{ padding: "6px 8px", color: m.sada >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
-                          {m.sada === null ? "―" : (m.sada >= 0 ? "+" : "") + fmtNum(m.sada) + "枚"}
-                        </td>
+              <>
+                <div className="scrollbar" style={{ maxHeight: "300px", overflowY: "auto", marginBottom: "16px" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+                    <thead>
+                      <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                        <th style={{ padding: "4px 8px", fontWeight: 600 }}>台番</th>
+                        <th style={{ padding: "4px 8px", fontWeight: 600 }}>差枚</th>
                       </tr>
+                    </thead>
+                    <tbody>
+                      {viewDateMachines.map((m) => (
+                        <tr key={m.no} style={{ borderTop: "1px solid #232b37" }}>
+                          <td className="mono" style={{ padding: "6px 8px", color: "#c7cbd4" }}>{m.no}</td>
+                          <td className="mono" style={{ padding: "6px 8px", color: m.sada >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+                            {m.sada === null ? "―" : (m.sada >= 0 ? "+" : "") + fmtNum(m.sada) + "枚"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div style={{ borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+                    <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
+                      この日までの差枚推移
+                    </div>
+                    <div style={{ display: "flex", gap: "6px" }}>
+                      {[7, 10, 20].map((w) => (
+                        <button key={w} onClick={() => setViewWindow(w)} className="chip" style={{
+                          fontSize: "12px", padding: "5px 9px", borderRadius: "6px",
+                          border: "1px solid " + (viewWindow === w ? "#4fd1c5" : "#2a323f"),
+                          background: viewWindow === w ? "rgba(79,209,197,0.12)" : "transparent",
+                          color: viewWindow === w ? "#4fd1c5" : "#c7cbd4",
+                        }}>
+                          {w}日間
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: "10px" }}>
+                    {viewWindowSeries.map((s) => (
+                      <div key={s.no} style={{ background: "#0e1218", border: "1px solid #232b37", borderRadius: "10px", overflow: "hidden" }}>
+                        <div style={{ background: "#e7e9ee", color: "#12161d", fontWeight: 700, fontSize: "12px", textAlign: "center", padding: "3px 0" }}>
+                          [{s.no}]
+                        </div>
+                        <div style={{ position: "relative", height: "100px" }}>
+                          <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={s.series} margin={{ top: 8, right: 6, left: 0, bottom: 0 }}>
+                              <CartesianGrid vertical={false} stroke="#232b37" strokeDasharray="2 3" />
+                              <YAxis hide width={0} />
+                              <XAxis dataKey="date" hide />
+                              <Tooltip contentStyle={{ background: "#1b212b", border: "1px solid #2a323f", borderRadius: "6px", fontSize: "11px" }} />
+                              <Line type="monotone" dataKey="value" stroke="#3ecf8e" strokeWidth={1.5} dot={false} connectNulls />
+                            </LineChart>
+                          </ResponsiveContainer>
+                          <div className="mono" style={{
+                            position: "absolute", right: "6px", bottom: "4px", fontSize: "13px", fontWeight: 800,
+                            color: "#f2d24b", textShadow: "0 0 8px rgba(242,210,75,0.35)",
+                          }}>
+                            {s.total >= 0 ? "+" : ""}{fmtNum(s.total)}枚
+                          </div>
+                        </div>
+                      </div>
                     ))}
-                  </tbody>
-                </table>
-              </div>
+                  </div>
+                </div>
+              </>
             )}
           </div>
 
