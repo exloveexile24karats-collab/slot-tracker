@@ -47,7 +47,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "1.8";
+const APP_VERSION = "1.9";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -869,7 +869,9 @@ export default function SlotDataTracker() {
         raw.push({ date, value: started ? cum : null });
       });
       const series = raw.map((pt) => (lastSeenDate && pt.date > lastSeenDate ? { ...pt, value: null } : pt));
-      return { no, total: cum, series };
+      const zeroAnchorDate = viewWindowDates.length > 0 ? addDays(viewWindowDates[0], -1) : null;
+      const seriesWithZero = zeroAnchorDate ? [{ date: zeroAnchorDate, value: 0 }, ...series] : series;
+      return { no, total: cum, series: seriesWithZero };
     });
   }, [viewDateMachines, viewWindowDates, historyByDate]);
 
