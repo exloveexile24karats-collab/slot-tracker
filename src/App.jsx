@@ -47,7 +47,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "2.3";
+const APP_VERSION = "2.5";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -211,7 +211,20 @@ function evaluateStreakPattern(series) {
     });
     return best;
   }
-  return { plus: bestForDir("plus"), minus: bestForDir("minus"), currentStreak: streaks[streaks.length - 1] || null };
+  // stat for EXACTLY this streak length (not "N or more"), which is what
+  // actually applies to the day right after the current streak
+  function exactForDir(dir, length) {
+    const subset = pairs.filter((p) => p.dir === dir && p.len === length);
+    if (subset.length < 4) return null;
+    const wins = subset.filter((p) => p.nextSada > 0).length;
+    return {
+      len: length,
+      winRate: wins / subset.length,
+      sampleSize: subset.length,
+      avgNext: subset.reduce((a, p) => a + p.nextSada, 0) / subset.length,
+    };
+  }
+  return { plus: bestForDir("plus"), minus: bestForDir("minus"), currentStreak: streaks[streaks.length - 1] || null, exactForDir };
 }
 
 // per-weekday average 差枚 for a {date,sada} series
@@ -283,14 +296,37 @@ function evaluateVolumeMismatch(seriesWithGsu) {
   const gsuVals = seriesWithGsu.map((s) => s.gsu).filter((v) => v !== null && v !== undefined);
   if (gsuVals.length < 5) return null;
   const avgGsu = gsuVals.reduce((a, b) => a + b, 0) / gsuVals.length;
-  const last = seriesWithGsu[seriesWithGsu.length - 1];
-  if (last.gsu === null || last.gsu === undefined || last.sada === null) return null;
-  const isHighVolume = last.gsu >= avgGsu * 1.15;
-  const isPoorReturn = last.sada <= 0;
-  if (isHighVolume && isPoorReturn) {
-    return { lastDate: last.date, lastGsu: last.gsu, avgGsu, lastSada: last.sada };
+
+  function isMismatch(pt) {
+    return pt.gsu !== null && pt.gsu !== undefined && pt.gsu >= avgGsu * 1.15 && pt.sada !== null && pt.sada <= 0;
   }
-  return null;
+
+  const last = seriesWithGsu[seriesWithGsu.length - 1];
+  if (!isMismatch(last)) return null;
+
+  // past occurrences of this same pattern (never includes "last" itself,
+  // since we're looking at what happened AFTER earlier instances)
+  const nextDayVals = [];
+  const twoDayVals = [];
+  for (let i = 0; i < seriesWithGsu.length - 1; i++) {
+    if (!isMismatch(seriesWithGsu[i])) continue;
+    if (seriesWithGsu[i + 1].sada !== null) nextDayVals.push(seriesWithGsu[i + 1].sada);
+    if (i + 2 < seriesWithGsu.length && seriesWithGsu[i + 2].sada !== null) twoDayVals.push(seriesWithGsu[i + 2].sada);
+  }
+  function summarize(arr) {
+    if (arr.length < 3) return null;
+    const wins = arr.filter((v) => v > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avg: arr.reduce((a, b) => a + b, 0) / arr.length };
+  }
+
+  return {
+    lastDate: last.date,
+    lastGsu: last.gsu,
+    avgGsu,
+    lastSada: last.sada,
+    nextDayStats: summarize(nextDayVals),
+    twoDayStats: summarize(twoDayVals),
+  };
 }
 
 // On a categorical date axis, a single day has zero width, so widen it by
@@ -835,9 +871,12 @@ export default function SlotDataTracker() {
       const streakEval = series.length >= 9 ? evaluateStreakPattern(series) : null;
       let streakMatch = null;
       if (streakEval && streakEval.currentStreak && streakEval.currentStreak.dir !== "flat") {
-        const best = streakEval.currentStreak.dir === "plus" ? streakEval.plus : streakEval.minus;
-        if (best && streakEval.currentStreak.len >= best.minLen) {
-          streakMatch = { dir: streakEval.currentStreak.dir, len: streakEval.currentStreak.len, ...best };
+        const dir = streakEval.currentStreak.dir;
+        const len = streakEval.currentStreak.len;
+        const best = dir === "plus" ? streakEval.plus : streakEval.minus;
+        const exact = streakEval.exactForDir(dir, len);
+        if (best && len >= best.minLen) {
+          streakMatch = { dir, len, ...best, exact };
         }
       }
 
@@ -896,7 +935,7 @@ export default function SlotDataTracker() {
       // (volumeMismatch is a caution flag, not a positive signal, so it's excluded)
       const signalWinRates = [];
       matchedWindows.forEach((w) => signalWinRates.push(Math.max(...w.result.reasons.map((r) => r.winRate))));
-      if (streakMatch) signalWinRates.push(streakMatch.winRate);
+      if (streakMatch) signalWinRates.push(streakMatch.exact ? streakMatch.exact.winRate : streakMatch.winRate);
       if (weekdayMatch && weekdayMatch.winRate !== null) signalWinRates.push(weekdayMatch.winRate);
       if (strongFollowMatch) signalWinRates.push(strongFollowMatch.winRate);
       if (plannedEventMatch && plannedEventMatch.winRate > 0.5) signalWinRates.push(plannedEventMatch.winRate);
@@ -2168,7 +2207,15 @@ export default function SlotDataTracker() {
                     {p.streakMatch && (
                       <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
                         連続日数：<span className="mono" style={{ color: "#c7cbd4" }}>{p.streakMatch.len}日連続{p.streakMatch.dir === "plus" ? "プラス" : "マイナス"}</span>
-                        （{p.streakMatch.minLen}日以上で翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.winRate * 100)}%</span>、{p.streakMatch.sampleSize}件中）
+                        {p.streakMatch.exact ? (
+                          <>
+                            （ちょうど{p.streakMatch.exact.len}日連続だった時の翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.exact.winRate * 100)}%</span>、{p.streakMatch.exact.sampleSize}件中）
+                          </>
+                        ) : (
+                          <>
+                            （ちょうど{p.streakMatch.len}日連続の過去データが少ないため、参考として{p.streakMatch.minLen}日以上でまとめた翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.winRate * 100)}%</span>、{p.streakMatch.sampleSize}件中）
+                          </>
+                        )}
                       </div>
                     )}
 
@@ -2218,9 +2265,29 @@ export default function SlotDataTracker() {
 
                     {p.volumeMismatch && (
                       <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
-                        ⚠ 大量回転・低調：直近G数 <span className="mono">{fmtNum(p.volumeMismatch.lastGsu)}G</span>
-                        （平均{fmtNum(Math.round(p.volumeMismatch.avgGsu))}G）に対し、差枚
-                        <span className="mono"> {p.volumeMismatch.lastSada >= 0 ? "+" : ""}{fmtNum(p.volumeMismatch.lastSada)}枚</span>
+                        <div>
+                          ⚠ 大量回転・低調：直近G数 <span className="mono">{fmtNum(p.volumeMismatch.lastGsu)}G</span>
+                          （平均{fmtNum(Math.round(p.volumeMismatch.avgGsu))}G）に対し、差枚
+                          <span className="mono"> {p.volumeMismatch.lastSada >= 0 ? "+" : ""}{fmtNum(p.volumeMismatch.lastSada)}枚</span>
+                        </div>
+                        {p.volumeMismatch.nextDayStats ? (
+                          <div style={{ marginTop: "4px" }}>
+                            過去、同じパターンの翌日：勝率 <span style={{ fontWeight: 700 }}>{Math.round(p.volumeMismatch.nextDayStats.winRate * 100)}%</span>
+                            ・平均{p.volumeMismatch.nextDayStats.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.volumeMismatch.nextDayStats.avg))}枚
+                            （{p.volumeMismatch.nextDayStats.sampleSize}件中）
+                          </div>
+                        ) : (
+                          <div style={{ marginTop: "4px", color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（翌日）</div>
+                        )}
+                        {p.volumeMismatch.twoDayStats ? (
+                          <div>
+                            2日後：勝率 <span style={{ fontWeight: 700 }}>{Math.round(p.volumeMismatch.twoDayStats.winRate * 100)}%</span>
+                            ・平均{p.volumeMismatch.twoDayStats.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.volumeMismatch.twoDayStats.avg))}枚
+                            （{p.volumeMismatch.twoDayStats.sampleSize}件中）
+                          </div>
+                        ) : (
+                          <div style={{ color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（2日後）</div>
+                        )}
                       </div>
                     )}
                   </div>
