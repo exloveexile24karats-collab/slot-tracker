@@ -30,6 +30,7 @@ import { storage } from "./storage";
 
 const PAGES_KEY = "slot-pages-v1";
 const historyKey = (pageId) => `slot-history-${pageId}`;
+const recommendKey = (pageId) => `slot-recommend-${pageId}`;
 const EVENT_NAMES_KEY = "slot-event-names-v1";
 const STRONG_EVENTS_KEY = "slot-strong-events-v1";
 const CLOSED_DAYS_KEY = "slot-closed-days-v1";
@@ -47,7 +48,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "2.6";
+const APP_VERSION = "3.0";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -185,6 +186,23 @@ function computeBaseRate(series) {
   return wins / series.length;
 }
 
+// rough letter-grade banding for the overall score, for at-a-glance ranking.
+// these cutoffs are just for readability, not a statistically rigorous scale.
+const GRADE_BANDS = [
+  { min: 0.8, grade: "S" },
+  { min: 0.7, grade: "A" },
+  { min: 0.62, grade: "B" },
+  { min: 0.56, grade: "C" },
+  { min: 0.52, grade: "D" },
+  { min: 0.48, grade: "E" },
+  { min: 0.42, grade: "F" },
+  { min: -Infinity, grade: "G" },
+];
+function scoreToGrade(score) {
+  if (score === null || score === undefined) return null;
+  return GRADE_BANDS.find((b) => score >= b.min).grade;
+}
+
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
 function computeStreaks(series) {
   const streaks = [];
@@ -306,6 +324,32 @@ function evaluateEventNamePerformance(series, historyByDate, eventName) {
   return { sampleSize: pairs.length, winRate: wins / pairs.length, avgNext: pairs.reduce((a, p) => a + p.nextSada, 0) / pairs.length };
 }
 
+// every calendar date from start to end, inclusive (used for recommend periods)
+function enumerateDateRange(start, end) {
+  const dates = [];
+  let cursor = start;
+  let guard = 0;
+  while (cursor <= end && guard < 400) {
+    dates.push(cursor);
+    cursor = addDays(cursor, 1);
+    guard += 1;
+  }
+  return dates;
+}
+
+// how has this machine performed ON days that fall inside a given date set
+// (e.g. a hall-declared "recommended" period), vs its usual base rate?
+function evaluateMembershipPerformance(series, dateSet) {
+  const memberDays = series.filter((s) => dateSet.has(s.date));
+  if (memberDays.length < 3) return null;
+  const wins = memberDays.filter((s) => s.sada > 0).length;
+  return {
+    sampleSize: memberDays.length,
+    winRate: wins / memberDays.length,
+    avg: memberDays.reduce((a, s) => a + s.sada, 0) / memberDays.length,
+  };
+}
+
 // heavy play (high G数) without a proportional payout — a caution flag, not a "buy" signal
 function evaluateVolumeMismatch(seriesWithGsu) {
   const gsuVals = seriesWithGsu.map((s) => s.gsu).filter((v) => v !== null && v !== undefined);
@@ -363,6 +407,14 @@ export default function SlotDataTracker() {
   const [confirmDeletePage, setConfirmDeletePage] = useState(null);
   const loadedHistoryRef = useRef(new Set());
 
+  // ---- recommended-model periods (page-scoped, since a page = one 機種) ----
+  const [pageRecommends, setPageRecommends] = useState({});
+  const loadedRecommendRef = useRef(new Set());
+  const [recommendStart, setRecommendStart] = useState(todayStr());
+  const [recommendEnd, setRecommendEnd] = useState(todayStr());
+  const [recommendLabel, setRecommendLabel] = useState("");
+  const [recommendStatus, setRecommendStatus] = useState(null);
+
   // ---- global event registries ----
   const [eventNames, setEventNames] = useState([]);
   const [strongEvents, setStrongEvents] = useState([]); // [{name,color}] - matched by event NAME, not a specific date
@@ -388,7 +440,6 @@ export default function SlotDataTracker() {
   // ---- per-page form / view state ----
   const [pasteText, setPasteText] = useState("");
   const [entryDate, setEntryDate] = useState(todayStr());
-  const [entryEvent, setEntryEvent] = useState("");
   const [status, setStatus] = useState(null);
   const [selectedMachines, setSelectedMachines] = useState([]);
   const [range, setRange] = useState(30);
@@ -468,11 +519,7 @@ export default function SlotDataTracker() {
       }
       try {
         const r5 = await storage.get(DATE_EVENT_MAP_KEY, false);
-        if (r5 && r5.value) {
-          const parsedMap = JSON.parse(r5.value);
-          setDateEventMap(parsedMap);
-          setEntryEvent((prev) => (prev ? prev : parsedMap[entryDate] || prev));
-        }
+        if (r5 && r5.value) setDateEventMap(JSON.parse(r5.value));
       } catch (e) {
         // none yet
       }
@@ -495,10 +542,25 @@ export default function SlotDataTracker() {
     })();
   }, [activePageId]);
 
+  // ---- lazy-load recommended-model periods for whichever page becomes active ----
+  useEffect(() => {
+    if (!activePageId) return;
+    if (loadedRecommendRef.current.has(activePageId)) return;
+    loadedRecommendRef.current.add(activePageId);
+    (async () => {
+      try {
+        const res = await storage.get(recommendKey(activePageId), false);
+        const val = res && res.value ? JSON.parse(res.value) : [];
+        setPageRecommends((prev) => ({ ...prev, [activePageId]: Array.isArray(val) ? val : [] }));
+      } catch (e) {
+        setPageRecommends((prev) => ({ ...prev, [activePageId]: [] }));
+      }
+    })();
+  }, [activePageId]);
+
   // ---- reset ephemeral per-page UI state when switching pages ----
-  // note: entryEvent is intentionally NOT cleared here, so an event typed
-  // while entering one page's data carries over to other pages for the
-  // same date (see the entryDate-based reset effect below).
+  // note: event text is no longer part of this per-page form state at all —
+  // it's pulled live from the shared dateEventMap registry at save time.
   useEffect(() => {
     setSelectedMachines([]);
     setPasteText("");
@@ -522,6 +584,15 @@ export default function SlotDataTracker() {
       if (!res) setStatus({ type: "error", msg: "保存に失敗しました。もう一度お試しください。" });
     } catch (e) {
       setStatus({ type: "error", msg: "保存中にエラーが発生しました。" });
+    }
+  }, []);
+
+  const persistPageRecommends = useCallback(async (pageId, next) => {
+    setPageRecommends((prev) => ({ ...prev, [pageId]: next }));
+    try {
+      await storage.set(recommendKey(pageId), JSON.stringify(next), false);
+    } catch (e) {
+      // ignore
     }
   }, []);
 
@@ -564,13 +635,35 @@ export default function SlotDataTracker() {
   // race-safe upsert: merges against the LATEST state (via the functional
   // setState form) instead of a value captured in a stale closure, so
   // saving several dates back-to-back can't silently drop earlier entries
-  const upsertDateEvent = useCallback((date, name) => {
-    setDateEventMap((prev) => {
-      const next = { ...prev, [date]: name };
-      storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch(() => {});
-      return next;
-    });
-  }, []);
+  const upsertDateEvent = useCallback(
+    async (date, name) => {
+      setDateEventMap((prev) => {
+        const next = { ...prev, [date]: name };
+        storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch(() => {});
+        return next;
+      });
+      // retroactively patch every OTHER page's already-saved record for this
+      // date too, so registering an event once is truly the only step needed
+      for (const p of pages) {
+        let hist = pageHistories[p.id];
+        if (hist === undefined) {
+          try {
+            const res = await storage.get(historyKey(p.id), false);
+            hist = res && res.value ? JSON.parse(res.value) : [];
+          } catch (e) {
+            hist = [];
+          }
+        }
+        const idx = hist.findIndex((h) => h.date === date);
+        if (idx === -1 || hist[idx].event === name) continue;
+        const nextHist = hist.map((h, i) => (i === idx ? { ...h, event: name } : h));
+        loadedHistoryRef.current.add(p.id);
+        setPageHistories((prev) => ({ ...prev, [p.id]: nextHist }));
+        storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch(() => {});
+      }
+    },
+    [pages, pageHistories]
+  );
 
   function rememberEventName(name) {
     const trimmed = (name || "").trim();
@@ -603,6 +696,7 @@ export default function SlotDataTracker() {
   const currentHistory = pageHistories[activePageId] || [];
   const historyLoading = activePageId && pageHistories[activePageId] === undefined;
   const currentPage = pages.find((p) => p.id === activePageId);
+  const currentRecommends = pageRecommends[activePageId] || [];
 
   const allMachineNumbers = useMemo(() => {
     const set = new Set();
@@ -633,6 +727,14 @@ export default function SlotDataTracker() {
   const entryDateHasExisting = !!historyByDate[entryDate];
 
   const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
+
+  const recommendDateSet = useMemo(() => {
+    const set = new Set();
+    currentRecommends.forEach((p) => {
+      enumerateDateRange(p.startDate, p.endDate).forEach((d) => set.add(d));
+    });
+    return set;
+  }, [currentRecommends]);
 
   // warn if the date being entered was already registered as a closed (店休日) day
   const entryDateIsClosed = closedDateSet.has(entryDate);
@@ -945,11 +1047,22 @@ export default function SlotDataTracker() {
         }
       }
 
+      // is tomorrow within a hall-declared "おすすめ機種" period for this
+      // page (機種)? if so, how has this machine done during such periods before?
+      let recommendMatch = null;
+      if (recommendDateSet.has(tomorrowDate)) {
+        const perf = evaluateMembershipPerformance(series, recommendDateSet);
+        if (perf && perf.winRate > baseRate) {
+          const activePeriod = currentRecommends.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
+          recommendMatch = { label: activePeriod ? activePeriod.label : "おすすめ期間", ...perf };
+        }
+      }
+
       // caution flag: heavy play without a proportional payout
       const volumeMismatch = evaluateVolumeMismatch(seriesFull);
 
       const hasAnySignal =
-        matchedWindows.length > 0 || streakMatch || weekdayMatch || strongFollowMatch || plannedEventMatch || volumeMismatch;
+        matchedWindows.length > 0 || streakMatch || weekdayMatch || strongFollowMatch || plannedEventMatch || recommendMatch || volumeMismatch;
       if (!hasAnySignal) return;
 
       // combine every POSITIVE matched signal's win rate into one overall score
@@ -960,10 +1073,12 @@ export default function SlotDataTracker() {
       if (weekdayMatch && weekdayMatch.winRate !== null) signalWinRates.push(weekdayMatch.winRate);
       if (strongFollowMatch) signalWinRates.push(strongFollowMatch.winRate);
       if (plannedEventMatch && plannedEventMatch.favorable) signalWinRates.push(plannedEventMatch.winRate);
+      if (recommendMatch) signalWinRates.push(recommendMatch.winRate);
       const overallScore = signalWinRates.length
         ? signalWinRates.reduce((a, b) => a + b, 0) / signalWinRates.length
         : null;
       const signalCount = signalWinRates.length;
+      const grade = scoreToGrade(overallScore);
 
       results.push({
         no,
@@ -978,17 +1093,21 @@ export default function SlotDataTracker() {
         combinedWeekdayDigit,
         strongFollowMatch,
         plannedEventMatch,
+        recommendMatch,
         volumeMismatch,
         overallScore,
         signalCount,
+        grade,
       });
     });
     results.sort((a, b) => {
-      if (b.signalCount !== a.signalCount) return b.signalCount - a.signalCount;
-      return (b.overallScore ?? 0) - (a.overallScore ?? 0);
+      const aScore = a.overallScore ?? -1;
+      const bScore = b.overallScore ?? -1;
+      if (bScore !== aScore) return bScore - aScore;
+      return b.signalCount - a.signalCount;
     });
     return results;
-  }, [allMachineNumbers, sortedHistory, strongDateSet, historyByDate, dateEventMap]);
+  }, [allMachineNumbers, sortedHistory, strongDateSet, historyByDate, dateEventMap, recommendDateSet, currentRecommends]);
 
   // system-wide reference accuracy: aggregates every 10/20/30-day threshold
   // rule found across every machine on this page, weighted by sample size.
@@ -1068,24 +1187,21 @@ export default function SlotDataTracker() {
       setStatus({ type: "error", msg: "日付を入力してください。" });
       return;
     }
-    const trimmedEvent = entryEvent.trim();
+    // event text is no longer typed here — it's pulled automatically from
+    // the shared date→event registry (managed in the "イベント登録" panel),
+    // so every page always stays in sync with zero extra steps
+    const autoEvent = (dateEventMap[entryDate] || "").trim();
     const next = [
       ...currentHistory.filter((h) => h.date !== entryDate),
-      { date: entryDate, event: trimmedEvent, machines: parsedMachines },
+      { date: entryDate, event: autoEvent, machines: parsedMachines },
     ];
     persistPageHistory(activePageId, next);
-    rememberEventName(trimmedEvent);
-    if (trimmedEvent) {
-      upsertDateEvent(entryDate, trimmedEvent);
-    }
     setStatus({
       type: "ok",
       msg: `${entryDate} のデータを保存しました（${parsedMachines.length}台分）。`,
     });
     setPasteText("");
-    const nextDate = addDays(entryDate, -1);
-    setEntryDate(nextDate);
-    setEntryEvent(dateEventMap[nextDate] || "");
+    setEntryDate(addDays(entryDate, -1));
   }
 
   function handleDeleteDate(date) {
@@ -1111,7 +1227,6 @@ export default function SlotDataTracker() {
     );
     setPasteText([header, ...rows].join("\n"));
     setEntryDate(h.date);
-    setEntryEvent(h.event || "");
     setStatus({ type: "ok", msg: `${h.date} のデータを編集用に読み込みました。修正して保存すると上書きされます。` });
   }
 
@@ -1167,26 +1282,65 @@ export default function SlotDataTracker() {
     persistClosedDays(closedDays.filter((c) => c.date !== date));
   }
 
-  function handleAddFutureEvent() {
+  function handleAddRecommend() {
+    if (!activePageId) return;
+    if (!recommendStart || !recommendEnd) {
+      setRecommendStatus({ type: "error", msg: "開始日と終了日を入力してください。" });
+      return;
+    }
+    if (recommendStart > recommendEnd) {
+      setRecommendStatus({ type: "error", msg: "終了日は開始日より後にしてください。" });
+      return;
+    }
+    const label = recommendLabel.trim() || "おすすめ期間";
+    const next = [...currentRecommends, { id: `rec-${Date.now()}`, startDate: recommendStart, endDate: recommendEnd, label }];
+    persistPageRecommends(activePageId, next);
+    setRecommendStatus({ type: "ok", msg: `${recommendStart}〜${recommendEnd} を「${label}」として登録しました。` });
+    setRecommendLabel("");
+  }
+
+  function handleRemoveRecommend(id) {
+    if (!activePageId) return;
+    persistPageRecommends(activePageId, currentRecommends.filter((r) => r.id !== id));
+  }
+
+  async function handleAddFutureEvent() {
     const name = futureEventName.trim();
     if (!futureEventDate || !name) {
       setFutureEventStatus({ type: "error", msg: "日付とイベント名を入力してください。" });
       return;
     }
-    upsertDateEvent(futureEventDate, name);
+    await upsertDateEvent(futureEventDate, name);
     rememberEventName(name);
-    setFutureEventStatus({ type: "ok", msg: `${futureEventDate} に「${name}」を予定イベントとして登録しました。` });
+    setFutureEventStatus({ type: "ok", msg: `${futureEventDate} に「${name}」を登録しました（既に保存済みの全ページのデータも更新しました）。` });
     setFutureEventName("");
     setFutureEventDate(addDays(futureEventDate, 1));
   }
 
-  function handleRemoveDateEvent(date) {
+  async function handleRemoveDateEvent(date) {
     setDateEventMap((prev) => {
       const next = { ...prev };
       delete next[date];
       storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch(() => {});
       return next;
     });
+    for (const p of pages) {
+      let hist = pageHistories[p.id];
+      if (hist === undefined) {
+        try {
+          const res = await storage.get(historyKey(p.id), false);
+          hist = res && res.value ? JSON.parse(res.value) : [];
+        } catch (e) {
+          hist = [];
+        }
+      }
+      const idx = hist.findIndex((h) => h.date === date);
+      if (idx === -1 || !hist[idx].event) continue;
+      const nextHist = hist.map((h, i) => (i === idx ? { ...h, event: "" } : h));
+      loadedHistoryRef.current.add(p.id);
+      setPageHistories((prev) => ({ ...prev, [p.id]: nextHist }));
+      storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch(() => {});
+    }
   }
 
   function handleUnlock() {
@@ -1412,11 +1566,7 @@ export default function SlotDataTracker() {
                 <input
                   type="date"
                   value={entryDate}
-                  onChange={(e) => {
-                    const newDate = e.target.value;
-                    setEntryDate(newDate);
-                    setEntryEvent(dateEventMap[newDate] || "");
-                  }}
+                  onChange={(e) => setEntryDate(e.target.value)}
                   style={{
                     width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
                     borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", boxSizing: "border-box",
@@ -1441,20 +1591,16 @@ export default function SlotDataTracker() {
               </div>
             )}
 
-            <div style={{ marginBottom: "10px" }}>
-              <label style={{ fontSize: "11px", color: "#8b93a3" }}>イベント名（任意・過去の入力から選択できます）</label>
-              <input
-                type="text"
-                list={DATALIST_ID}
-                value={entryEvent}
-                onChange={(e) => setEntryEvent(e.target.value)}
-                placeholder="例：末尾7の日、増台イベント など"
-                style={{
-                  width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
-                  borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", boxSizing: "border-box",
-                }}
-              />
-            </div>
+            {dateEventMap[entryDate] && (
+              <div style={{
+                fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
+                background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
+                display: "flex", alignItems: "center", gap: "6px",
+              }}>
+                <Flag size={12} />
+                この日のイベント：{dateEventMap[entryDate]}（「📅 イベント登録」で変更できます）
+              </div>
+            )}
 
             <div style={{ marginBottom: "10px" }}>
               <label style={{ fontSize: "11px", color: "#8b93a3" }}>
@@ -1573,6 +1719,81 @@ export default function SlotDataTracker() {
             </div>
           </div>
 
+          {/* recommended-model periods (page-scoped, since a page = one 機種) */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🏆 おすすめ機種期間（この機種）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              このお店の「月のおすすめ」「期間限定のおすすめ」など、この機種が対象になっている期間を自由な日付範囲で登録できます（月曜〜金曜や7日間である必要はありません）。「本日のピックアップ」で、この期間中の実績も見ます。
+            </div>
+            <div style={{ display: "flex", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>
+              <input
+                type="date"
+                value={recommendStart}
+                onChange={(e) => setRecommendStart(e.target.value)}
+                style={{
+                  flex: "1 1 120px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 6px", color: "#e7e9ee", fontSize: "12px",
+                }}
+              />
+              <span style={{ color: "#5a6272", alignSelf: "center" }}>〜</span>
+              <input
+                type="date"
+                value={recommendEnd}
+                onChange={(e) => setRecommendEnd(e.target.value)}
+                style={{
+                  flex: "1 1 120px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 6px", color: "#e7e9ee", fontSize: "12px",
+                }}
+              />
+            </div>
+            <input
+              type="text"
+              value={recommendLabel}
+              onChange={(e) => setRecommendLabel(e.target.value)}
+              placeholder="ラベル（例：7月のおすすめ、今週のイチ押し など）"
+              style={{
+                width: "100%", marginBottom: "8px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", boxSizing: "border-box",
+              }}
+            />
+            <button
+              onClick={handleAddRecommend}
+              style={{
+                width: "100%", background: "#bb9af7", color: "#12161d", border: "none", borderRadius: "8px",
+                padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
+              }}
+            >
+              おすすめ期間として登録
+            </button>
+            {recommendStatus && (
+              <div style={{ marginTop: "8px", fontSize: "11px", color: recommendStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                {recommendStatus.msg}
+              </div>
+            )}
+
+            <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+              {[...currentRecommends].sort((a, b) => b.startDate.localeCompare(a.startDate)).map((r) => (
+                <div key={r.id} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                  background: "#12161d", border: "1px solid #2a2540", borderRadius: "6px", padding: "5px 8px",
+                }}>
+                  <span>
+                    <span className="mono" style={{ color: "#bb9af7" }}>{r.startDate}〜{r.endDate}</span>
+                    <span style={{ marginLeft: "6px", color: "#c7cbd4" }}>{r.label}</span>
+                  </span>
+                  <button onClick={() => handleRemoveRecommend(r.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+              {currentRecommends.length === 0 && (
+                <div style={{ fontSize: "11px", color: "#5a6272" }}>登録されたおすすめ期間はまだありません。</div>
+              )}
+            </div>
+          </div>
+
           {/* strong event management (global, shared across all pages) */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
@@ -1646,13 +1867,15 @@ export default function SlotDataTracker() {
             </div>
           </div>
 
-          {/* future events: pre-register a date's event before that day's data exists */}
+          {/* the ONE place to register an event for any date — past, today, or future.
+              Saving any page automatically pulls the event from here, and registering
+              here retroactively patches every page's already-saved data too. */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              📅 予定イベント（先に登録）
+              📅 イベント登録（全ページ共通）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              まだデータが無い未来の日付でも、イベント名だけ先に登録できます。実際にその日のデータを入力するとき、イベント名が自動で入り、他のページにも反映されます。「本日のピックアップ」でも、そのイベント名の過去の傾向を照合します。
+              過去・今日・未来、どの日付でもここでイベント名を登録できます。各ページの「データ入力」にはイベント欄はもう無く、保存するときにここの登録内容を自動で読み込みます。ここで登録・削除すると、既に保存済みの全ページのデータも自動で書き換わります（再保存は不要です）。
             </div>
             <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
               <input
@@ -1683,7 +1906,7 @@ export default function SlotDataTracker() {
                 padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
               }}
             >
-              予定イベントとして登録
+              イベントとして登録
             </button>
             {futureEventStatus && (
               <div style={{ marginTop: "8px", fontSize: "11px", color: futureEventStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
@@ -1693,8 +1916,7 @@ export default function SlotDataTracker() {
 
             <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
               {Object.entries(dateEventMap)
-                .filter(([d]) => d >= todayStr())
-                .sort((a, b) => a[0].localeCompare(b[0]))
+                .sort((a, b) => b[0].localeCompare(a[0]))
                 .map(([d, name]) => (
                   <div key={d} style={{
                     display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
@@ -1709,8 +1931,8 @@ export default function SlotDataTracker() {
                     </button>
                   </div>
                 ))}
-              {Object.entries(dateEventMap).filter(([d]) => d >= todayStr()).length === 0 && (
-                <div style={{ fontSize: "11px", color: "#5a6272" }}>登録された予定イベントはまだありません。</div>
+              {Object.keys(dateEventMap).length === 0 && (
+                <div style={{ fontSize: "11px", color: "#5a6272" }}>登録されたイベントはまだありません。</div>
               )}
             </div>
           </div>
@@ -2163,7 +2385,7 @@ export default function SlotDataTracker() {
               本日のピックアップ（10日足・20日足・30日足）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台を「総合スコア」順にリストアップします（このページの全ての台が対象）
+              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台を「総合スコア」が高い順（同スコアなら根拠の件数が多い順）にリストアップします（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。
             </div>
             {overallBacktestStats && (
               <div style={{
@@ -2184,6 +2406,15 @@ export default function SlotDataTracker() {
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
                       <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                         <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
+                        {p.grade && (
+                          <span className="mono" style={{
+                            fontSize: "13px", fontWeight: 800, width: "22px", height: "22px", lineHeight: "22px",
+                            textAlign: "center", borderRadius: "50%", color: "#12161d",
+                            background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
+                          }}>
+                            {p.grade}
+                          </span>
+                        )}
                         {p.overallScore !== null && (
                           <span className="mono" style={{
                             fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a",
@@ -2282,6 +2513,14 @@ export default function SlotDataTracker() {
                           {" "}{Math.round(p.plannedEventMatch.winRate * 100)}%
                         </span>
                         でプラス（{p.plannedEventMatch.sampleSize}件中、平均{p.plannedEventMatch.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(p.plannedEventMatch.avgNext))}枚）
+                      </div>
+                    )}
+
+                    {p.recommendMatch && (
+                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(191,161,247,0.08)", borderRadius: "6px" }}>
+                        🏆 明日は「{p.recommendMatch.label}」期間中 → この期間の実績は勝率
+                        <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.recommendMatch.winRate * 100)}%</span>
+                        ・平均{p.recommendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.recommendMatch.avg))}枚（{p.recommendMatch.sampleSize}件中）
                       </div>
                     )}
 
