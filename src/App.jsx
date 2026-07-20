@@ -47,7 +47,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "2.0";
+const APP_VERSION = "2.3";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -216,13 +216,37 @@ function evaluateStreakPattern(series) {
 
 // per-weekday average 差枚 for a {date,sada} series
 function computeWeekdayStats(series) {
-  const buckets = Array.from({ length: 7 }, () => ({ sum: 0, count: 0 }));
+  const buckets = Array.from({ length: 7 }, () => ({ sum: 0, count: 0, wins: 0 }));
   series.forEach((pt) => {
     const wd = weekdayOf(pt.date);
     buckets[wd].sum += pt.sada;
     buckets[wd].count += 1;
+    if (pt.sada > 0) buckets[wd].wins += 1;
   });
-  return buckets.map((b) => ({ avg: b.count ? b.sum / b.count : null, count: b.count }));
+  return buckets.map((b) => ({
+    avg: b.count ? b.sum / b.count : null,
+    count: b.count,
+    winRate: b.count ? b.wins / b.count : null,
+  }));
+}
+
+function pearsonCorrelation(xs, ys) {
+  const n = xs.length;
+  if (n < 8) return null;
+  const meanX = xs.reduce((a, b) => a + b, 0) / n;
+  const meanY = ys.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let denX = 0;
+  let denY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX;
+    const dy = ys[i] - meanY;
+    num += dx * dy;
+    denX += dx * dx;
+    denY += dy * dy;
+  }
+  if (denX === 0 || denY === 0) return null;
+  return num / Math.sqrt(denX * denY);
 }
 
 // does the day AFTER a registered strong-event day tend to be better than usual?
@@ -237,6 +261,21 @@ function evaluateStrongFollow(series, strongDateSet) {
     return { sampleSize: arr.length, winRate: wins / arr.length, avgNext: arr.reduce((a, p) => a + p.nextSada, 0) / arr.length };
   }
   return { strong: summarize(pairs.filter((p) => p.isStrong)), normal: summarize(pairs.filter((p) => !p.isStrong)) };
+}
+
+// how has this machine historically done the day AFTER any occurrence of a
+// specific named event (not limited to the curated "strong" list)?
+function evaluateEventNamePerformance(series, historyByDate, eventName) {
+  const pairs = [];
+  for (let i = 0; i < series.length - 1; i++) {
+    const entry = historyByDate[series[i].date];
+    if (entry && entry.event && entry.event.trim() === eventName) {
+      pairs.push({ nextSada: series[i + 1].sada });
+    }
+  }
+  if (pairs.length < 3) return null;
+  const wins = pairs.filter((p) => p.nextSada > 0).length;
+  return { sampleSize: pairs.length, winRate: wins / pairs.length, avgNext: pairs.reduce((a, p) => a + p.nextSada, 0) / pairs.length };
 }
 
 // heavy play (high G数) without a proportional payout — a caution flag, not a "buy" signal
@@ -289,6 +328,11 @@ export default function SlotDataTracker() {
   // typed while entering one page's data auto-fills for the same date on
   // every other page, even after a reload / on another device) ----
   const [dateEventMap, setDateEventMap] = useState({});
+
+  // ---- future events (pre-register a date's event before that day's data exists) ----
+  const [futureEventDate, setFutureEventDate] = useState(addDays(todayStr(), 1));
+  const [futureEventName, setFutureEventName] = useState("");
+  const [futureEventStatus, setFutureEventStatus] = useState(null);
 
   // ---- per-page form / view state ----
   const [pasteText, setPasteText] = useState("");
@@ -799,9 +843,25 @@ export default function SlotDataTracker() {
 
       // weekday-based signal (does tomorrow's weekday historically do well?)
       const weekdayStats = computeWeekdayStats(series);
-      const tomorrowWeekday = weekdayOf(addDays(lastDate, 1));
+      const tomorrowDate = addDays(lastDate, 1);
+      const tomorrowWeekday = weekdayOf(tomorrowDate);
       const weekdayBucket = weekdayStats[tomorrowWeekday];
       const weekdayMatch = weekdayBucket && weekdayBucket.count >= 3 && weekdayBucket.avg > 0 ? weekdayBucket : null;
+
+      // if tomorrow is ALSO a "2のつく日" or "7のつく日", check that intersection specifically
+      const tomorrowDigit = parseInt(tomorrowDate.slice(-2), 10) % 10;
+      let combinedWeekdayDigit = null;
+      if (tomorrowDigit === 2 || tomorrowDigit === 7) {
+        const combinedDates = series.filter(
+          (pt) => weekdayOf(pt.date) === tomorrowWeekday && parseInt(pt.date.slice(-2), 10) % 10 === tomorrowDigit
+        );
+        if (combinedDates.length > 0) {
+          const avg = combinedDates.reduce((a, p) => a + p.sada, 0) / combinedDates.length;
+          combinedWeekdayDigit = { digit: tomorrowDigit, avg, count: combinedDates.length };
+        } else {
+          combinedWeekdayDigit = { digit: tomorrowDigit, avg: null, count: 0 };
+        }
+      }
 
       // did today follow a registered strong-event day, and does that pattern historically help?
       const strongFollowEval = series.length >= 6 ? evaluateStrongFollow(series, strongDateSet) : null;
@@ -813,11 +873,37 @@ export default function SlotDataTracker() {
         }
       }
 
+      // is tomorrow pre-registered (via 予定イベント) as a specific named event?
+      // if so, look up THAT event name's own historical track record for this
+      // machine — works for any event name, not just the curated strong list
+      const plannedEventName = dateEventMap[tomorrowDate];
+      let plannedEventMatch = null;
+      if (plannedEventName) {
+        const perf = evaluateEventNamePerformance(series, historyByDate, plannedEventName);
+        if (perf) {
+          plannedEventMatch = { name: plannedEventName, ...perf };
+        }
+      }
+
       // caution flag: heavy play without a proportional payout
       const volumeMismatch = evaluateVolumeMismatch(seriesFull);
 
-      const hasAnySignal = matchedWindows.length > 0 || streakMatch || weekdayMatch || strongFollowMatch || volumeMismatch;
+      const hasAnySignal =
+        matchedWindows.length > 0 || streakMatch || weekdayMatch || strongFollowMatch || plannedEventMatch || volumeMismatch;
       if (!hasAnySignal) return;
+
+      // combine every POSITIVE matched signal's win rate into one overall score
+      // (volumeMismatch is a caution flag, not a positive signal, so it's excluded)
+      const signalWinRates = [];
+      matchedWindows.forEach((w) => signalWinRates.push(Math.max(...w.result.reasons.map((r) => r.winRate))));
+      if (streakMatch) signalWinRates.push(streakMatch.winRate);
+      if (weekdayMatch && weekdayMatch.winRate !== null) signalWinRates.push(weekdayMatch.winRate);
+      if (strongFollowMatch) signalWinRates.push(strongFollowMatch.winRate);
+      if (plannedEventMatch && plannedEventMatch.winRate > 0.5) signalWinRates.push(plannedEventMatch.winRate);
+      const overallScore = signalWinRates.length
+        ? signalWinRates.reduce((a, b) => a + b, 0) / signalWinRates.length
+        : null;
+      const signalCount = signalWinRates.length;
 
       results.push({
         no,
@@ -829,16 +915,86 @@ export default function SlotDataTracker() {
         streakMatch,
         weekdayMatch,
         weekdayTomorrow: WEEKDAY_LABELS[tomorrowWeekday],
+        combinedWeekdayDigit,
         strongFollowMatch,
+        plannedEventMatch,
         volumeMismatch,
+        overallScore,
+        signalCount,
       });
     });
     results.sort((a, b) => {
-      if (b.matchedCount !== a.matchedCount) return b.matchedCount - a.matchedCount;
-      return (b.avgWinRate ?? 0) - (a.avgWinRate ?? 0);
+      if (b.signalCount !== a.signalCount) return b.signalCount - a.signalCount;
+      return (b.overallScore ?? 0) - (a.overallScore ?? 0);
     });
     return results;
-  }, [allMachineNumbers, sortedHistory, strongDateSet]);
+  }, [allMachineNumbers, sortedHistory, strongDateSet, historyByDate, dateEventMap]);
+
+  // system-wide reference accuracy: aggregates every 10/20/30-day threshold
+  // rule found across every machine on this page, weighted by sample size.
+  // NOTE: this is an in-sample measure (the rule was derived from, and is
+  // being checked against, the same historical data) — not a true walk-
+  // forward backtest — so treat it as a rough reference, not a guarantee.
+  const overallBacktestStats = useMemo(() => {
+    let totalWins = 0;
+    let totalSamples = 0;
+    allMachineNumbers.forEach((no) => {
+      const series = sortedHistory
+        .map((h) => {
+          const m = h.machines.find((mm) => mm.no === no);
+          return m && m.sada !== null ? { date: h.date, sada: m.sada } : null;
+        })
+        .filter(Boolean);
+      [10, 20, 30].forEach((w) => {
+        const pairs = buildTrailingPairs(series, w);
+        const result = findBestThresholds(pairs);
+        if (result?.bestAbove) {
+          totalWins += result.bestAbove.winRate * result.bestAbove.sampleSize;
+          totalSamples += result.bestAbove.sampleSize;
+        }
+        if (result?.bestBelow) {
+          totalWins += result.bestBelow.winRate * result.bestBelow.sampleSize;
+          totalSamples += result.bestBelow.sampleSize;
+        }
+      });
+    });
+    return totalSamples > 0 ? { winRate: totalWins / totalSamples, totalSamples } : null;
+  }, [allMachineNumbers, sortedHistory]);
+
+  // machine-to-machine correlation: does machine A's daily 差枚 tend to move
+  // with machine B's, on days both have data? (Pearson correlation)
+  const machineCorrelations = useMemo(() => {
+    const seriesByMachine = {};
+    allMachineNumbers.forEach((no) => {
+      const map = {};
+      sortedHistory.forEach((h) => {
+        const m = h.machines.find((mm) => mm.no === no);
+        if (m && m.sada !== null) map[h.date] = m.sada;
+      });
+      seriesByMachine[no] = map;
+    });
+
+    const results = [];
+    for (let i = 0; i < allMachineNumbers.length; i++) {
+      for (let j = i + 1; j < allMachineNumbers.length; j++) {
+        const noA = allMachineNumbers[i];
+        const noB = allMachineNumbers[j];
+        const mapA = seriesByMachine[noA];
+        const mapB = seriesByMachine[noB];
+        const commonDates = Object.keys(mapA).filter((d) => d in mapB);
+        if (commonDates.length < 10) continue;
+        const xs = commonDates.map((d) => mapA[d]);
+        const ys = commonDates.map((d) => mapB[d]);
+        const r = pearsonCorrelation(xs, ys);
+        if (r === null) continue;
+        if (Math.abs(r) >= 0.4) {
+          results.push({ noA, noB, r, sampleSize: commonDates.length });
+        }
+      }
+    }
+    results.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
+    return results.slice(0, 20);
+  }, [allMachineNumbers, sortedHistory]);
 
   function handleSave() {
     if (!activePageId) return;
@@ -948,6 +1104,28 @@ export default function SlotDataTracker() {
 
   function handleRemoveClosedDay(date) {
     persistClosedDays(closedDays.filter((c) => c.date !== date));
+  }
+
+  function handleAddFutureEvent() {
+    const name = futureEventName.trim();
+    if (!futureEventDate || !name) {
+      setFutureEventStatus({ type: "error", msg: "日付とイベント名を入力してください。" });
+      return;
+    }
+    upsertDateEvent(futureEventDate, name);
+    rememberEventName(name);
+    setFutureEventStatus({ type: "ok", msg: `${futureEventDate} に「${name}」を予定イベントとして登録しました。` });
+    setFutureEventName("");
+    setFutureEventDate(addDays(futureEventDate, 1));
+  }
+
+  function handleRemoveDateEvent(date) {
+    setDateEventMap((prev) => {
+      const next = { ...prev };
+      delete next[date];
+      storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch(() => {});
+      return next;
+    });
   }
 
   function handleUnlock() {
@@ -1407,6 +1585,75 @@ export default function SlotDataTracker() {
             </div>
           </div>
 
+          {/* future events: pre-register a date's event before that day's data exists */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📅 予定イベント（先に登録）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              まだデータが無い未来の日付でも、イベント名だけ先に登録できます。実際にその日のデータを入力するとき、イベント名が自動で入り、他のページにも反映されます。「本日のピックアップ」でも、そのイベント名の過去の傾向を照合します。
+            </div>
+            <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
+              <input
+                type="date"
+                value={futureEventDate}
+                onChange={(e) => setFutureEventDate(e.target.value)}
+                style={{
+                  flex: "0 0 130px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 6px", color: "#e7e9ee", fontSize: "12px",
+                }}
+              />
+              <input
+                type="text"
+                list={DATALIST_ID}
+                value={futureEventName}
+                onChange={(e) => setFutureEventName(e.target.value)}
+                placeholder="イベント名（例：末尾7の日）"
+                style={{
+                  flex: 1, background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", minWidth: 0,
+                }}
+              />
+            </div>
+            <button
+              onClick={handleAddFutureEvent}
+              style={{
+                width: "100%", background: "#7aa2f7", color: "#12161d", border: "none", borderRadius: "8px",
+                padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
+              }}
+            >
+              予定イベントとして登録
+            </button>
+            {futureEventStatus && (
+              <div style={{ marginTop: "8px", fontSize: "11px", color: futureEventStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                {futureEventStatus.msg}
+              </div>
+            )}
+
+            <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+              {Object.entries(dateEventMap)
+                .filter(([d]) => d >= todayStr())
+                .sort((a, b) => a[0].localeCompare(b[0]))
+                .map(([d, name]) => (
+                  <div key={d} style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                    background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "5px 8px",
+                  }}>
+                    <span>
+                      <span className="mono" style={{ color: "#7aa2f7" }}>{d}</span>
+                      <span style={{ marginLeft: "6px", color: "#c7cbd4" }}>{name}</span>
+                    </span>
+                    <button onClick={() => handleRemoveDateEvent(d)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                ))}
+              {Object.entries(dateEventMap).filter(([d]) => d >= todayStr()).length === 0 && (
+                <div style={{ fontSize: "11px", color: "#5a6272" }}>登録された予定イベントはまだありません。</div>
+              )}
+            </div>
+          </div>
+
           {/* closed days (global, shared across all pages) */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
@@ -1854,9 +2101,19 @@ export default function SlotDataTracker() {
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
               本日のピックアップ（10日足・20日足・30日足）
             </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台をリストアップします（このページの全ての台が対象）
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台を「総合スコア」順にリストアップします（このページの全ての台が対象）
             </div>
+            {overallBacktestStats && (
+              <div style={{
+                fontSize: "11px", color: "#8b93a3", marginBottom: "12px", padding: "8px 10px",
+                background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+              }}>
+                参考：総差枚しきい値ルールの過去的中率（全台・10/20/30日足 合算） 約
+                <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(overallBacktestStats.winRate * 100)}%</span>
+                （{overallBacktestStats.totalSamples}件） ※ルールを作った同じ過去データで検証した参考値です。将来を保証するものではありません。
+              </div>
+            )}
             {pickList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
             ) : (
@@ -1864,7 +2121,17 @@ export default function SlotDataTracker() {
                 {pickList.map((p) => (
                   <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
+                      <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
+                        {p.overallScore !== null && (
+                          <span className="mono" style={{
+                            fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a",
+                            borderRadius: "4px", padding: "1px 6px",
+                          }}>
+                            総合スコア {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
+                          </span>
+                        )}
+                      </span>
                       <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}時点</span>
                     </div>
 
@@ -1912,11 +2179,40 @@ export default function SlotDataTracker() {
                       </div>
                     )}
 
+                    {p.combinedWeekdayDigit && (
+                      <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "3px", marginLeft: "12px" }}>
+                        └ さらに絞って{p.weekdayTomorrow}曜日×{p.combinedWeekdayDigit.digit}のつく日：
+                        {p.combinedWeekdayDigit.count === 0 ? (
+                          <span>過去に該当日がまだありません</span>
+                        ) : (
+                          <span>
+                            平均 <span style={{ color: p.combinedWeekdayDigit.avg >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+                              {p.combinedWeekdayDigit.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.combinedWeekdayDigit.avg))}枚
+                            </span>（{p.combinedWeekdayDigit.count}件中 — サンプルが少ないので参考程度に）
+                          </span>
+                        )}
+                      </div>
+                    )}
+
                     {p.strongFollowMatch && (
                       <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
                         <Star size={10} style={{ display: "inline", marginRight: "2px", color: "#e5697a" }} fill="#e5697a" />
                         今日は強いイベント日 → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.strongFollowMatch.winRate * 100)}%</span>
                         （通常{Math.round(p.strongFollowMatch.normalRate * 100)}% ／ {p.strongFollowMatch.sampleSize}件中）
+                      </div>
+                    )}
+
+                    {p.plannedEventMatch && (
+                      <div style={{
+                        fontSize: "11px", marginTop: "6px", padding: "6px 8px", borderRadius: "6px",
+                        color: p.plannedEventMatch.winRate > 0.5 ? "#8b93a3" : "#e5697a",
+                        background: p.plannedEventMatch.winRate > 0.5 ? "rgba(232,179,76,0.08)" : "rgba(229,105,122,0.06)",
+                      }}>
+                        📅 明日は予定イベント「{p.plannedEventMatch.name}」 → このイベントの翌日は過去
+                        <span style={{ color: p.plannedEventMatch.winRate > 0.5 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+                          {" "}{Math.round(p.plannedEventMatch.winRate * 100)}%
+                        </span>
+                        でプラス（{p.plannedEventMatch.sampleSize}件中、平均{p.plannedEventMatch.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(p.plannedEventMatch.avgNext))}枚）
                       </div>
                     )}
 
@@ -1929,6 +2225,44 @@ export default function SlotDataTracker() {
                     )}
                   </div>
                 ))}
+              </div>
+            )}
+          </div>
+
+          {/* machine-to-machine correlation */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              台同士の相関
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+              日ごとの差枚が似た動きをする台の組み合わせを探します（相関係数の絶対値が0.4以上、同時データ10日分以上のペアのみ表示）。相関は因果関係を示すものではなく、偶然による見かけ上の一致も含まれる点にご注意ください。
+            </div>
+            {machineCorrelations.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>目立った相関の組み合わせはまだ見つかっていません。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "300px", overflowY: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+                  <thead>
+                    <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>台番A</th>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>台番B</th>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>相関係数</th>
+                      <th style={{ padding: "4px 8px", fontWeight: 600 }}>同時日数</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {machineCorrelations.map((c) => (
+                      <tr key={c.noA + "-" + c.noB} style={{ borderTop: "1px solid #232b37" }}>
+                        <td className="mono" style={{ padding: "6px 8px", color: "#c7cbd4" }}>{c.noA}</td>
+                        <td className="mono" style={{ padding: "6px 8px", color: "#c7cbd4" }}>{c.noB}</td>
+                        <td className="mono" style={{ padding: "6px 8px", fontWeight: 700, color: c.r >= 0 ? "#9ece6a" : "#e5697a" }}>
+                          {c.r >= 0 ? "+" : ""}{c.r.toFixed(2)}
+                        </td>
+                        <td className="mono" style={{ padding: "6px 8px", color: "#5a6272" }}>{c.sampleSize}日</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
