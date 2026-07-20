@@ -48,7 +48,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.0";
+const APP_VERSION = "3.1";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -407,9 +407,15 @@ export default function SlotDataTracker() {
   const [confirmDeletePage, setConfirmDeletePage] = useState(null);
   const loadedHistoryRef = useRef(new Set());
 
+  // ---- top-level tab: a normal 機種 page, or the shared "共通設定" tab ----
+  const [viewMode, setViewMode] = useState("page"); // "page" | "common"
+
   // ---- recommended-model periods (page-scoped, since a page = one 機種) ----
+  // managed from the 共通設定 tab via a dropdown, so pages don't need their
+  // own copy of this UI — but the data itself still lives per page
   const [pageRecommends, setPageRecommends] = useState({});
   const loadedRecommendRef = useRef(new Set());
+  const [recommendTargetPageId, setRecommendTargetPageId] = useState(null);
   const [recommendStart, setRecommendStart] = useState(todayStr());
   const [recommendEnd, setRecommendEnd] = useState(todayStr());
   const [recommendLabel, setRecommendLabel] = useState("");
@@ -542,21 +548,27 @@ export default function SlotDataTracker() {
     })();
   }, [activePageId]);
 
-  // ---- lazy-load recommended-model periods for whichever page becomes active ----
+  // ---- lazy-load recommended-model periods for every page, so the shared
+  //      共通設定 tab's machine dropdown works regardless of which 機種 tab
+  //      is currently active ----
   useEffect(() => {
-    if (!activePageId) return;
-    if (loadedRecommendRef.current.has(activePageId)) return;
-    loadedRecommendRef.current.add(activePageId);
-    (async () => {
-      try {
-        const res = await storage.get(recommendKey(activePageId), false);
-        const val = res && res.value ? JSON.parse(res.value) : [];
-        setPageRecommends((prev) => ({ ...prev, [activePageId]: Array.isArray(val) ? val : [] }));
-      } catch (e) {
-        setPageRecommends((prev) => ({ ...prev, [activePageId]: [] }));
-      }
-    })();
-  }, [activePageId]);
+    pages.forEach((p) => {
+      if (loadedRecommendRef.current.has(p.id)) return;
+      loadedRecommendRef.current.add(p.id);
+      (async () => {
+        try {
+          const res = await storage.get(recommendKey(p.id), false);
+          const val = res && res.value ? JSON.parse(res.value) : [];
+          setPageRecommends((prev) => ({ ...prev, [p.id]: Array.isArray(val) ? val : [] }));
+        } catch (e) {
+          setPageRecommends((prev) => ({ ...prev, [p.id]: [] }));
+        }
+      })();
+    });
+    if (!recommendTargetPageId && pages.length > 0) {
+      setRecommendTargetPageId(pages[0].id);
+    }
+  }, [pages, recommendTargetPageId]);
 
   // ---- reset ephemeral per-page UI state when switching pages ----
   // note: event text is no longer part of this per-page form state at all —
@@ -678,6 +690,7 @@ export default function SlotDataTracker() {
     const next = [...pages, { id: `page-${Date.now()}`, name: "" }];
     persistPages(next);
     setActivePageId(next[next.length - 1].id);
+    setViewMode("page");
   }
 
   function handleRenamePage(pageId, name) {
@@ -696,7 +709,10 @@ export default function SlotDataTracker() {
   const currentHistory = pageHistories[activePageId] || [];
   const historyLoading = activePageId && pageHistories[activePageId] === undefined;
   const currentPage = pages.find((p) => p.id === activePageId);
-  const currentRecommends = pageRecommends[activePageId] || [];
+  // this page's own recommend periods (used for this page's own predictions)
+  const activePageRecommends = pageRecommends[activePageId] || [];
+  // whichever page is selected in the 共通設定 tab's dropdown (used for that UI)
+  const recommendTargetList = pageRecommends[recommendTargetPageId] || [];
 
   const allMachineNumbers = useMemo(() => {
     const set = new Set();
@@ -728,13 +744,16 @@ export default function SlotDataTracker() {
 
   const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
 
+  // this PAGE's own recommend periods, for its own machines' predictions
   const recommendDateSet = useMemo(() => {
     const set = new Set();
-    currentRecommends.forEach((p) => {
+    activePageRecommends.forEach((p) => {
       enumerateDateRange(p.startDate, p.endDate).forEach((d) => set.add(d));
     });
     return set;
-  }, [currentRecommends]);
+  }, [activePageRecommends]);
+
+  // whichever page the 共通設定 dropdown has selected, for the registration UI
 
   // warn if the date being entered was already registered as a closed (店休日) day
   const entryDateIsClosed = closedDateSet.has(entryDate);
@@ -1053,7 +1072,7 @@ export default function SlotDataTracker() {
       if (recommendDateSet.has(tomorrowDate)) {
         const perf = evaluateMembershipPerformance(series, recommendDateSet);
         if (perf && perf.winRate > baseRate) {
-          const activePeriod = currentRecommends.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
+          const activePeriod = activePageRecommends.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
           recommendMatch = { label: activePeriod ? activePeriod.label : "おすすめ期間", ...perf };
         }
       }
@@ -1107,7 +1126,7 @@ export default function SlotDataTracker() {
       return b.signalCount - a.signalCount;
     });
     return results;
-  }, [allMachineNumbers, sortedHistory, strongDateSet, historyByDate, dateEventMap, recommendDateSet, currentRecommends]);
+  }, [allMachineNumbers, sortedHistory, strongDateSet, historyByDate, dateEventMap, recommendDateSet, activePageRecommends]);
 
   // system-wide reference accuracy: aggregates every 10/20/30-day threshold
   // rule found across every machine on this page, weighted by sample size.
@@ -1283,7 +1302,7 @@ export default function SlotDataTracker() {
   }
 
   function handleAddRecommend() {
-    if (!activePageId) return;
+    if (!recommendTargetPageId) return;
     if (!recommendStart || !recommendEnd) {
       setRecommendStatus({ type: "error", msg: "開始日と終了日を入力してください。" });
       return;
@@ -1293,15 +1312,15 @@ export default function SlotDataTracker() {
       return;
     }
     const label = recommendLabel.trim() || "おすすめ期間";
-    const next = [...currentRecommends, { id: `rec-${Date.now()}`, startDate: recommendStart, endDate: recommendEnd, label }];
-    persistPageRecommends(activePageId, next);
+    const next = [...recommendTargetList, { id: `rec-${Date.now()}`, startDate: recommendStart, endDate: recommendEnd, label }];
+    persistPageRecommends(recommendTargetPageId, next);
     setRecommendStatus({ type: "ok", msg: `${recommendStart}〜${recommendEnd} を「${label}」として登録しました。` });
     setRecommendLabel("");
   }
 
   function handleRemoveRecommend(id) {
-    if (!activePageId) return;
-    persistPageRecommends(activePageId, currentRecommends.filter((r) => r.id !== id));
+    if (!recommendTargetPageId) return;
+    persistPageRecommends(recommendTargetPageId, recommendTargetList.filter((r) => r.id !== id));
   }
 
   async function handleAddFutureEvent() {
@@ -1476,11 +1495,18 @@ export default function SlotDataTracker() {
 
       {/* page tabs */}
       <div style={{ display: "flex", alignItems: "flex-end", gap: "4px", marginBottom: "0", flexWrap: "wrap" }}>
+        <div
+          className={"page-tab" + (viewMode === "common" ? " active" : "")}
+          onClick={() => setViewMode("common")}
+          style={{ display: "flex", alignItems: "center", gap: "6px" }}
+        >
+          <span>🔧 共通設定</span>
+        </div>
         {pages.map((p, i) => (
           <div
             key={p.id}
-            className={"page-tab" + (p.id === activePageId ? " active" : "")}
-            onClick={() => setActivePageId(p.id)}
+            className={"page-tab" + (viewMode === "page" && p.id === activePageId ? " active" : "")}
+            onClick={() => { setActivePageId(p.id); setViewMode("page"); }}
             style={{ display: "flex", alignItems: "center", gap: "6px" }}
           >
             <span>{p.name && p.name.trim() ? p.name : `機種${i + 1}`}</span>
@@ -1521,211 +1547,32 @@ export default function SlotDataTracker() {
 
       <div style={{ borderTop: "1px solid #2a323f", marginBottom: "16px" }} />
 
-      {/* machine model name (manual entry) for current page */}
-      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
-        <Pencil size={14} color="#5a6272" />
-        <input
-          type="text"
-          value={currentPage ? currentPage.name : ""}
-          onChange={(e) => handleRenamePage(activePageId, e.target.value)}
-          placeholder="機種名を入力（例：ジャグラーガールズ）"
-          style={{
-            fontSize: "16px",
-            fontWeight: 700,
-            background: "transparent",
-            border: "none",
-            borderBottom: "1px dashed #2a323f",
-            color: "#e7e9ee",
-            padding: "4px 2px",
-            minWidth: "260px",
-          }}
-        />
-      </div>
-
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "360px 1fr",
-          gap: "20px",
-          alignItems: "start",
-        }}
-        className="tracker-grid"
-      >
-        {/* LEFT: input panel */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+      {viewMode === "common" ? (
+        <div style={{ maxWidth: "640px" }}>
           {unlocked ? (
-          <>
-          <div className="card" style={{ padding: "18px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "12px", color: "#c7cbd4" }}>
-              データ入力
-            </div>
-
-            <div style={{ display: "flex", gap: "10px", marginBottom: "10px" }}>
-              <div style={{ flex: 1 }}>
-                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
-                <input
-                  type="date"
-                  value={entryDate}
-                  onChange={(e) => setEntryDate(e.target.value)}
-                  style={{
-                    width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
-                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", boxSizing: "border-box",
-                  }}
-                />
-              </div>
-            </div>
-            {entryDateHasExisting && (
-              <div style={{ fontSize: "11px", color: "#e8b34c", marginBottom: "8px", marginTop: "-4px" }}>
-                この日付はすでにデータがあります。保存すると上書きされます。
-              </div>
-            )}
-            {entryDateIsClosed && (
-              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
-                ⚠ この日付は店休日として登録されています。本当にデータを入力しますか？
-              </div>
-            )}
-            {dateGapWarning && (
-              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
-                ⚠ 前回の記録（{dateGapWarning.lastDate}）からこの日付までに、{dateGapWarning.missing.length}日分データがありません（
-                {dateGapWarning.missing.join("、")}）。店休日であれば登録しておくとこの警告は出なくなります。
-              </div>
-            )}
-
-            {dateEventMap[entryDate] && (
-              <div style={{
-                fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
-                background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
-                display: "flex", alignItems: "center", gap: "6px",
-              }}>
-                <Flag size={12} />
-                この日のイベント：{dateEventMap[entryDate]}（「📅 イベント登録」で変更できます）
-              </div>
-            )}
-
-            <div style={{ marginBottom: "10px" }}>
-              <label style={{ fontSize: "11px", color: "#8b93a3" }}>
-                表を貼り付け（台番／差枚／G数／出率／BB／RB／合成／BB率／RB率）
-              </label>
-              <textarea
-                className="mono scrollbar"
-                value={pasteText}
-                onChange={(e) => setPasteText(e.target.value)}
-                placeholder={"台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n351\t1,581\t6,432\t108.2%\t0\t16\t1/402\t-\t1/402"}
-                rows={10}
-                style={{
-                  width: "100%", marginTop: "4px", background: "#0e1218", border: "1px solid #2a323f",
-                  borderRadius: "6px", padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5,
-                  resize: "vertical", boxSizing: "border-box",
-                }}
-              />
-            </div>
-
-            <button
-              onClick={handleSave}
-              style={{
-                width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
-                display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
-              }}
-            >
-              <Save size={15} />
-              この日のデータを保存
-            </button>
-
-            {status && (
-              <div style={{
-                marginTop: "10px", fontSize: "12px", display: "flex", alignItems: "flex-start", gap: "6px",
-                color: status.type === "ok" ? "#9ece6a" : "#e5697a",
-              }}>
-                {status.type === "ok" ? <CheckCircle2 size={14} style={{ marginTop: 1 }} /> : <AlertCircle size={14} style={{ marginTop: 1 }} />}
-                <span>{status.msg}</span>
-              </div>
-            )}
-
-            <div style={{ marginTop: "18px", borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
-              <button
-                onClick={() => setDateListOpen((v) => !v)}
-                style={{
-                  display: "flex", alignItems: "center", gap: "6px", width: "100%",
-                  fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: dateListOpen ? "8px" : 0,
-                  background: "none", border: "none", cursor: "pointer", padding: 0, textAlign: "left",
-                }}
-              >
-                {dateListOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                登録済みの日付（{currentHistory.length}件）
-              </button>
-              {dateListOpen && (
-              <div className="scrollbar" style={{ maxHeight: "200px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
-                {historyLoading && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
-                {!historyLoading && sortedHistory.length === 0 && (
-                  <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
-                )}
-                {[...sortedHistory].reverse().map((h) => (
-                  <div key={h.date} style={{
-                    display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
-                    background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
-                  }}>
-                    <div>
-                      <span className="mono">{h.date}</span>
-                      {strongDateSet.has(h.date) && (
-                        <span style={{ marginLeft: "6px", color: strongColorByDate[h.date] || "#e5697a" }}>
-                          <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={strongColorByDate[h.date] || "#e5697a"} />
-                        </span>
-                      )}
-                      {h.event && (
-                        <span style={{ marginLeft: "6px", color: "#e8b34c" }}>
-                          <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
-                          {h.event}
-                        </span>
-                      )}
-                      <span style={{ marginLeft: "6px", color: "#5a6272" }}>{h.machines.length}台</span>
-                    </div>
-                    {confirmDeleteDate === h.date ? (
-                      <div style={{ display: "flex", gap: "6px" }}>
-                        <button onClick={() => handleDeleteDate(h.date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
-                        <button onClick={() => setConfirmDeleteDate(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
-                      </div>
-                    ) : (
-                      <div style={{ display: "flex", gap: "10px" }}>
-                        <button onClick={() => handleEditDate(h)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この日のデータを編集">
-                          <Pencil size={13} />
-                        </button>
-                        <button onClick={() => setConfirmDeleteDate(h.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この日のデータを削除">
-                          <Trash2 size={13} />
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-              )}
-
-              {currentHistory.length > 0 && (
-                <div style={{ marginTop: "10px" }}>
-                  {confirmReset ? (
-                    <div style={{ display: "flex", gap: "8px", fontSize: "12px" }}>
-                      <span style={{ color: "#e5697a" }}>このページのデータを全て削除しますか？</span>
-                      <button onClick={handleResetAll} style={{ color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>はい</button>
-                      <button onClick={() => setConfirmReset(false)} style={{ color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>いいえ</button>
-                    </div>
-                  ) : (
-                    <button onClick={() => setConfirmReset(true)} style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px" }}>
-                      <RotateCcw size={11} />
-                      このページのデータをリセット
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* recommended-model periods (page-scoped, since a page = one 機種) */}
+            <>
+          {/* recommended-model periods — one shared panel, target machine chosen via dropdown */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              🏆 おすすめ機種期間（この機種）
+              🏆 おすすめ機種期間
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              このお店の「月のおすすめ」「期間限定のおすすめ」など、この機種が対象になっている期間を自由な日付範囲で登録できます（月曜〜金曜や7日間である必要はありません）。「本日のピックアップ」で、この期間中の実績も見ます。
+              このお店の「月のおすすめ」「期間限定のおすすめ」など、機種が対象になっている期間を自由な日付範囲で登録できます（月曜〜金曜や7日間である必要はありません）。対象の機種を選んでから登録してください。「本日のピックアップ」で、その機種のこの期間中の実績も見ます。
+            </div>
+            <div style={{ marginBottom: "10px" }}>
+              <label style={{ fontSize: "11px", color: "#8b93a3" }}>対象の機種</label>
+              <select
+                value={recommendTargetPageId || ""}
+                onChange={(e) => setRecommendTargetPageId(e.target.value)}
+                style={{
+                  width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", boxSizing: "border-box",
+                }}
+              >
+                {pages.map((p, i) => (
+                  <option key={p.id} value={p.id}>{p.name && p.name.trim() ? p.name : `機種${i + 1}`}</option>
+                ))}
+              </select>
             </div>
             <div style={{ display: "flex", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>
               <input
@@ -1774,7 +1621,7 @@ export default function SlotDataTracker() {
             )}
 
             <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
-              {[...currentRecommends].sort((a, b) => b.startDate.localeCompare(a.startDate)).map((r) => (
+              {[...recommendTargetList].sort((a, b) => b.startDate.localeCompare(a.startDate)).map((r) => (
                 <div key={r.id} style={{
                   display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
                   background: "#12161d", border: "1px solid #2a2540", borderRadius: "6px", padding: "5px 8px",
@@ -1788,7 +1635,7 @@ export default function SlotDataTracker() {
                   </button>
                 </div>
               ))}
-              {currentRecommends.length === 0 && (
+              {recommendTargetList.length === 0 && (
                 <div style={{ fontSize: "11px", color: "#5a6272" }}>登録されたおすすめ期間はまだありません。</div>
               )}
             </div>
@@ -1984,6 +1831,254 @@ export default function SlotDataTracker() {
               ))}
               {closedDays.length === 0 && (
                 <div style={{ fontSize: "11px", color: "#5a6272" }}>登録された店休日はまだありません。</div>
+              )}
+            </div>
+          </div>
+
+              <button
+                onClick={() => { setUnlocked(false); setPinInput(""); setPinError(false); }}
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
+                  width: "100%", background: "transparent", border: "1px solid #2a323f", borderRadius: "8px",
+                  padding: "8px", color: "#5a6272", fontSize: "12px", cursor: "pointer",
+                }}
+              >
+                <Lock size={12} /> 共通設定をロックする
+              </button>
+            </>
+          ) : (
+            <div className="card" style={{ padding: "18px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
+                <Lock size={14} /> 共通設定はロック中です
+              </div>
+              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+                暗証番号を入力すると、イベント登録・強いイベント・店休日・おすすめ機種期間を編集できます。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
+              </div>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  value={pinInput}
+                  onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleUnlock(); }}
+                  placeholder="暗証番号"
+                  style={{
+                    flex: 1, background: "#12161d", border: "1px solid " + (pinError ? "#e5697a" : "#2a323f"),
+                    borderRadius: "6px", padding: "8px", color: "#e7e9ee", fontSize: "13px",
+                  }}
+                />
+                <button
+                  onClick={handleUnlock}
+                  style={{
+                    background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
+                    padding: "0 16px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
+                  }}
+                >
+                  解除
+                </button>
+              </div>
+              {pinError && (
+                <div style={{ marginTop: "8px", fontSize: "11px", color: "#e5697a" }}>暗証番号が違います。</div>
+              )}
+            </div>
+          )}
+        </div>
+      ) : (
+        <>
+      {/* machine model name (manual entry) for current page */}
+      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
+        <Pencil size={14} color="#5a6272" />
+        <input
+          type="text"
+          value={currentPage ? currentPage.name : ""}
+          onChange={(e) => handleRenamePage(activePageId, e.target.value)}
+          placeholder="機種名を入力（例：ジャグラーガールズ）"
+          style={{
+            fontSize: "16px",
+            fontWeight: 700,
+            background: "transparent",
+            border: "none",
+            borderBottom: "1px dashed #2a323f",
+            color: "#e7e9ee",
+            padding: "4px 2px",
+            minWidth: "260px",
+          }}
+        />
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "360px 1fr",
+          gap: "20px",
+          alignItems: "start",
+        }}
+        className="tracker-grid"
+      >
+        {/* LEFT: input panel */}
+        <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+          {unlocked ? (
+          <>
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "12px", color: "#c7cbd4" }}>
+              データ入力
+            </div>
+
+            <div style={{ display: "flex", gap: "10px", marginBottom: "10px" }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
+                <input
+                  type="date"
+                  value={entryDate}
+                  onChange={(e) => setEntryDate(e.target.value)}
+                  style={{
+                    width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", boxSizing: "border-box",
+                  }}
+                />
+              </div>
+            </div>
+            {entryDateHasExisting && (
+              <div style={{ fontSize: "11px", color: "#e8b34c", marginBottom: "8px", marginTop: "-4px" }}>
+                この日付はすでにデータがあります。保存すると上書きされます。
+              </div>
+            )}
+            {entryDateIsClosed && (
+              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
+                ⚠ この日付は店休日として登録されています。本当にデータを入力しますか？
+              </div>
+            )}
+            {dateGapWarning && (
+              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
+                ⚠ 前回の記録（{dateGapWarning.lastDate}）からこの日付までに、{dateGapWarning.missing.length}日分データがありません（
+                {dateGapWarning.missing.join("、")}）。店休日であれば登録しておくとこの警告は出なくなります。
+              </div>
+            )}
+
+            {dateEventMap[entryDate] && (
+              <div style={{
+                fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
+                background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
+                display: "flex", alignItems: "center", gap: "6px",
+              }}>
+                <Flag size={12} />
+                この日のイベント：{dateEventMap[entryDate]}（「📅 イベント登録」で変更できます）
+              </div>
+            )}
+
+            <div style={{ marginBottom: "10px" }}>
+              <label style={{ fontSize: "11px", color: "#8b93a3" }}>
+                表を貼り付け（台番／差枚／G数／出率／BB／RB／合成／BB率／RB率）
+              </label>
+              <textarea
+                className="mono scrollbar"
+                value={pasteText}
+                onChange={(e) => setPasteText(e.target.value)}
+                placeholder={"台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n351\t1,581\t6,432\t108.2%\t0\t16\t1/402\t-\t1/402"}
+                rows={10}
+                style={{
+                  width: "100%", marginTop: "4px", background: "#0e1218", border: "1px solid #2a323f",
+                  borderRadius: "6px", padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5,
+                  resize: "vertical", boxSizing: "border-box",
+                }}
+              />
+            </div>
+
+            <button
+              onClick={handleSave}
+              style={{
+                width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
+                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
+              }}
+            >
+              <Save size={15} />
+              この日のデータを保存
+            </button>
+
+            {status && (
+              <div style={{
+                marginTop: "10px", fontSize: "12px", display: "flex", alignItems: "flex-start", gap: "6px",
+                color: status.type === "ok" ? "#9ece6a" : "#e5697a",
+              }}>
+                {status.type === "ok" ? <CheckCircle2 size={14} style={{ marginTop: 1 }} /> : <AlertCircle size={14} style={{ marginTop: 1 }} />}
+                <span>{status.msg}</span>
+              </div>
+            )}
+
+            <div style={{ marginTop: "18px", borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
+              <button
+                onClick={() => setDateListOpen((v) => !v)}
+                style={{
+                  display: "flex", alignItems: "center", gap: "6px", width: "100%",
+                  fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: dateListOpen ? "8px" : 0,
+                  background: "none", border: "none", cursor: "pointer", padding: 0, textAlign: "left",
+                }}
+              >
+                {dateListOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                登録済みの日付（{currentHistory.length}件）
+              </button>
+              {dateListOpen && (
+              <div className="scrollbar" style={{ maxHeight: "200px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+                {historyLoading && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
+                {!historyLoading && sortedHistory.length === 0 && (
+                  <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
+                )}
+                {[...sortedHistory].reverse().map((h) => (
+                  <div key={h.date} style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                    background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
+                  }}>
+                    <div>
+                      <span className="mono">{h.date}</span>
+                      {strongDateSet.has(h.date) && (
+                        <span style={{ marginLeft: "6px", color: strongColorByDate[h.date] || "#e5697a" }}>
+                          <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={strongColorByDate[h.date] || "#e5697a"} />
+                        </span>
+                      )}
+                      {h.event && (
+                        <span style={{ marginLeft: "6px", color: "#e8b34c" }}>
+                          <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
+                          {h.event}
+                        </span>
+                      )}
+                      <span style={{ marginLeft: "6px", color: "#5a6272" }}>{h.machines.length}台</span>
+                    </div>
+                    {confirmDeleteDate === h.date ? (
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <button onClick={() => handleDeleteDate(h.date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
+                        <button onClick={() => setConfirmDeleteDate(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", gap: "10px" }}>
+                        <button onClick={() => handleEditDate(h)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この日のデータを編集">
+                          <Pencil size={13} />
+                        </button>
+                        <button onClick={() => setConfirmDeleteDate(h.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この日のデータを削除">
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              )}
+
+              {currentHistory.length > 0 && (
+                <div style={{ marginTop: "10px" }}>
+                  {confirmReset ? (
+                    <div style={{ display: "flex", gap: "8px", fontSize: "12px" }}>
+                      <span style={{ color: "#e5697a" }}>このページのデータを全て削除しますか？</span>
+                      <button onClick={handleResetAll} style={{ color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>はい</button>
+                      <button onClick={() => setConfirmReset(false)} style={{ color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>いいえ</button>
+                    </div>
+                  ) : (
+                    <button onClick={() => setConfirmReset(true)} style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px" }}>
+                      <RotateCcw size={11} />
+                      このページのデータをリセット
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           </div>
@@ -2635,6 +2730,8 @@ export default function SlotDataTracker() {
           </div>
         </div>
       </div>
+        </>
+      )}
 
       <style>{`
         @media (max-width: 860px) {
