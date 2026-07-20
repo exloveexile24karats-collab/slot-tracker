@@ -47,7 +47,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "1.9";
+const APP_VERSION = "2.0";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -166,6 +166,92 @@ function findBestThresholds(pairs, minSample = 5) {
   });
 
   return { totalPairs: pairs.length, bestAbove, bestBelow };
+}
+
+const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
+
+function weekdayOf(dateStr) {
+  return new Date(dateStr + "T00:00:00").getDay();
+}
+
+// consecutive same-sign run lengths, day by day, for a {date,sada} series
+function computeStreaks(series) {
+  const streaks = [];
+  series.forEach((pt, i) => {
+    const dir = pt.sada > 0 ? "plus" : pt.sada < 0 ? "minus" : "flat";
+    if (i === 0 || streaks[i - 1].dir !== dir) {
+      streaks.push({ dir, len: 1 });
+    } else {
+      streaks.push({ dir, len: streaks[i - 1].len + 1 });
+    }
+  });
+  return streaks;
+}
+
+// does a long enough plus/minus streak predict next-day-positive?
+function evaluateStreakPattern(series) {
+  const streaks = computeStreaks(series);
+  const pairs = [];
+  for (let i = 0; i < series.length - 1; i++) {
+    pairs.push({ dir: streaks[i].dir, len: streaks[i].len, nextSada: series[i + 1].sada });
+  }
+  function bestForDir(dir) {
+    const subset = pairs.filter((p) => p.dir === dir);
+    if (subset.length < 8) return null;
+    const lens = Array.from(new Set(subset.map((p) => p.len))).sort((a, b) => a - b);
+    let best = null;
+    lens.forEach((L) => {
+      const matched = subset.filter((p) => p.len >= L);
+      if (matched.length < 5) return;
+      const wins = matched.filter((p) => p.nextSada > 0).length;
+      const winRate = wins / matched.length;
+      if (!best || winRate > best.winRate || (winRate === best.winRate && matched.length > best.sampleSize)) {
+        best = { minLen: L, winRate, sampleSize: matched.length, avgNext: matched.reduce((a, p) => a + p.nextSada, 0) / matched.length };
+      }
+    });
+    return best;
+  }
+  return { plus: bestForDir("plus"), minus: bestForDir("minus"), currentStreak: streaks[streaks.length - 1] || null };
+}
+
+// per-weekday average 差枚 for a {date,sada} series
+function computeWeekdayStats(series) {
+  const buckets = Array.from({ length: 7 }, () => ({ sum: 0, count: 0 }));
+  series.forEach((pt) => {
+    const wd = weekdayOf(pt.date);
+    buckets[wd].sum += pt.sada;
+    buckets[wd].count += 1;
+  });
+  return buckets.map((b) => ({ avg: b.count ? b.sum / b.count : null, count: b.count }));
+}
+
+// does the day AFTER a registered strong-event day tend to be better than usual?
+function evaluateStrongFollow(series, strongDateSet) {
+  const pairs = [];
+  for (let i = 0; i < series.length - 1; i++) {
+    pairs.push({ isStrong: strongDateSet.has(series[i].date), nextSada: series[i + 1].sada });
+  }
+  function summarize(arr) {
+    if (arr.length < 3) return null;
+    const wins = arr.filter((p) => p.nextSada > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avgNext: arr.reduce((a, p) => a + p.nextSada, 0) / arr.length };
+  }
+  return { strong: summarize(pairs.filter((p) => p.isStrong)), normal: summarize(pairs.filter((p) => !p.isStrong)) };
+}
+
+// heavy play (high G数) without a proportional payout — a caution flag, not a "buy" signal
+function evaluateVolumeMismatch(seriesWithGsu) {
+  const gsuVals = seriesWithGsu.map((s) => s.gsu).filter((v) => v !== null && v !== undefined);
+  if (gsuVals.length < 5) return null;
+  const avgGsu = gsuVals.reduce((a, b) => a + b, 0) / gsuVals.length;
+  const last = seriesWithGsu[seriesWithGsu.length - 1];
+  if (last.gsu === null || last.gsu === undefined || last.sada === null) return null;
+  const isHighVolume = last.gsu >= avgGsu * 1.15;
+  const isPoorReturn = last.sada <= 0;
+  if (isHighVolume && isPoorReturn) {
+    return { lastDate: last.date, lastGsu: last.gsu, avgGsu, lastSada: last.sada };
+  }
+  return null;
 }
 
 // On a categorical date axis, a single day has zero width, so widen it by
@@ -678,28 +764,60 @@ export default function SlotDataTracker() {
 
   // machines whose CURRENT trailing total already meets a historically
   // favorable threshold, checked across the 10/20/30-day windows together,
-  // with a combined "総合判断" verdict (computed across all machines this
-  // page has ever seen)
+  // with a combined "総合判断" verdict, plus several other pickup signals
+  // (computed across all machines this page has ever seen)
   const pickList = useMemo(() => {
     const results = [];
     allMachineNumbers.forEach((no) => {
-      const series = sortedHistory
+      const seriesFull = sortedHistory
         .map((h) => {
           const m = h.machines.find((mm) => mm.no === no);
-          return m && m.sada !== null ? { date: h.date, sada: m.sada } : null;
+          return m && m.sada !== null ? { date: h.date, sada: m.sada, gsu: m.gsu } : null;
         })
         .filter(Boolean);
-      if (series.length === 0) return;
+      if (seriesFull.length === 0) return;
+      const series = seriesFull.map((s) => ({ date: s.date, sada: s.sada }));
       const lastDate = series[series.length - 1].date;
 
       const windows = [10, 20, 30].map((w) => ({ windowSize: w, result: evaluateWindow(series, w) }));
       const matchedWindows = windows.filter((w) => w.result && w.result.reasons.length > 0);
-      if (matchedWindows.length === 0) return;
 
       const evaluableCount = windows.filter((w) => w.result).length;
-      const avgWinRate =
-        matchedWindows.reduce((a, w) => a + Math.max(...w.result.reasons.map((r) => r.winRate)), 0) /
-        matchedWindows.length;
+      const avgWinRate = matchedWindows.length
+        ? matchedWindows.reduce((a, w) => a + Math.max(...w.result.reasons.map((r) => r.winRate)), 0) / matchedWindows.length
+        : null;
+
+      // streak-based signal
+      const streakEval = series.length >= 9 ? evaluateStreakPattern(series) : null;
+      let streakMatch = null;
+      if (streakEval && streakEval.currentStreak && streakEval.currentStreak.dir !== "flat") {
+        const best = streakEval.currentStreak.dir === "plus" ? streakEval.plus : streakEval.minus;
+        if (best && streakEval.currentStreak.len >= best.minLen) {
+          streakMatch = { dir: streakEval.currentStreak.dir, len: streakEval.currentStreak.len, ...best };
+        }
+      }
+
+      // weekday-based signal (does tomorrow's weekday historically do well?)
+      const weekdayStats = computeWeekdayStats(series);
+      const tomorrowWeekday = weekdayOf(addDays(lastDate, 1));
+      const weekdayBucket = weekdayStats[tomorrowWeekday];
+      const weekdayMatch = weekdayBucket && weekdayBucket.count >= 3 && weekdayBucket.avg > 0 ? weekdayBucket : null;
+
+      // did today follow a registered strong-event day, and does that pattern historically help?
+      const strongFollowEval = series.length >= 6 ? evaluateStrongFollow(series, strongDateSet) : null;
+      let strongFollowMatch = null;
+      if (strongFollowEval && strongFollowEval.strong && strongDateSet.has(lastDate)) {
+        const normalRate = strongFollowEval.normal ? strongFollowEval.normal.winRate : 0.5;
+        if (strongFollowEval.strong.winRate > normalRate) {
+          strongFollowMatch = { ...strongFollowEval.strong, normalRate };
+        }
+      }
+
+      // caution flag: heavy play without a proportional payout
+      const volumeMismatch = evaluateVolumeMismatch(seriesFull);
+
+      const hasAnySignal = matchedWindows.length > 0 || streakMatch || weekdayMatch || strongFollowMatch || volumeMismatch;
+      if (!hasAnySignal) return;
 
       results.push({
         no,
@@ -708,14 +826,19 @@ export default function SlotDataTracker() {
         matchedCount: matchedWindows.length,
         evaluableCount,
         avgWinRate,
+        streakMatch,
+        weekdayMatch,
+        weekdayTomorrow: WEEKDAY_LABELS[tomorrowWeekday],
+        strongFollowMatch,
+        volumeMismatch,
       });
     });
     results.sort((a, b) => {
       if (b.matchedCount !== a.matchedCount) return b.matchedCount - a.matchedCount;
-      return b.avgWinRate - a.avgWinRate;
+      return (b.avgWinRate ?? 0) - (a.avgWinRate ?? 0);
     });
     return results;
-  }, [allMachineNumbers, sortedHistory]);
+  }, [allMachineNumbers, sortedHistory, strongDateSet]);
 
   function handleSave() {
     if (!activePageId) return;
@@ -1732,12 +1855,12 @@ export default function SlotDataTracker() {
               本日のピックアップ（10日足・20日足・30日足）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-              10日足・20日足・30日足それぞれの直近総差枚を、過去データで見つかった「翌日プラスになりやすい条件」と照らし合わせ、当てはまる台をリストアップします（このページの全ての台が対象）
+              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台をリストアップします（このページの全ての台が対象）
             </div>
             {pickList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
             ) : (
-              <div className="scrollbar" style={{ maxHeight: "420px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
+              <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
                 {pickList.map((p) => (
                   <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
@@ -1745,10 +1868,12 @@ export default function SlotDataTracker() {
                       <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}時点</span>
                     </div>
 
-                    <div style={{ fontSize: "11px", color: "#c7cbd4", marginBottom: "6px", padding: "6px 8px", background: "rgba(79,209,197,0.08)", borderRadius: "6px" }}>
-                      総合判断：<span style={{ color: "#4fd1c5", fontWeight: 700 }}>{p.evaluableCount}期間中{p.matchedCount}期間</span>でプラス条件に該当
-                      （平均勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.avgWinRate * 100)}%</span>）
-                    </div>
+                    {p.matchedCount > 0 && (
+                      <div style={{ fontSize: "11px", color: "#c7cbd4", marginBottom: "6px", padding: "6px 8px", background: "rgba(79,209,197,0.08)", borderRadius: "6px" }}>
+                        総合判断：<span style={{ color: "#4fd1c5", fontWeight: 700 }}>{p.evaluableCount}期間中{p.matchedCount}期間</span>でプラス条件に該当
+                        （平均勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.avgWinRate * 100)}%</span>）
+                      </div>
+                    )}
 
                     {p.windows.map((w) => (
                       <div key={w.windowSize} style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "3px" }}>
@@ -1772,6 +1897,36 @@ export default function SlotDataTracker() {
                         )}
                       </div>
                     ))}
+
+                    {p.streakMatch && (
+                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
+                        連続日数：<span className="mono" style={{ color: "#c7cbd4" }}>{p.streakMatch.len}日連続{p.streakMatch.dir === "plus" ? "プラス" : "マイナス"}</span>
+                        （{p.streakMatch.minLen}日以上で翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.winRate * 100)}%</span>、{p.streakMatch.sampleSize}件中）
+                      </div>
+                    )}
+
+                    {p.weekdayMatch && (
+                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
+                        曜日傾向：明日は<span className="mono" style={{ color: "#c7cbd4" }}>{p.weekdayTomorrow}曜日</span>
+                        （過去平均 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{p.weekdayMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.weekdayMatch.avg))}枚</span>、{p.weekdayMatch.count}件中）
+                      </div>
+                    )}
+
+                    {p.strongFollowMatch && (
+                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
+                        <Star size={10} style={{ display: "inline", marginRight: "2px", color: "#e5697a" }} fill="#e5697a" />
+                        今日は強いイベント日 → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.strongFollowMatch.winRate * 100)}%</span>
+                        （通常{Math.round(p.strongFollowMatch.normalRate * 100)}% ／ {p.strongFollowMatch.sampleSize}件中）
+                      </div>
+                    )}
+
+                    {p.volumeMismatch && (
+                      <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
+                        ⚠ 大量回転・低調：直近G数 <span className="mono">{fmtNum(p.volumeMismatch.lastGsu)}G</span>
+                        （平均{fmtNum(Math.round(p.volumeMismatch.avgGsu))}G）に対し、差枚
+                        <span className="mono"> {p.volumeMismatch.lastSada >= 0 ? "+" : ""}{fmtNum(p.volumeMismatch.lastSada)}枚</span>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
