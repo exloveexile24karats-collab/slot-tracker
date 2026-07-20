@@ -47,7 +47,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "2.5";
+const APP_VERSION = "2.6";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -138,7 +138,7 @@ function buildTrailingPairs(series, windowSize) {
 // Search candidate thresholds and find the "total >= T" and "total <= T"
 // splits that give the best next-day-positive win rate (with a minimum
 // sample size so it isn't just picking a fluke single data point).
-function findBestThresholds(pairs, minSample = 5) {
+function findBestThresholds(pairs, minSample = 5, baseRate = 0.5) {
   if (pairs.length < 8) return null;
   const thresholds = Array.from(new Set(pairs.map((p) => p.trailingSum))).sort((a, b) => a - b);
 
@@ -150,7 +150,10 @@ function findBestThresholds(pairs, minSample = 5) {
       const wins = above.filter((p) => p.nextSada > 0).length;
       const winRate = wins / above.length;
       const avgNext = above.reduce((a, p) => a + p.nextSada, 0) / above.length;
-      if (!bestAbove || winRate > bestAbove.winRate || (winRate === bestAbove.winRate && above.length > bestAbove.sampleSize)) {
+      // only accept as "favorable" if it beats this machine's OWN overall
+      // base rate — not a fixed 50%, since a machine's unconditional odds
+      // of a positive day may themselves sit above or below half
+      if (winRate > baseRate && (!bestAbove || winRate > bestAbove.winRate || (winRate === bestAbove.winRate && above.length > bestAbove.sampleSize))) {
         bestAbove = { threshold: T, winRate, sampleSize: above.length, avgNext };
       }
     }
@@ -159,7 +162,7 @@ function findBestThresholds(pairs, minSample = 5) {
       const wins = below.filter((p) => p.nextSada > 0).length;
       const winRate = wins / below.length;
       const avgNext = below.reduce((a, p) => a + p.nextSada, 0) / below.length;
-      if (!bestBelow || winRate > bestBelow.winRate || (winRate === bestBelow.winRate && below.length > bestBelow.sampleSize)) {
+      if (winRate > baseRate && (!bestBelow || winRate > bestBelow.winRate || (winRate === bestBelow.winRate && below.length > bestBelow.sampleSize))) {
         bestBelow = { threshold: T, winRate, sampleSize: below.length, avgNext };
       }
     }
@@ -172,6 +175,14 @@ const WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
 
 function weekdayOf(dateStr) {
   return new Date(dateStr + "T00:00:00").getDay();
+}
+
+// this machine's own unconditional odds of a positive day — the correct
+// baseline to compare conditional patterns against (not a fixed 50%)
+function computeBaseRate(series) {
+  if (series.length === 0) return 0.5;
+  const wins = series.filter((s) => s.sada > 0).length;
+  return wins / series.length;
 }
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -188,8 +199,9 @@ function computeStreaks(series) {
   return streaks;
 }
 
-// does a long enough plus/minus streak predict next-day-positive?
-function evaluateStreakPattern(series) {
+// does a long enough plus/minus streak predict next-day-positive (relative
+// to this machine's own base rate)?
+function evaluateStreakPattern(series, baseRate = 0.5) {
   const streaks = computeStreaks(series);
   const pairs = [];
   for (let i = 0; i < series.length - 1; i++) {
@@ -205,21 +217,24 @@ function evaluateStreakPattern(series) {
       if (matched.length < 5) return;
       const wins = matched.filter((p) => p.nextSada > 0).length;
       const winRate = wins / matched.length;
-      if (!best || winRate > best.winRate || (winRate === best.winRate && matched.length > best.sampleSize)) {
+      if (winRate > baseRate && (!best || winRate > best.winRate || (winRate === best.winRate && matched.length > best.sampleSize))) {
         best = { minLen: L, winRate, sampleSize: matched.length, avgNext: matched.reduce((a, p) => a + p.nextSada, 0) / matched.length };
       }
     });
     return best;
   }
   // stat for EXACTLY this streak length (not "N or more"), which is what
-  // actually applies to the day right after the current streak
+  // actually applies to the day right after the current streak — only
+  // returned if it actually beats this machine's base rate
   function exactForDir(dir, length) {
     const subset = pairs.filter((p) => p.dir === dir && p.len === length);
     if (subset.length < 4) return null;
     const wins = subset.filter((p) => p.nextSada > 0).length;
+    const winRate = wins / subset.length;
+    if (winRate <= baseRate) return null;
     return {
       len: length,
-      winRate: wins / subset.length,
+      winRate,
       sampleSize: subset.length,
       avgNext: subset.reduce((a, p) => a + p.nextSada, 0) / subset.length,
     };
@@ -824,10 +839,10 @@ export default function SlotDataTracker() {
 
   // evaluate one window size for one machine's series: does the CURRENT
   // trailing total already meet a historically favorable threshold?
-  function evaluateWindow(series, windowSize) {
+  function evaluateWindow(series, windowSize, baseRate) {
     if (series.length < windowSize + 1) return null;
     const pairs = buildTrailingPairs(series, windowSize);
-    const result = findBestThresholds(pairs);
+    const result = findBestThresholds(pairs, 5, baseRate);
     if (!result) return null;
     const currentWindow = series.slice(-windowSize);
     if (currentWindow.length < windowSize) return null;
@@ -858,8 +873,9 @@ export default function SlotDataTracker() {
       if (seriesFull.length === 0) return;
       const series = seriesFull.map((s) => ({ date: s.date, sada: s.sada }));
       const lastDate = series[series.length - 1].date;
+      const baseRate = computeBaseRate(series);
 
-      const windows = [10, 20, 30].map((w) => ({ windowSize: w, result: evaluateWindow(series, w) }));
+      const windows = [10, 20, 30].map((w) => ({ windowSize: w, result: evaluateWindow(series, w, baseRate) }));
       const matchedWindows = windows.filter((w) => w.result && w.result.reasons.length > 0);
 
       const evaluableCount = windows.filter((w) => w.result).length;
@@ -868,15 +884,17 @@ export default function SlotDataTracker() {
         : null;
 
       // streak-based signal
-      const streakEval = series.length >= 9 ? evaluateStreakPattern(series) : null;
+      const streakEval = series.length >= 9 ? evaluateStreakPattern(series, baseRate) : null;
       let streakMatch = null;
       if (streakEval && streakEval.currentStreak && streakEval.currentStreak.dir !== "flat") {
         const dir = streakEval.currentStreak.dir;
         const len = streakEval.currentStreak.len;
-        const best = dir === "plus" ? streakEval.plus : streakEval.minus;
-        const exact = streakEval.exactForDir(dir, len);
-        if (best && len >= best.minLen) {
-          streakMatch = { dir, len, ...best, exact };
+        const exact = streakEval.exactForDir(dir, len); // null unless it beats baseRate
+        const best = dir === "plus" ? streakEval.plus : streakEval.minus; // null unless it beats baseRate
+        if (exact) {
+          streakMatch = { dir, len, ...exact, exact };
+        } else if (best && len >= best.minLen) {
+          streakMatch = { dir, len, ...best, exact: null };
         }
       }
 
@@ -885,7 +903,10 @@ export default function SlotDataTracker() {
       const tomorrowDate = addDays(lastDate, 1);
       const tomorrowWeekday = weekdayOf(tomorrowDate);
       const weekdayBucket = weekdayStats[tomorrowWeekday];
-      const weekdayMatch = weekdayBucket && weekdayBucket.count >= 3 && weekdayBucket.avg > 0 ? weekdayBucket : null;
+      const weekdayMatch =
+        weekdayBucket && weekdayBucket.count >= 3 && weekdayBucket.winRate !== null && weekdayBucket.winRate > baseRate
+          ? weekdayBucket
+          : null;
 
       // if tomorrow is ALSO a "2のつく日" or "7のつく日", check that intersection specifically
       const tomorrowDigit = parseInt(tomorrowDate.slice(-2), 10) % 10;
@@ -920,7 +941,7 @@ export default function SlotDataTracker() {
       if (plannedEventName) {
         const perf = evaluateEventNamePerformance(series, historyByDate, plannedEventName);
         if (perf) {
-          plannedEventMatch = { name: plannedEventName, ...perf };
+          plannedEventMatch = { name: plannedEventName, favorable: perf.winRate > baseRate, ...perf };
         }
       }
 
@@ -938,7 +959,7 @@ export default function SlotDataTracker() {
       if (streakMatch) signalWinRates.push(streakMatch.exact ? streakMatch.exact.winRate : streakMatch.winRate);
       if (weekdayMatch && weekdayMatch.winRate !== null) signalWinRates.push(weekdayMatch.winRate);
       if (strongFollowMatch) signalWinRates.push(strongFollowMatch.winRate);
-      if (plannedEventMatch && plannedEventMatch.winRate > 0.5) signalWinRates.push(plannedEventMatch.winRate);
+      if (plannedEventMatch && plannedEventMatch.favorable) signalWinRates.push(plannedEventMatch.winRate);
       const overallScore = signalWinRates.length
         ? signalWinRates.reduce((a, b) => a + b, 0) / signalWinRates.length
         : null;
@@ -986,7 +1007,8 @@ export default function SlotDataTracker() {
         .filter(Boolean);
       [10, 20, 30].forEach((w) => {
         const pairs = buildTrailingPairs(series, w);
-        const result = findBestThresholds(pairs);
+        const baseRate = computeBaseRate(series);
+        const result = findBestThresholds(pairs, 5, baseRate);
         if (result?.bestAbove) {
           totalWins += result.bestAbove.winRate * result.bestAbove.sampleSize;
           totalSamples += result.bestAbove.sampleSize;
@@ -2252,11 +2274,11 @@ export default function SlotDataTracker() {
                     {p.plannedEventMatch && (
                       <div style={{
                         fontSize: "11px", marginTop: "6px", padding: "6px 8px", borderRadius: "6px",
-                        color: p.plannedEventMatch.winRate > 0.5 ? "#8b93a3" : "#e5697a",
-                        background: p.plannedEventMatch.winRate > 0.5 ? "rgba(232,179,76,0.08)" : "rgba(229,105,122,0.06)",
+                        color: p.plannedEventMatch.favorable ? "#8b93a3" : "#e5697a",
+                        background: p.plannedEventMatch.favorable ? "rgba(232,179,76,0.08)" : "rgba(229,105,122,0.06)",
                       }}>
                         📅 明日は予定イベント「{p.plannedEventMatch.name}」 → このイベントの翌日は過去
-                        <span style={{ color: p.plannedEventMatch.winRate > 0.5 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+                        <span style={{ color: p.plannedEventMatch.favorable ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
                           {" "}{Math.round(p.plannedEventMatch.winRate * 100)}%
                         </span>
                         でプラス（{p.plannedEventMatch.sampleSize}件中、平均{p.plannedEventMatch.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(p.plannedEventMatch.avgNext))}枚）
