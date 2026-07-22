@@ -50,7 +50,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.13";
+const APP_VERSION = "4.0";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -206,7 +206,7 @@ function buildTrailingPairs(series, windowSize) {
 // splits that give the best next-day-positive win rate (with a minimum
 // sample size so it isn't just picking a fluke single data point).
 function findBestThresholds(pairs, minSample = 5, baseRate = 0.5) {
-  if (pairs.length < 8) return null;
+  if (pairs.length < minSample) return null;
   const thresholds = Array.from(new Set(pairs.map((p) => p.trailingSum))).sort((a, b) => a - b);
 
   let bestAbove = null;
@@ -269,6 +269,40 @@ function scoreToGrade(score) {
   return GRADE_BANDS.find((b) => score >= b.min).grade;
 }
 
+// point-based grading for the new additive/subtractive scoring system: each
+// signal contributes (its winRate - its own baseline) in percentage points,
+// discounted by sample-size confidence, and all signals (pro AND caution)
+// are summed together — so a total can go negative.
+const POINT_GRADE_BANDS = [
+  { min: 35, grade: "S" },
+  { min: 20, grade: "A" },
+  { min: 10, grade: "B" },
+  { min: 3, grade: "C" },
+  { min: -3, grade: "D" },
+  { min: -10, grade: "E" },
+  { min: -20, grade: "F" },
+  { min: -Infinity, grade: "G" },
+];
+function pointsToGrade(points) {
+  if (points === null || points === undefined) return null;
+  return POINT_GRADE_BANDS.find((b) => points >= b.min).grade;
+}
+
+// how much weight to give one signal's diff, based on how many historical
+// samples it's built on — a 5-sample "100%" streak shouldn't count nearly as
+// much as a 30-sample 60% edge. sqrt curve: 5 samples ≈ half weight, 20+ ≈ full.
+function sampleWeight(sampleSize) {
+  if (!sampleSize || sampleSize <= 0) return 0;
+  return Math.min(1, Math.sqrt(sampleSize / 20));
+}
+
+// core building block for the new scoring system: (winRate - baseline) in
+// percentage points, scaled down when the sample size is small
+function computePoints(winRate, baseline, sampleSize) {
+  if (winRate === null || winRate === undefined || baseline === null || baseline === undefined) return 0;
+  return (winRate - baseline) * 100 * sampleWeight(sampleSize);
+}
+
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
 function computeStreaks(series) {
   const streaks = [];
@@ -323,7 +357,22 @@ function evaluateStreakPattern(series, baseRate = 0.5) {
       avgNext: subset.reduce((a, p) => a + p.nextSada, 0) / subset.length,
     };
   }
-  return { plus: bestForDir("plus"), minus: bestForDir("minus"), currentStreak: streaks[streaks.length - 1] || null, exactForDir };
+  // ungated variant: returns the stat for this exact streak length regardless
+  // of whether it beats base rate — needed for the additive/subtractive
+  // scoring system, which wants the SIGNED difference, not just "does it win"
+  function exactForDirRaw(dir, length) {
+    const subset = pairs.filter((p) => p.dir === dir && p.len === length);
+    if (subset.length < 4) return null;
+    const wins = subset.filter((p) => p.nextSada > 0).length;
+    const winRate = wins / subset.length;
+    return {
+      len: length,
+      winRate,
+      sampleSize: subset.length,
+      avgNext: subset.reduce((a, p) => a + p.nextSada, 0) / subset.length,
+    };
+  }
+  return { plus: bestForDir("plus"), minus: bestForDir("minus"), currentStreak: streaks[streaks.length - 1] || null, exactForDir, exactForDirRaw };
 }
 
 // per-weekday average 差枚 for a {date,sada} series
@@ -1305,30 +1354,29 @@ export default function SlotDataTracker() {
         ? matchedWindows.reduce((a, w) => a + Math.max(...w.result.reasons.map((r) => r.winRate)), 0) / matchedWindows.length
         : null;
 
-      // streak-based signal
+      // streak-based signal — prefer the EXACT streak-length stat (signed,
+      // whichever direction it points), falling back to the "N-or-more"
+      // grouped stat (positive-only) when the exact length has too few samples
       const streakEval = series.length >= 9 ? evaluateStreakPattern(series, baseRate) : null;
       let streakMatch = null;
       if (streakEval && streakEval.currentStreak && streakEval.currentStreak.dir !== "flat") {
         const dir = streakEval.currentStreak.dir;
         const len = streakEval.currentStreak.len;
-        const exact = streakEval.exactForDir(dir, len); // null unless it beats baseRate
-        const best = dir === "plus" ? streakEval.plus : streakEval.minus; // null unless it beats baseRate
-        if (exact) {
-          streakMatch = { dir, len, ...exact, exact };
+        const exactRaw = streakEval.exactForDirRaw(dir, len);
+        const best = dir === "plus" ? streakEval.plus : streakEval.minus; // positive-only fallback
+        if (exactRaw) {
+          streakMatch = { dir, len, ...exactRaw, exact: exactRaw };
         } else if (best && len >= best.minLen) {
           streakMatch = { dir, len, ...best, exact: null };
         }
       }
 
-      // weekday-based signal (does tomorrow's weekday historically do well?)
+      // weekday-based signal (how does tomorrow's weekday historically do?)
       const weekdayStats = computeWeekdayStats(series);
       const tomorrowDate = addDays(referenceDate || lastDate, 1);
       const tomorrowWeekday = weekdayOf(tomorrowDate);
       const weekdayBucket = weekdayStats[tomorrowWeekday];
-      const weekdayMatch =
-        weekdayBucket && weekdayBucket.count >= 3 && weekdayBucket.winRate !== null && weekdayBucket.winRate > baseRate
-          ? weekdayBucket
-          : null;
+      const weekdayMatch = weekdayBucket && weekdayBucket.count >= 3 && weekdayBucket.winRate !== null ? weekdayBucket : null;
 
       // if tomorrow is ALSO a "2のつく日" or "7のつく日", check that intersection specifically
       const tomorrowDigit = parseInt(tomorrowDate.slice(-2), 10) % 10;
@@ -1345,14 +1393,13 @@ export default function SlotDataTracker() {
         }
       }
 
-      // did today follow a registered strong-event day, and does that pattern historically help?
+      // did today follow a registered strong-event day, and how did that
+      // pattern historically do (compared to non-event-day follow-throughs)?
       const strongFollowEval = series.length >= 6 ? evaluateStrongFollow(series, strongDateSet) : null;
       let strongFollowMatch = null;
       if (strongFollowEval && strongFollowEval.strong && strongDateSet.has(lastDate)) {
         const normalRate = strongFollowEval.normal ? strongFollowEval.normal.winRate : 0.5;
-        if (strongFollowEval.strong.winRate > normalRate) {
-          strongFollowMatch = { ...strongFollowEval.strong, normalRate };
-        }
+        strongFollowMatch = { ...strongFollowEval.strong, normalRate };
       }
 
       // is tomorrow pre-registered (via イベント登録) as a specific named event?
@@ -1371,7 +1418,7 @@ export default function SlotDataTracker() {
       let recommendMatch = null;
       if (pageRecommendDateSet.has(tomorrowDate)) {
         const perf = evaluateMembershipPerformance(series, pageRecommendDateSet);
-        if (perf && perf.winRate > baseRate) {
+        if (perf) {
           const activePeriod = pageRecommendsList.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
           recommendMatch = { label: activePeriod ? activePeriod.label : "おすすめ期間", ...perf };
         }
@@ -1386,7 +1433,7 @@ export default function SlotDataTracker() {
       const settingFollow = seriesFull.length >= 6 ? evaluateSuspectedSettingFollow(seriesFull, flagByDate) : null;
       const todayFlag = flagByDate.get(lastDate) || null;
       let settingMatch = null;
-      if (todayFlag === "good" && settingFollow && settingFollow.good && settingFollow.good.winRate > baseRate) {
+      if (todayFlag === "good" && settingFollow && settingFollow.good) {
         settingMatch = { flag: "good", ...settingFollow.good };
       }
       let settingCaution = null;
@@ -1394,7 +1441,7 @@ export default function SlotDataTracker() {
         settingCaution = { flag: "low", ...settingFollow.low };
       }
 
-      // caution flag: heavy play without a proportional payout
+      // heavy play without a proportional payout — checked against baseRate too now
       const volumeMismatch = evaluateVolumeMismatch(seriesFull);
 
       const hasAnySignal =
@@ -1409,21 +1456,43 @@ export default function SlotDataTracker() {
         volumeMismatch;
       if (!hasAnySignal) return;
 
-      // combine every POSITIVE matched signal's win rate into one overall score
-      // (volumeMismatch / settingCaution are caution flags, not positive signals, so excluded)
-      const signalWinRates = [];
-      matchedWindows.forEach((w) => signalWinRates.push(Math.max(...w.result.reasons.map((r) => r.winRate))));
-      if (streakMatch) signalWinRates.push(streakMatch.exact ? streakMatch.exact.winRate : streakMatch.winRate);
-      if (weekdayMatch && weekdayMatch.winRate !== null) signalWinRates.push(weekdayMatch.winRate);
-      if (strongFollowMatch) signalWinRates.push(strongFollowMatch.winRate);
-      if (plannedEventMatch && plannedEventMatch.favorable) signalWinRates.push(plannedEventMatch.winRate);
-      if (recommendMatch) signalWinRates.push(recommendMatch.winRate);
-      if (settingMatch) signalWinRates.push(settingMatch.winRate);
-      const overallScore = signalWinRates.length
-        ? signalWinRates.reduce((a, b) => a + b, 0) / signalWinRates.length
-        : null;
-      const signalCount = signalWinRates.length;
-      const grade = scoreToGrade(overallScore);
+      // ---- additive/subtractive scoring: every signal (favorable OR
+      // cautionary) contributes (its winRate − its own baseline) in
+      // percentage points, scaled down for small samples, and all of them
+      // are summed together — so the total can go negative. ----
+      const scoreItems = [];
+      matchedWindows.forEach((w) => {
+        const bestReason = w.result.reasons.reduce((a, r) => (!a || r.winRate > a.winRate ? r : a), null);
+        scoreItems.push({ label: `${w.windowSize}日足`, points: computePoints(bestReason.winRate, baseRate, bestReason.sampleSize) });
+      });
+      if (streakMatch) {
+        scoreItems.push({ label: "連続日数", points: computePoints(streakMatch.winRate, baseRate, streakMatch.sampleSize) });
+      }
+      if (weekdayMatch) {
+        scoreItems.push({ label: "曜日傾向", points: computePoints(weekdayMatch.winRate, baseRate, weekdayMatch.count) });
+      }
+      if (strongFollowMatch) {
+        scoreItems.push({ label: "強いイベント翌日", points: computePoints(strongFollowMatch.winRate, strongFollowMatch.normalRate, strongFollowMatch.sampleSize) });
+      }
+      if (plannedEventMatch) {
+        scoreItems.push({ label: "イベント登録連動", points: computePoints(plannedEventMatch.winRate, baseRate, plannedEventMatch.sampleSize) });
+      }
+      if (recommendMatch) {
+        scoreItems.push({ label: "おすすめ機種期間", points: computePoints(recommendMatch.winRate, baseRate, recommendMatch.sampleSize) });
+      }
+      if (settingMatch) {
+        scoreItems.push({ label: "相対ローテーション（設定良さそう）", points: computePoints(settingMatch.winRate, baseRate, settingMatch.sampleSize) });
+      }
+      if (settingCaution) {
+        scoreItems.push({ label: "相対ローテーション（低設定っぽい）", points: computePoints(settingCaution.winRate, baseRate, settingCaution.sampleSize) });
+      }
+      if (volumeMismatch && volumeMismatch.nextDayStats) {
+        scoreItems.push({ label: "大量回転・低調", points: computePoints(volumeMismatch.nextDayStats.winRate, baseRate, volumeMismatch.nextDayStats.sampleSize) });
+      }
+
+      const totalPoints = scoreItems.reduce((a, s) => a + s.points, 0);
+      const signalCount = scoreItems.length;
+      const grade = pointsToGrade(totalPoints);
 
       results.push({
         no,
@@ -1442,7 +1511,8 @@ export default function SlotDataTracker() {
         settingMatch,
         settingCaution,
         volumeMismatch,
-        overallScore,
+        scoreItems,
+        totalPoints,
         signalCount,
         grade,
       });
@@ -1452,8 +1522,8 @@ export default function SlotDataTracker() {
 
   function sortPickResults(results) {
     results.sort((a, b) => {
-      const aScore = a.overallScore ?? -1;
-      const bScore = b.overallScore ?? -1;
+      const aScore = a.totalPoints ?? -Infinity;
+      const bScore = b.totalPoints ?? -Infinity;
       if (bScore !== aScore) return bScore - aScore;
       return b.signalCount - a.signalCount;
     });
@@ -1810,11 +1880,11 @@ export default function SlotDataTracker() {
     });
   }, [viewDateMachines, viewWindowDates, historyByDate]);
 
-  function renderThresholdResult(result, label, pairsCount) {
+  function renderThresholdResult(result, label, pairsCount, minSample) {
     if (!result) {
       return (
         <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "6px" }}>
-          {label}：十分なデータがありません（有効な組み合わせ {pairsCount ?? 0}件、最低5件必要）
+          {label}：十分なデータがありません（有効な組み合わせ {pairsCount ?? 0}件、最低{minSample ?? 5}件必要）
         </div>
       );
     }
@@ -1862,12 +1932,13 @@ export default function SlotDataTracker() {
                 {p.grade}
               </span>
             )}
-            {p.overallScore !== null && (
+            {p.totalPoints !== null && p.totalPoints !== undefined && (
               <span className="mono" style={{
-                fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a",
+                fontSize: "11px", fontWeight: 700, color: "#12161d",
+                background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a",
                 borderRadius: "4px", padding: "1px 6px",
               }}>
-                総合スコア {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
+                総合スコア {p.totalPoints >= 0 ? "+" : ""}{Math.round(p.totalPoints)}pt（{p.signalCount}件根拠）
               </span>
             )}
           </span>
@@ -2012,6 +2083,20 @@ export default function SlotDataTracker() {
             ) : (
               <div style={{ color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（2日後）</div>
             )}
+          </div>
+        )}
+
+        {p.scoreItems && p.scoreItems.length > 0 && (
+          <div style={{ marginTop: "8px", paddingTop: "6px", borderTop: "1px dashed #232b37", display: "flex", flexWrap: "wrap", gap: "6px" }}>
+            {p.scoreItems.map((s, i) => (
+              <span key={i} className="mono" style={{
+                fontSize: "10px", padding: "1px 6px", borderRadius: "4px",
+                color: s.points >= 0 ? "#9ece6a" : "#e5697a",
+                background: s.points >= 0 ? "rgba(158,206,106,0.1)" : "rgba(229,105,122,0.1)",
+              }}>
+                {s.label} {s.points >= 0 ? "+" : ""}{s.points.toFixed(1)}pt
+              </span>
+            ))}
           </div>
         )}
       </div>
@@ -2166,9 +2251,9 @@ export default function SlotDataTracker() {
                       <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
                       <span style={{ fontSize: "11px", color: "#8b93a3" }}>{p.pageLabel}</span>
                     </span>
-                    {p.overallScore !== null && (
-                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a", borderRadius: "4px", padding: "1px 6px" }}>
-                        {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
+                    {p.totalPoints !== null && p.totalPoints !== undefined && (
+                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a", borderRadius: "4px", padding: "1px 6px" }}>
+                        {p.totalPoints >= 0 ? "+" : ""}{Math.round(p.totalPoints)}pt（{p.signalCount}件根拠）
                       </span>
                     )}
                   </div>
@@ -3389,9 +3474,9 @@ export default function SlotDataTracker() {
                       {a.no}番　
                       <span style={{ fontSize: "10px", color: "#5a6272", fontWeight: 400 }}>（有効データ {a.validDays}日分・基準勝率{Math.round(a.baseRate * 100)}%）</span>
                     </div>
-                    {renderThresholdResult(a.overall, "全日", a.overallPairsCount)}
-                    {renderThresholdResult(a.digit2, "翌日が2のつく日のみ", a.digit2PairsCount)}
-                    {renderThresholdResult(a.digit7, "翌日が7のつく日のみ", a.digit7PairsCount)}
+                    {renderThresholdResult(a.overall, "全日", a.overallPairsCount, 5)}
+                    {renderThresholdResult(a.digit2, "翌日が2のつく日のみ", a.digit2PairsCount, 3)}
+                    {renderThresholdResult(a.digit7, "翌日が7のつく日のみ", a.digit7PairsCount, 3)}
                   </div>
                 ))}
               </div>
