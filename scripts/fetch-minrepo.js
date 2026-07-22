@@ -11,7 +11,9 @@ import admin from "firebase-admin";
 
 // ---- config ----
 const TAG_LIST_URL = "https://min-repo.com/tag/%e3%83%97%e3%83%a9%e3%82%b6%e6%9c%ac%e5%ba%97ii/";
-const STOP_DATE = "2026-05-15"; // never fetch/backfill earlier than this
+// never fetch/backfill earlier than this — can be overridden for a quick
+// test run via the STOP_DATE_OVERRIDE env var (see workflow_dispatch input)
+const STOP_DATE = (process.env.STOP_DATE_OVERRIDE || "").trim() || "2026-05-15";
 const MAX_DAYS_PER_RUN = 400; // safety guard against infinite loops
 const REQUEST_DELAY_MS = 1200; // be gentle with the target site
 
@@ -157,6 +159,7 @@ function parseSummaryRows($, table) {
 }
 
 async function main() {
+  console.log(`Using STOP_DATE = ${STOP_DATE}${process.env.STOP_DATE_OVERRIDE ? " (manual override)" : ""}`);
   console.log("Loading current app data from Firestore...");
   const pages = (await kvGet(PAGES_KEY)) || [];
   const dateEventMap = (await kvGet(DATE_EVENT_MAP_KEY)) || {};

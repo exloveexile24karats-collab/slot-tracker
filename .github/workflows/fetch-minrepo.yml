@@ -4,7 +4,12 @@ on:
   schedule:
     # 3:00 AM JST = 18:00 UTC (previous day)
     - cron: "0 18 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      stop_date:
+        description: "テスト用: この日付までしか遡らない (YYYY-MM-DD)。空欄なら通常通り2026-05-15まで遡ります"
+        required: false
+        default: ""
 
 jobs:
   fetch:
@@ -21,4 +26,5 @@ jobs:
         working-directory: scripts
         env:
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          STOP_DATE_OVERRIDE: ${{ github.event.inputs.stop_date }}
         run: node fetch-minrepo.js
