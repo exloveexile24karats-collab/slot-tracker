@@ -48,7 +48,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.1";
+const APP_VERSION = "3.2";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -388,6 +388,61 @@ function evaluateVolumeMismatch(seriesWithGsu) {
   };
 }
 
+// per-day, per-machine "suspected setting" flag based on how this machine's
+// G数 ranks against every OTHER machine on the same page that same day (not
+// against its own historical average) — this way, hall-wide rotation being
+// boosted on event days doesn't get mistaken for one machine being popular.
+// 'good': played a lot relative to peers, and didn't lose much (people kept feeding it)
+// 'low': played little relative to peers despite being ahead (people gave up early)
+function computeDailySettingFlags(pageSortedHistory) {
+  const perDateFlags = {};
+  pageSortedHistory.forEach((h) => {
+    const gsuVals = h.machines.map((m) => m.gsu).filter((v) => v !== null && v !== undefined).sort((a, b) => a - b);
+    const dayFlags = {};
+    if (gsuVals.length >= 5) {
+      const pctOf = (v) => {
+        if (v === null || v === undefined) return null;
+        let count = 0;
+        for (const x of gsuVals) if (x <= v) count += 1;
+        return count / gsuVals.length;
+      };
+      h.machines.forEach((m) => {
+        const pct = pctOf(m.gsu);
+        if (pct === null || m.sada === null) {
+          dayFlags[m.no] = null;
+        } else if (pct >= 0.75 && m.sada >= -1000) {
+          dayFlags[m.no] = "good";
+        } else if (pct <= 0.25 && m.sada > 0) {
+          dayFlags[m.no] = "low";
+        } else {
+          dayFlags[m.no] = null;
+        }
+      });
+    }
+    perDateFlags[h.date] = dayFlags;
+  });
+  return perDateFlags;
+}
+
+// does yesterday's "suspected good/low setting" flag predict today's result?
+function evaluateSuspectedSettingFollow(seriesFull, flagByDate) {
+  const goodVals = [];
+  const lowVals = [];
+  for (let i = 0; i < seriesFull.length - 1; i++) {
+    const flag = flagByDate.get(seriesFull[i].date);
+    const next = seriesFull[i + 1].sada;
+    if (next === null || next === undefined) continue;
+    if (flag === "good") goodVals.push(next);
+    if (flag === "low") lowVals.push(next);
+  }
+  function summarize(arr) {
+    if (arr.length < 3) return null;
+    const wins = arr.filter((v) => v > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avg: arr.reduce((a, b) => a + b, 0) / arr.length };
+  }
+  return { good: summarize(goodVals), low: summarize(lowVals) };
+}
+
 // On a categorical date axis, a single day has zero width, so widen it by
 // one neighboring day so the hatched band is actually visible.
 function getBandRange(dateList, date) {
@@ -547,6 +602,25 @@ export default function SlotDataTracker() {
       }
     })();
   }, [activePageId]);
+
+  // ---- also eagerly load every OTHER page's history in the background, so
+  //      the hall-wide combined ranking works even for tabs you haven't
+  //      visited yet this session ----
+  useEffect(() => {
+    pages.forEach((p) => {
+      if (loadedHistoryRef.current.has(p.id)) return;
+      loadedHistoryRef.current.add(p.id);
+      (async () => {
+        try {
+          const res = await storage.get(historyKey(p.id), false);
+          const val = res && res.value ? JSON.parse(res.value) : [];
+          setPageHistories((prev) => ({ ...prev, [p.id]: Array.isArray(val) ? val : [] }));
+        } catch (e) {
+          setPageHistories((prev) => ({ ...prev, [p.id]: [] }));
+        }
+      })();
+    });
+  }, [pages]);
 
   // ---- lazy-load recommended-model periods for every page, so the shared
   //      共通設定 tab's machine dropdown works regardless of which 機種 tab
@@ -982,10 +1056,16 @@ export default function SlotDataTracker() {
   // favorable threshold, checked across the 10/20/30-day windows together,
   // with a combined "総合判断" verdict, plus several other pickup signals
   // (computed across all machines this page has ever seen)
-  const pickList = useMemo(() => {
+  // core per-machine signal computation, parameterized so it can run for the
+  // active page (pickList) AND for every page at once (allPagesPickList)
+  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList) {
     const results = [];
-    allMachineNumbers.forEach((no) => {
-      const seriesFull = sortedHistory
+    const pageRecommendDateSet = new Set();
+    pageRecommendsList.forEach((r) => enumerateDateRange(r.startDate, r.endDate).forEach((d) => pageRecommendDateSet.add(d)));
+    const dailySettingFlags = computeDailySettingFlags(pageSortedHistory);
+
+    machineNumbers.forEach((no) => {
+      const seriesFull = pageSortedHistory
         .map((h) => {
           const m = h.machines.find((mm) => mm.no === no);
           return m && m.sada !== null ? { date: h.date, sada: m.sada, gsu: m.gsu } : null;
@@ -1054,38 +1134,62 @@ export default function SlotDataTracker() {
         }
       }
 
-      // is tomorrow pre-registered (via 予定イベント) as a specific named event?
+      // is tomorrow pre-registered (via イベント登録) as a specific named event?
       // if so, look up THAT event name's own historical track record for this
       // machine — works for any event name, not just the curated strong list
       const plannedEventName = dateEventMap[tomorrowDate];
       let plannedEventMatch = null;
       if (plannedEventName) {
-        const perf = evaluateEventNamePerformance(series, historyByDate, plannedEventName);
+        const perf = evaluateEventNamePerformance(series, pageHistoryByDate, plannedEventName);
         if (perf) {
           plannedEventMatch = { name: plannedEventName, favorable: perf.winRate > baseRate, ...perf };
         }
       }
 
-      // is tomorrow within a hall-declared "おすすめ機種" period for this
-      // page (機種)? if so, how has this machine done during such periods before?
+      // is tomorrow within a hall-declared "おすすめ機種" period for this page (機種)?
       let recommendMatch = null;
-      if (recommendDateSet.has(tomorrowDate)) {
-        const perf = evaluateMembershipPerformance(series, recommendDateSet);
+      if (pageRecommendDateSet.has(tomorrowDate)) {
+        const perf = evaluateMembershipPerformance(series, pageRecommendDateSet);
         if (perf && perf.winRate > baseRate) {
-          const activePeriod = activePageRecommends.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
+          const activePeriod = pageRecommendsList.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
           recommendMatch = { label: activePeriod ? activePeriod.label : "おすすめ期間", ...perf };
         }
+      }
+
+      // relative-to-peers rotation signal: was TODAY flagged "good" (heavily
+      // played, not badly losing) or "low" (little played despite being
+      // ahead) compared to other machines on this page that same day — and
+      // does that pattern historically predict tomorrow?
+      const flagByDate = new Map();
+      pageSortedHistory.forEach((h) => flagByDate.set(h.date, (dailySettingFlags[h.date] || {})[no] ?? null));
+      const settingFollow = seriesFull.length >= 6 ? evaluateSuspectedSettingFollow(seriesFull, flagByDate) : null;
+      const todayFlag = flagByDate.get(lastDate) || null;
+      let settingMatch = null;
+      if (todayFlag === "good" && settingFollow && settingFollow.good && settingFollow.good.winRate > baseRate) {
+        settingMatch = { flag: "good", ...settingFollow.good };
+      }
+      let settingCaution = null;
+      if (todayFlag === "low" && settingFollow && settingFollow.low) {
+        settingCaution = { flag: "low", ...settingFollow.low };
       }
 
       // caution flag: heavy play without a proportional payout
       const volumeMismatch = evaluateVolumeMismatch(seriesFull);
 
       const hasAnySignal =
-        matchedWindows.length > 0 || streakMatch || weekdayMatch || strongFollowMatch || plannedEventMatch || recommendMatch || volumeMismatch;
+        matchedWindows.length > 0 ||
+        streakMatch ||
+        weekdayMatch ||
+        strongFollowMatch ||
+        plannedEventMatch ||
+        recommendMatch ||
+        settingMatch ||
+        settingCaution ||
+        volumeMismatch;
       if (!hasAnySignal) return;
 
       // combine every POSITIVE matched signal's win rate into one overall score
-      // (volumeMismatch is a caution flag, not a positive signal, so it's excluded)
+      // (volumeMismatch / settingCaution are caution flags, not positive signals, so excluded)
       const signalWinRates = [];
       matchedWindows.forEach((w) => signalWinRates.push(Math.max(...w.result.reasons.map((r) => r.winRate))));
       if (streakMatch) signalWinRates.push(streakMatch.exact ? streakMatch.exact.winRate : streakMatch.winRate);
@@ -1093,6 +1197,7 @@ export default function SlotDataTracker() {
       if (strongFollowMatch) signalWinRates.push(strongFollowMatch.winRate);
       if (plannedEventMatch && plannedEventMatch.favorable) signalWinRates.push(plannedEventMatch.winRate);
       if (recommendMatch) signalWinRates.push(recommendMatch.winRate);
+      if (settingMatch) signalWinRates.push(settingMatch.winRate);
       const overallScore = signalWinRates.length
         ? signalWinRates.reduce((a, b) => a + b, 0) / signalWinRates.length
         : null;
@@ -1113,12 +1218,18 @@ export default function SlotDataTracker() {
         strongFollowMatch,
         plannedEventMatch,
         recommendMatch,
+        settingMatch,
+        settingCaution,
         volumeMismatch,
         overallScore,
         signalCount,
         grade,
       });
     });
+    return results;
+  }
+
+  function sortPickResults(results) {
     results.sort((a, b) => {
       const aScore = a.overallScore ?? -1;
       const bScore = b.overallScore ?? -1;
@@ -1126,7 +1237,33 @@ export default function SlotDataTracker() {
       return b.signalCount - a.signalCount;
     });
     return results;
-  }, [allMachineNumbers, sortedHistory, strongDateSet, historyByDate, dateEventMap, recommendDateSet, activePageRecommends]);
+  }
+
+  const pickList = useMemo(() => {
+    return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends));
+  }, [allMachineNumbers, sortedHistory, strongDateSet, historyByDate, dateEventMap, activePageRecommends]);
+
+  // hall-wide: every page's machines combined into ONE ranked list, no
+  // page/機種 boundary — for spotting the single best "aim" machine anywhere
+  // in the store, not just within one machine type
+  const allPagesPickList = useMemo(() => {
+    const combined = [];
+    pages.forEach((p, i) => {
+      const hist = pageHistories[p.id];
+      if (!hist) return; // not loaded yet
+      const sorted = [...hist].sort((a, b) => a.date.localeCompare(b.date));
+      const hbd = {};
+      sorted.forEach((h) => {
+        hbd[h.date] = h;
+      });
+      const machineNos = Array.from(new Set(sorted.flatMap((h) => h.machines.map((m) => m.no)))).sort((a, b) => a - b);
+      const recs = pageRecommends[p.id] || [];
+      const pageResults = computeSignalsForPage(machineNos, sorted, hbd, recs);
+      const pageLabel = p.name && p.name.trim() ? p.name : `機種${i + 1}`;
+      pageResults.forEach((r) => combined.push({ ...r, pageId: p.id, pageLabel }));
+    });
+    return sortPickResults(combined);
+  }, [pages, pageHistories, pageRecommends, strongDateSet, dateEventMap]);
 
   // system-wide reference accuracy: aggregates every 10/20/30-day threshold
   // rule found across every machine on this page, weighted by sample size.
@@ -1548,7 +1685,45 @@ export default function SlotDataTracker() {
       <div style={{ borderTop: "1px solid #2a323f", marginBottom: "16px" }} />
 
       {viewMode === "common" ? (
-        <div style={{ maxWidth: "640px" }}>
+        <div style={{ maxWidth: "760px" }}>
+          {/* hall-wide combined ranking: every page's machines together, no 機種 boundary */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🏅 全機種合算ランキング（機種の隔たり無し）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+              全ての機種ページの台をひとまとめにして、総合スコアが高い順にランク付けします。狙い台を機種を問わず探したいときはこちらを見てください。
+            </div>
+            {allPagesPickList.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "10px" }}>
+                {allPagesPickList.map((p) => (
+                  <div key={p.pageId + "-" + p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "9px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      {p.grade && (
+                        <span className="mono" style={{
+                          fontSize: "12px", fontWeight: 800, width: "20px", height: "20px", lineHeight: "20px",
+                          textAlign: "center", borderRadius: "50%", color: "#12161d",
+                          background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
+                        }}>
+                          {p.grade}
+                        </span>
+                      )}
+                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
+                      <span style={{ fontSize: "11px", color: "#8b93a3" }}>{p.pageLabel}</span>
+                    </span>
+                    {p.overallScore !== null && (
+                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a", borderRadius: "4px", padding: "1px 6px" }}>
+                        {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {unlocked ? (
             <>
           {/* recommended-model periods — one shared panel, target machine chosen via dropdown */}
@@ -2616,6 +2791,22 @@ export default function SlotDataTracker() {
                         🏆 明日は「{p.recommendMatch.label}」期間中 → この期間の実績は勝率
                         <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.recommendMatch.winRate * 100)}%</span>
                         ・平均{p.recommendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.recommendMatch.avg))}枚（{p.recommendMatch.sampleSize}件中）
+                      </div>
+                    )}
+
+                    {p.settingMatch && (
+                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(158,206,106,0.08)", borderRadius: "6px" }}>
+                        🎯 今日は他の台と比べて回転数が多いのに大きく負けていない（設定良さそう）→ 過去このパターンの翌日は勝率
+                        <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.settingMatch.winRate * 100)}%</span>
+                        ・平均{p.settingMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.settingMatch.avg))}枚（{p.settingMatch.sampleSize}件中）
+                      </div>
+                    )}
+
+                    {p.settingCaution && (
+                      <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
+                        ⚠ 今日は他の台と比べて回転数が少ないのにプラス（早めに見切られた・低設定っぽい）→ 過去このパターンの翌日は勝率
+                        <span style={{ fontWeight: 700 }}> {Math.round(p.settingCaution.winRate * 100)}%</span>
+                        ・平均{p.settingCaution.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.settingCaution.avg))}枚（{p.settingCaution.sampleSize}件中）
                       </div>
                     )}
 
