@@ -180,14 +180,16 @@ async function main() {
   console.log("Collecting report links...");
   const reportLinks = [];
   const nowIso = new Date().toISOString();
-  let pageNum = 1;
-  while (pageNum <= 12) {
-    const listUrl = pageNum === 1 ? TAG_LIST_URL : `${TAG_LIST_URL}page/${pageNum}/`;
+  let listUrl = TAG_LIST_URL;
+  let pageCount = 0;
+  while (listUrl && pageCount < 15) {
+    pageCount += 1;
     let listHtml;
     try {
       listHtml = await fetchHtml(listUrl);
     } catch (e) {
-      break; // no more pages
+      console.log(`Failed to fetch listing page ${listUrl}: ${e.message}`);
+      break;
     }
     const $list = cheerio.load(listHtml);
     let foundAnyOnThisPage = false;
@@ -211,7 +213,29 @@ async function main() {
     });
     if (!foundAnyOnThisPage) break;
     if (oldestDateOnThisPage && oldestDateOnThisPage < STOP_DATE) break; // gone far enough back
-    pageNum += 1;
+
+    // follow the site's own "next page" link rather than guessing the URL
+    // pattern — wp-pagenavi typically renders one of these
+    let nextHref =
+      $list(".wp-pagenavi a.nextpostslink").attr("href") ||
+      $list('a[rel="next"]').attr("href") ||
+      $list("a.next").attr("href") ||
+      null;
+    if (!nextHref) {
+      // last resort: any link whose text looks like "next"
+      $list("a").each((_, a) => {
+        if (nextHref) return;
+        const t = $list(a).text().trim();
+        if (t === "次のページ" || t === "次へ" || t === "»" || t === "Next" || t.includes("次")) {
+          nextHref = $list(a).attr("href") || null;
+        }
+      });
+    }
+    if (!nextHref) {
+      console.log("No next-page link found on the listing page. Stopping pagination.");
+      break;
+    }
+    listUrl = new URL(nextHref, listUrl).toString();
     await sleep(REQUEST_DELAY_MS);
   }
   if (reportLinks.length === 0) {
