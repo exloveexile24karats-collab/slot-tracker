@@ -84,6 +84,8 @@ function toAsciiMinus(text) {
   return text.replace(/[\u2212\uFF0D\u2010\u2011\u2013\u2014]/g, "-");
 }
 
+const DEBUG_MINREPO = !!(process.env.DEBUG_MINREPO || "").trim();
+
 function parseMachineTable($, root) {
   const machines = [];
   root.find("table tr").each((_, tr) => {
@@ -110,6 +112,11 @@ function parseMachineTable($, root) {
     const rb = rbText === "-" ? null : parseInt(rbText, 10);
     const gouseiMatch = gouseiText.match(/1\s*\/\s*(\d+)/);
     const gousei = gouseiMatch ? parseInt(gouseiMatch[1], 10) : null;
+    if (DEBUG_MINREPO) {
+      console.log(
+        `  [debug] no=${no} sadaText=${JSON.stringify(sadaText)} codepoints=${[...sadaText].map((c) => c.codePointAt(0).toString(16)).join(",")} -> sada=${sada} | shutsuText=${JSON.stringify(shutsuText)} -> shutsu=${shutsu}`
+      );
+    }
     machines.push({
       no,
       sada: Number.isNaN(sada) ? null : sada,
