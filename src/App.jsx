@@ -49,7 +49,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.3";
+const APP_VERSION = "3.4";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -122,6 +122,56 @@ function parseTable(text) {
 function fmtNum(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return "―";
   return v.toLocaleString();
+}
+
+// parse a store-wide summary table: 機種名(or 末尾)\t平均差枚\t平均G数\t勝率(x/y)\t出率
+// handles "-" as null, and labels that wrap onto their own line (e.g. "ゾロ目"
+// then "(下二桁)\t231\t...") by carrying the orphan text forward as a prefix
+function parseSummaryTable(text) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const rows = [];
+  let pendingLabel = "";
+  for (const line of lines) {
+    if (line.includes("機種") && line.includes("平均差枚")) continue; // header
+    if (line.includes("末尾") && line.includes("平均差枚")) continue; // digit-table header
+    if (line === "末尾別データ") continue; // section title
+
+    const cols = line.split("\t").map((c) => c.trim());
+    if (cols.length < 5) {
+      pendingLabel += line;
+      continue;
+    }
+    const name = (pendingLabel + cols[0]).trim();
+    pendingLabel = "";
+    const avgSada = cols[1] === "-" || cols[1] === "" ? null : parseInt(cols[1].replace(/,/g, ""), 10);
+    const avgGsu = cols[2] === "-" || cols[2] === "" ? null : parseInt(cols[2].replace(/,/g, ""), 10);
+    const winMatch = cols[3] ? cols[3].match(/(\d+)\s*\/\s*(\d+)/) : null;
+    const wins = winMatch ? parseInt(winMatch[1], 10) : null;
+    const total = winMatch ? parseInt(winMatch[2], 10) : null;
+    const shutsu = cols[4] === "-" || cols[4] === "" ? null : parseFloat(cols[4].replace("%", ""));
+    if (!name) continue;
+    rows.push({
+      name,
+      avgSada: Number.isNaN(avgSada) ? null : avgSada,
+      avgGsu: Number.isNaN(avgGsu) ? null : avgGsu,
+      wins,
+      total,
+      shutsu: Number.isNaN(shutsu) ? null : shutsu,
+    });
+  }
+  return rows;
+}
+
+// splits a combined paste (機種別サマリー + 末尾別データ) at the "末尾別データ" divider
+function parseOverallSummary(text) {
+  const idx = text.indexOf("末尾別データ");
+  const modelText = idx === -1 ? text : text.slice(0, idx);
+  const digitText = idx === -1 ? "" : text.slice(idx);
+  return { modelRows: parseSummaryTable(modelText), digitRows: parseSummaryTable(digitText) };
 }
 
 // Build (trailing N-day total, next day's differential) pairs from a
@@ -499,6 +549,15 @@ export default function SlotDataTracker() {
   const [futureEventName, setFutureEventName] = useState("");
   const [futureEventStatus, setFutureEventStatus] = useState(null);
 
+  // ---- store-wide overall summary (機種別サマリー + 末尾別データ), global,
+  //      irregular entries, one snapshot per date ----
+  const [overallSummaries, setOverallSummaries] = useState([]); // [{date,event,modelRows,digitRows}]
+  const [overallSummariesLoaded, setOverallSummariesLoaded] = useState(false);
+  const [overallDate, setOverallDate] = useState(todayStr());
+  const [overallPasteText, setOverallPasteText] = useState("");
+  const [overallStatus, setOverallStatus] = useState(null);
+  const [confirmDeleteOverall, setConfirmDeleteOverall] = useState(null);
+
   // ---- per-page form / view state ----
   const [pasteText, setPasteText] = useState("");
   const [entryDate, setEntryDate] = useState(todayStr());
@@ -584,6 +643,17 @@ export default function SlotDataTracker() {
         if (r5 && r5.value) setDateEventMap(JSON.parse(r5.value));
       } catch (e) {
         // none yet
+      }
+      try {
+        const r6 = await storage.get(OVERALL_SUMMARY_KEY, false);
+        if (r6 && r6.value) {
+          const val = JSON.parse(r6.value);
+          if (Array.isArray(val)) setOverallSummaries(val);
+        }
+      } catch (e) {
+        // none yet
+      } finally {
+        setOverallSummariesLoaded(true);
       }
     })();
   }, []);
@@ -718,6 +788,43 @@ export default function SlotDataTracker() {
       // ignore
     }
   }, []);
+
+  const persistOverallSummaries = useCallback(async (next) => {
+    setOverallSummaries(next);
+    try {
+      await storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false);
+    } catch (e) {
+      // ignore
+    }
+  }, []);
+
+  function handleSaveOverall() {
+    if (!overallDate) {
+      setOverallStatus({ type: "error", msg: "日付を入力してください。" });
+      return;
+    }
+    const { modelRows, digitRows } = parseOverallSummary(overallPasteText);
+    if (modelRows.length === 0 && digitRows.length === 0) {
+      setOverallStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
+      return;
+    }
+    const eventForDate = (dateEventMap[overallDate] || "").trim();
+    const next = [
+      ...overallSummaries.filter((s) => s.date !== overallDate),
+      { date: overallDate, event: eventForDate, modelRows, digitRows },
+    ];
+    persistOverallSummaries(next);
+    setOverallStatus({
+      type: "ok",
+      msg: `${overallDate} のデータを保存しました（機種${modelRows.length}件・末尾${digitRows.length}件）。`,
+    });
+    setOverallPasteText("");
+  }
+
+  function handleDeleteOverall(date) {
+    persistOverallSummaries(overallSummaries.filter((s) => s.date !== date));
+    setConfirmDeleteOverall(null);
+  }
 
   // race-safe upsert: merges against the LATEST state (via the functional
   // setState form) instead of a value captured in a stale closure, so
@@ -1266,6 +1373,42 @@ export default function SlotDataTracker() {
     return sortPickResults(combined);
   }, [pages, pageHistories, pageRecommends, strongDateSet, dateEventMap]);
 
+  // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
+  // engine (it doesn't care whether "no" is a machine number, a model name,
+  // or a last-digit label — it just needs {date, sada, gsu} per entity)
+  const overallSortedSummaries = useMemo(
+    () => [...overallSummaries].sort((a, b) => a.date.localeCompare(b.date)),
+    [overallSummaries]
+  );
+
+  const overallModelPickList = useMemo(() => {
+    const sortedH = overallSortedSummaries.map((s) => ({
+      date: s.date,
+      event: s.event,
+      machines: s.modelRows.map((r) => ({ no: r.name, sada: r.avgSada, gsu: r.avgGsu })),
+    }));
+    const hbd = {};
+    sortedH.forEach((h) => {
+      hbd[h.date] = h;
+    });
+    const names = Array.from(new Set(sortedH.flatMap((h) => h.machines.map((m) => m.no)))).sort();
+    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, []));
+  }, [overallSortedSummaries, strongDateSet, dateEventMap]);
+
+  const overallDigitPickList = useMemo(() => {
+    const sortedH = overallSortedSummaries.map((s) => ({
+      date: s.date,
+      event: s.event,
+      machines: s.digitRows.map((r) => ({ no: r.name, sada: r.avgSada, gsu: r.avgGsu })),
+    }));
+    const hbd = {};
+    sortedH.forEach((h) => {
+      hbd[h.date] = h;
+    });
+    const names = Array.from(new Set(sortedH.flatMap((h) => h.machines.map((m) => m.no)))).sort();
+    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, []));
+  }, [overallSortedSummaries, strongDateSet, dateEventMap]);
+
   // system-wide reference accuracy: aggregates every 10/20/30-day threshold
   // rule found across every machine on this page, weighted by sample size.
   // NOTE: this is an in-sample measure (the rule was derived from, and is
@@ -1646,6 +1789,13 @@ export default function SlotDataTracker() {
           style={{ display: "flex", alignItems: "center", gap: "6px" }}
         >
           <span>🔧 共通設定</span>
+        </div>
+        <div
+          className={"page-tab" + (viewMode === "overall" ? " active" : "")}
+          onClick={() => setViewMode("overall")}
+          style={{ display: "flex", alignItems: "center", gap: "6px" }}
+        >
+          <span>📊 全体データ</span>
         </div>
         {pages.map((p, i) => (
           <div
@@ -2038,6 +2188,215 @@ export default function SlotDataTracker() {
               </div>
               <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
                 暗証番号を入力すると、イベント登録・強いイベント・店休日・おすすめ機種期間を編集できます。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
+              </div>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  value={pinInput}
+                  onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
+                  onKeyDown={(e) => { if (e.key === "Enter") handleUnlock(); }}
+                  placeholder="暗証番号"
+                  style={{
+                    flex: 1, background: "#12161d", border: "1px solid " + (pinError ? "#e5697a" : "#2a323f"),
+                    borderRadius: "6px", padding: "8px", color: "#e7e9ee", fontSize: "13px",
+                  }}
+                />
+                <button
+                  onClick={handleUnlock}
+                  style={{
+                    background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
+                    padding: "0 16px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
+                  }}
+                >
+                  解除
+                </button>
+              </div>
+              {pinError && (
+                <div style={{ marginTop: "8px", fontSize: "11px", color: "#e5697a" }}>暗証番号が違います。</div>
+              )}
+            </div>
+          )}
+        </div>
+      ) : viewMode === "overall" ? (
+        <div style={{ maxWidth: "760px" }}>
+          {/* public: today's recommendations from the store-wide summaries, no lock needed */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🎯 本日のおすすめ機種（未追跡の機種も含む）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+              下で貼り付けた「機種別サマリー」から、台ごとの分析と同じ仕組みで判定します。
+            </div>
+            {overallModelPickList.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる機種はありません。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "300px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
+                {overallModelPickList.map((p) => (
+                  <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "8px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      {p.grade && (
+                        <span className="mono" style={{
+                          fontSize: "12px", fontWeight: 800, width: "20px", height: "20px", lineHeight: "20px",
+                          textAlign: "center", borderRadius: "50%", color: "#12161d",
+                          background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
+                        }}>
+                          {p.grade}
+                        </span>
+                      )}
+                      <span style={{ fontSize: "12px", color: "#e8b34c" }}>{p.no}</span>
+                    </span>
+                    {p.overallScore !== null && (
+                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a", borderRadius: "4px", padding: "1px 6px" }}>
+                        {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🎯 末尾別のおすすめ
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+              下で貼り付けた「末尾別データ」から、同じ仕組みで判定します。
+            </div>
+            {overallDigitPickList.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる末尾はありません。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "260px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
+                {overallDigitPickList.map((p) => (
+                  <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "8px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      {p.grade && (
+                        <span className="mono" style={{
+                          fontSize: "12px", fontWeight: 800, width: "20px", height: "20px", lineHeight: "20px",
+                          textAlign: "center", borderRadius: "50%", color: "#12161d",
+                          background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
+                        }}>
+                          {p.grade}
+                        </span>
+                      )}
+                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#7dcfff" }}>末尾{p.no}</span>
+                    </span>
+                    {p.overallScore !== null && (
+                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a", borderRadius: "4px", padding: "1px 6px" }}>
+                        {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* data entry, locked behind the same PIN as everything else */}
+          {unlocked ? (
+            <div className="card" style={{ padding: "18px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+                データ入力（機種別サマリー＋末尾別データ）
+              </div>
+              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+                両方の表をそのまま1つに貼り付けてください（「末尾別データ」の行で自動的に区切ります）。日付にはイベント登録の内容が自動で反映されます。
+              </div>
+              <div style={{ marginBottom: "10px" }}>
+                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
+                <input
+                  type="date"
+                  value={overallDate}
+                  onChange={(e) => setOverallDate(e.target.value)}
+                  style={{
+                    display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
+                  }}
+                />
+              </div>
+              {dateEventMap[overallDate] && (
+                <div style={{
+                  fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
+                  background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
+                  display: "flex", alignItems: "center", gap: "6px",
+                }}>
+                  <Flag size={12} />
+                  この日のイベント：{dateEventMap[overallDate]}
+                </div>
+              )}
+              <textarea
+                className="mono scrollbar"
+                value={overallPasteText}
+                onChange={(e) => setOverallPasteText(e.target.value)}
+                placeholder={"機種\t平均差枚\t平均G数\t勝率\t出率\nLアズールレーン THE ANIMATION\t3,500\t3,596\t2/4\t132.4%\n...\n末尾別データ\n末尾\t平均差枚\t平均G数\t勝率\t出率\n0\t868\t5,513\t24/56\t105.2%\n..."}
+                rows={12}
+                style={{
+                  width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
+                  boxSizing: "border-box", marginBottom: "10px",
+                }}
+              />
+              <button
+                onClick={handleSaveOverall}
+                style={{
+                  width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
+                  padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                }}
+              >
+                この日のデータを保存
+              </button>
+              {overallStatus && (
+                <div style={{ marginTop: "8px", fontSize: "11px", color: overallStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                  {overallStatus.msg}
+                </div>
+              )}
+
+              <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
+                <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "8px" }}>
+                  登録済みの日付（{overallSummaries.length}件）
+                </div>
+                <div className="scrollbar" style={{ maxHeight: "180px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+                  {!overallSummariesLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
+                  {overallSummariesLoaded && overallSortedSummaries.length === 0 && (
+                    <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
+                  )}
+                  {[...overallSortedSummaries].reverse().map((s) => (
+                    <div key={s.date} style={{
+                      display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                      background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
+                    }}>
+                      <div>
+                        <span className="mono">{s.date}</span>
+                        {s.event && (
+                          <span style={{ marginLeft: "6px", color: "#e8b34c" }}>
+                            <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
+                            {s.event}
+                          </span>
+                        )}
+                        <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>
+                      </div>
+                      {confirmDeleteOverall === s.date ? (
+                        <div style={{ display: "flex", gap: "6px" }}>
+                          <button onClick={() => handleDeleteOverall(s.date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
+                          <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
+                        </div>
+                      ) : (
+                        <button onClick={() => setConfirmDeleteOverall(s.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="card" style={{ padding: "18px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
+                <Lock size={14} /> データ入力はロック中です
+              </div>
+              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+                暗証番号を入力すると、機種別サマリー・末尾別データを入力できます。上のおすすめ表示は鍵なしで見られます。
               </div>
               <div style={{ display: "flex", gap: "8px" }}>
                 <input
