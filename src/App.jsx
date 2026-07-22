@@ -49,7 +49,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.6";
+const APP_VERSION = "3.7";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -565,6 +565,7 @@ export default function SlotDataTracker() {
   const [overallPasteText, setOverallPasteText] = useState("");
   const [overallStatus, setOverallStatus] = useState(null);
   const [confirmDeleteOverall, setConfirmDeleteOverall] = useState(null);
+  const [confirmDeleteAllOverall, setConfirmDeleteAllOverall] = useState(false);
 
   // ---- per-page form / view state ----
   const [pasteText, setPasteText] = useState("");
@@ -832,6 +833,11 @@ export default function SlotDataTracker() {
   function handleDeleteOverall(date) {
     persistOverallSummaries(overallSummaries.filter((s) => s.date !== date));
     setConfirmDeleteOverall(null);
+  }
+
+  function handleDeleteAllOverall() {
+    persistOverallSummaries([]);
+    setConfirmDeleteAllOverall(false);
   }
 
   // race-safe upsert: merges against the LATEST state (via the functional
@@ -2371,8 +2377,28 @@ export default function SlotDataTracker() {
               )}
 
               <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
-                <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "8px" }}>
-                  登録済みの日付（{overallSummaries.length}件）
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
+                    登録済みの日付（{overallSummaries.length}件）
+                  </div>
+                  {overallSummaries.length > 0 && (
+                    confirmDeleteAllOverall ? (
+                      <span style={{ display: "flex", gap: "6px" }}>
+                        <span style={{ fontSize: "11px", color: "#e5697a" }}>本当に全部削除しますか？</span>
+                        <button onClick={handleDeleteAllOverall} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>
+                          削除する
+                        </button>
+                        <button onClick={() => setConfirmDeleteAllOverall(false)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>
+                          取消
+                        </button>
+                      </span>
+                    ) : (
+                      <button onClick={() => setConfirmDeleteAllOverall(true)} style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px" }}>
+                        <Trash2 size={11} />
+                        全部削除
+                      </button>
+                    )
+                  )}
                 </div>
                 <div className="scrollbar" style={{ maxHeight: "180px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
                   {!overallSummariesLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
