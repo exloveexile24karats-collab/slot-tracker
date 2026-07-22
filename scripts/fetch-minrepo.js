@@ -75,6 +75,13 @@ function resolveDate(monthDayStr, referenceIso) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+// some sites render negative numbers with a different Unicode character than
+// a plain ASCII hyphen (e.g. U+2212 MINUS SIGN, U+FF0D FULLWIDTH HYPHEN-MINUS)
+// — parseInt/parseFloat don't recognize those, so normalize them first
+function toAsciiMinus(text) {
+  return text.replace(/[\u2212\uFF0D\u2010\u2011\u2013\u2014]/g, "-");
+}
+
 function parseMachineTable($, root) {
   const machines = [];
   root.find("table tr").each((_, tr) => {
@@ -86,11 +93,11 @@ function parseMachineTable($, root) {
     if (noText === "平均") return; // average row
     const no = parseInt(noText.replace(/,/g, ""), 10);
     if (Number.isNaN(no)) return;
-    const sadaText = $(tds[1]).text().trim();
-    const gsuText = $(tds[2]).text().trim();
+    const sadaText = toAsciiMinus($(tds[1]).text().trim());
+    const gsuText = toAsciiMinus($(tds[2]).text().trim());
     const shutsuText = $(tds[3]).text().trim();
-    const bbText = $(tds[4]).text().trim();
-    const rbText = $(tds[5]).text().trim();
+    const bbText = toAsciiMinus($(tds[4]).text().trim());
+    const rbText = toAsciiMinus($(tds[5]).text().trim());
     const gouseiText = $(tds[6]).text().trim();
     const bbRateStr = $(tds[7]).text().trim() || "-";
     const rbRateStr = $(tds[8]).text().trim() || "-";
@@ -126,8 +133,8 @@ function parseSummaryRows($, table) {
       const tds = $tr.find("td");
       if (tds.length < 5) return;
       const name = $(tds[0]).text().trim().replace(/\s+/g, " ");
-      const avgSadaText = $(tds[1]).text().trim();
-      const avgGsuText = $(tds[2]).text().trim();
+      const avgSadaText = toAsciiMinus($(tds[1]).text().trim());
+      const avgGsuText = toAsciiMinus($(tds[2]).text().trim());
       const winText = $(tds[3]).text().trim();
       const shutsuText = $(tds[4]).text().trim();
       const avgSada = avgSadaText === "-" || avgSadaText === "" ? null : parseInt(avgSadaText.replace(/,/g, ""), 10);

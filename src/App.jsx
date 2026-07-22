@@ -49,7 +49,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.5";
+const APP_VERSION = "3.6";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -74,6 +74,13 @@ function addDays(dateStr, days) {
 }
 
 // Parse pasted hall-data table text into an array of machine records.
+// some sources render negative numbers with a different Unicode character
+// than a plain ASCII hyphen (e.g. U+2212 MINUS SIGN, U+FF0D FULLWIDTH
+// HYPHEN-MINUS) — parseInt/parseFloat don't recognize those, so normalize first
+function toAsciiMinus(text) {
+  return String(text).replace(/[\u2212\uFF0D\u2010\u2011\u2013\u2014]/g, "-");
+}
+
 function parseTable(text) {
   const lines = text
     .split(/\r?\n/)
@@ -96,11 +103,11 @@ function parseTable(text) {
     const no = parseInt(String(noStr).replace(/,/g, ""), 10);
     if (Number.isNaN(no)) continue;
 
-    const sada = parseInt(String(sadaStr).replace(/,/g, ""), 10);
-    const gsu = parseInt(String(gsuStr).replace(/,/g, ""), 10);
+    const sada = parseInt(toAsciiMinus(sadaStr).replace(/,/g, ""), 10);
+    const gsu = parseInt(toAsciiMinus(gsuStr).replace(/,/g, ""), 10);
     const shutsu = parseFloat(String(shutsuStr).replace("%", ""));
-    const bb = bbStr === "-" || bbStr === undefined ? null : parseInt(bbStr, 10);
-    const rb = rbStr === "-" || rbStr === undefined ? null : parseInt(rbStr, 10);
+    const bb = bbStr === "-" || bbStr === undefined ? null : parseInt(toAsciiMinus(bbStr), 10);
+    const rb = rbStr === "-" || rbStr === undefined ? null : parseInt(toAsciiMinus(rbStr), 10);
     const gouseiMatch = gouseiStr ? gouseiStr.match(/1\s*\/\s*(\d+)/) : null;
     const gousei = gouseiMatch ? parseInt(gouseiMatch[1], 10) : null;
 
@@ -147,7 +154,8 @@ function parseSummaryTable(text) {
     }
     const name = (pendingLabel + cols[0]).trim();
     pendingLabel = "";
-    const avgSada = cols[1] === "-" || cols[1] === "" ? null : parseInt(cols[1].replace(/,/g, ""), 10);
+    const col1 = toAsciiMinus(cols[1]);
+    const avgSada = col1 === "-" || col1 === "" ? null : parseInt(col1.replace(/,/g, ""), 10);
     const avgGsu = cols[2] === "-" || cols[2] === "" ? null : parseInt(cols[2].replace(/,/g, ""), 10);
     const winMatch = cols[3] ? cols[3].match(/(\d+)\s*\/\s*(\d+)/) : null;
     const wins = winMatch ? parseInt(winMatch[1], 10) : null;
