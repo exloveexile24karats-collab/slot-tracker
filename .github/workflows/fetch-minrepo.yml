@@ -1,0 +1,24 @@
+name: Fetch min-repo data
+
+on:
+  schedule:
+    # 3:00 AM JST = 18:00 UTC (previous day)
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install scraper dependencies
+        working-directory: scripts
+        run: npm install
+      - name: Run fetch
+        working-directory: scripts
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: node fetch-minrepo.js
