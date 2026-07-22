@@ -49,7 +49,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.7";
+const APP_VERSION = "3.8";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -893,10 +893,6 @@ export default function SlotDataTracker() {
     persistPages(pages.map((p) => (p.id === pageId ? { ...p, name } : p)));
   }
 
-  function handleSetMinRepoName(pageId, minRepoName) {
-    persistPages(pages.map((p) => (p.id === pageId ? { ...p, minRepoName } : p)));
-  }
-
   function handleDeletePage(pageId) {
     const next = pages.filter((p) => p.id !== pageId);
     persistPages(next);
@@ -1396,13 +1392,6 @@ export default function SlotDataTracker() {
   // or a last-digit label — it just needs {date, sada, gsu} per entity)
   const overallSortedSummaries = useMemo(
     () => [...overallSummaries].sort((a, b) => a.date.localeCompare(b.date)),
-    [overallSummaries]
-  );
-
-  // every model name that has ever appeared in a 機種別サマリー snapshot —
-  // used as autocomplete options for registering a page's min-repo official name
-  const allKnownModelNames = useMemo(
-    () => Array.from(new Set(overallSummaries.flatMap((s) => s.modelRows.map((r) => r.name)))).sort(),
     [overallSummaries]
   );
 
@@ -2475,7 +2464,7 @@ export default function SlotDataTracker() {
       ) : (
         <>
       {/* machine model name (manual entry) for current page */}
-      <div style={{ marginBottom: "8px", display: "flex", alignItems: "center", gap: "8px" }}>
+      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
         <Pencil size={14} color="#5a6272" />
         <input
           type="text"
@@ -2494,30 +2483,6 @@ export default function SlotDataTracker() {
           }}
         />
       </div>
-      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
-        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>min-repo正式名称（自動取得用・任意）：</span>
-        <input
-          type="text"
-          list="minrepo-model-options"
-          value={currentPage ? currentPage.minRepoName || "" : ""}
-          onChange={(e) => handleSetMinRepoName(activePageId, e.target.value)}
-          placeholder="例：スマスロ 甲鉄城のカバネリ 海門決戦"
-          style={{
-            fontSize: "12px",
-            background: "#12161d",
-            border: "1px solid #2a323f",
-            borderRadius: "6px",
-            color: "#e7e9ee",
-            padding: "5px 8px",
-            minWidth: "280px",
-          }}
-        />
-      </div>
-      <datalist id="minrepo-model-options">
-        {allKnownModelNames.map((n) => (
-          <option value={n} key={n} />
-        ))}
-      </datalist>
 
       <div
         style={{
