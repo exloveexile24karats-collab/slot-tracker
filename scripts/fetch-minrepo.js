@@ -190,11 +190,17 @@ async function main() {
   console.log("Latest report:", latestUrl);
 
   let currentUrl = latestUrl;
+  const visitedUrls = new Set();
   let overallChanged = false;
   const changedPageIds = new Set();
   let stepCount = 0;
 
   while (currentUrl && stepCount < MAX_DAYS_PER_RUN) {
+    if (visitedUrls.has(currentUrl)) {
+      console.log(`Already visited ${currentUrl} — stopping to avoid a loop.`);
+      break;
+    }
+    visitedUrls.add(currentUrl);
     stepCount += 1;
     await sleep(REQUEST_DELAY_MS);
 
@@ -266,7 +272,10 @@ async function main() {
     }
 
     // ---- follow the "前日" (previous day) link to keep walking backward ----
-    const prevHref = $(".prev_next_link a").first().attr("href");
+    let prevHref = null;
+    $(".prev_next_link a").each((_, a) => {
+      if ($(a).text().includes("前日")) prevHref = $(a).attr("href");
+    });
     if (!prevHref) {
       console.log("No previous-day link found. Stopping.");
       break;
