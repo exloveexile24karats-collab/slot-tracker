@@ -50,7 +50,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.9";
+const APP_VERSION = "3.11";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -156,12 +156,18 @@ function parseSummaryTable(text) {
     const name = (pendingLabel + cols[0]).trim();
     pendingLabel = "";
     const col1 = toAsciiMinus(cols[1]);
-    const avgSada = col1 === "-" || col1 === "" ? null : parseInt(col1.replace(/,/g, ""), 10);
+    // min-repo shows a bare "-" for 平均差枚 specifically when the average
+    // was NEGATIVE (not when data is missing) — so treat it as "a loss of
+    // unknown size" rather than silently dropping the day from the series.
+    // Using a near-zero negative sentinel correctly counts it as a losing
+    // day for win-rate/streak purposes without meaningfully distorting
+    // magnitude-based averages (since we have no real number to use).
+    const avgSada = col1 === "" ? null : col1 === "-" ? -0.01 : parseInt(col1.replace(/,/g, ""), 10);
     const avgGsu = cols[2] === "-" || cols[2] === "" ? null : parseInt(cols[2].replace(/,/g, ""), 10);
     const winMatch = cols[3] ? cols[3].match(/(\d+)\s*\/\s*(\d+)/) : null;
     const wins = winMatch ? parseInt(winMatch[1], 10) : null;
     const total = winMatch ? parseInt(winMatch[2], 10) : null;
-    const shutsu = cols[4] === "-" || cols[4] === "" ? null : parseFloat(cols[4].replace("%", ""));
+    const shutsu = cols[4] === "-" ? 99.9 : cols[4] === "" ? null : parseFloat(cols[4].replace("%", ""));
     if (!name) continue;
     rows.push({
       name,
@@ -1262,6 +1268,11 @@ export default function SlotDataTracker() {
     const pageRecommendDateSet = new Set();
     pageRecommendsList.forEach((r) => enumerateDateRange(r.startDate, r.endDate).forEach((d) => pageRecommendDateSet.add(d)));
     const dailySettingFlags = computeDailySettingFlags(pageSortedHistory);
+    // "tomorrow" must mean the same date for every machine/model/digit on this
+    // page — anchored to the page's own most recent entered date, NOT each
+    // item's own last non-"-" date (otherwise an item that happened to show
+    // "-" on the latest date would predict for the wrong, already-past day)
+    const referenceDate = pageSortedHistory.length > 0 ? pageSortedHistory[pageSortedHistory.length - 1].date : null;
 
     machineNumbers.forEach((no) => {
       const seriesFull = pageSortedHistory
@@ -1300,7 +1311,7 @@ export default function SlotDataTracker() {
 
       // weekday-based signal (does tomorrow's weekday historically do well?)
       const weekdayStats = computeWeekdayStats(series);
-      const tomorrowDate = addDays(lastDate, 1);
+      const tomorrowDate = addDays(referenceDate || lastDate, 1);
       const tomorrowWeekday = weekdayOf(tomorrowDate);
       const weekdayBucket = weekdayStats[tomorrowWeekday];
       const weekdayMatch =
