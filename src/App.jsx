@@ -36,6 +36,7 @@ const STRONG_EVENTS_KEY = "slot-strong-events-v1";
 const CLOSED_DAYS_KEY = "slot-closed-days-v1";
 const DATE_EVENT_MAP_KEY = "slot-date-event-map-v1";
 const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1";
+const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
 
 const PALETTE = [
@@ -49,7 +50,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.8";
+const APP_VERSION = "3.9";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -567,6 +568,13 @@ export default function SlotDataTracker() {
   const [confirmDeleteOverall, setConfirmDeleteOverall] = useState(null);
   const [confirmDeleteAllOverall, setConfirmDeleteAllOverall] = useState(false);
 
+  // ---- undo history: snapshots taken right before a destructive action,
+  //      so any reset/delete can be reversed with one click. shown as a
+  //      fixed panel regardless of which tab/page is currently open ----
+  const [undoHistory, setUndoHistory] = useState([]);
+  const [undoHistoryLoaded, setUndoHistoryLoaded] = useState(false);
+  const [undoPanelOpen, setUndoPanelOpen] = useState(false);
+
   // ---- per-page form / view state ----
   const [pasteText, setPasteText] = useState("");
   const [entryDate, setEntryDate] = useState(todayStr());
@@ -663,6 +671,17 @@ export default function SlotDataTracker() {
         // none yet
       } finally {
         setOverallSummariesLoaded(true);
+      }
+      try {
+        const r7 = await storage.get(UNDO_HISTORY_KEY, false);
+        if (r7 && r7.value) {
+          const val = JSON.parse(r7.value);
+          if (Array.isArray(val)) setUndoHistory(val);
+        }
+      } catch (e) {
+        // none yet
+      } finally {
+        setUndoHistoryLoaded(true);
       }
     })();
   }, []);
@@ -807,6 +826,60 @@ export default function SlotDataTracker() {
     }
   }, []);
 
+  // ---- undo history: call this with the CURRENT (about-to-be-overwritten)
+  //      value right before any destructive write, so it can be restored
+  //      with one click later. Shown in a fixed panel regardless of tab. ----
+  const persistUndoHistory = useCallback(async (next) => {
+    setUndoHistory(next);
+    try {
+      await storage.set(UNDO_HISTORY_KEY, JSON.stringify(next), false);
+    } catch (e) {
+      // ignore
+    }
+  }, []);
+
+  function pushUndoEntry(label, storageKey, previousValue) {
+    const entry = { id: `undo-${Date.now()}`, timestamp: Date.now(), label, storageKey, previousValue };
+    const next = [entry, ...undoHistory].slice(0, 10);
+    persistUndoHistory(next);
+  }
+
+  // maps a storage key back to the React state setter that mirrors it, so a
+  // restored value shows up immediately without needing a page reload
+  function applyRestoredValue(storageKey, value) {
+    if (storageKey === PAGES_KEY) {
+      setPages(value || []);
+    } else if (storageKey === OVERALL_SUMMARY_KEY) {
+      setOverallSummaries(value || []);
+    } else if (storageKey === CLOSED_DAYS_KEY) {
+      setClosedDays(value || []);
+    } else if (storageKey === STRONG_EVENTS_KEY) {
+      setStrongEvents(value || []);
+    } else if (storageKey === DATE_EVENT_MAP_KEY) {
+      setDateEventMap(value || {});
+    } else if (storageKey.startsWith("slot-history-")) {
+      const pageId = storageKey.slice("slot-history-".length);
+      setPageHistories((prev) => ({ ...prev, [pageId]: value || [] }));
+    } else if (storageKey.startsWith("slot-recommend-")) {
+      const pageId = storageKey.slice("slot-recommend-".length);
+      setPageRecommends((prev) => ({ ...prev, [pageId]: value || [] }));
+    }
+  }
+
+  async function handleRestoreUndo(entry) {
+    try {
+      await storage.set(entry.storageKey, JSON.stringify(entry.previousValue), false);
+    } catch (e) {
+      // ignore, still update local state below so the user sees the restore
+    }
+    applyRestoredValue(entry.storageKey, entry.previousValue);
+    persistUndoHistory(undoHistory.filter((h) => h.id !== entry.id));
+  }
+
+  function handleDismissUndoEntry(id) {
+    persistUndoHistory(undoHistory.filter((h) => h.id !== id));
+  }
+
   function handleSaveOverall() {
     if (!overallDate) {
       setOverallStatus({ type: "error", msg: "日付を入力してください。" });
@@ -831,11 +904,13 @@ export default function SlotDataTracker() {
   }
 
   function handleDeleteOverall(date) {
+    pushUndoEntry(`全体データ ${date} を削除`, OVERALL_SUMMARY_KEY, overallSummaries);
     persistOverallSummaries(overallSummaries.filter((s) => s.date !== date));
     setConfirmDeleteOverall(null);
   }
 
   function handleDeleteAllOverall() {
+    pushUndoEntry("全体データを全部削除", OVERALL_SUMMARY_KEY, overallSummaries);
     persistOverallSummaries([]);
     setConfirmDeleteAllOverall(false);
   }
@@ -894,7 +969,9 @@ export default function SlotDataTracker() {
   }
 
   function handleDeletePage(pageId) {
+    const deletedPage = pages.find((p) => p.id === pageId);
     const next = pages.filter((p) => p.id !== pageId);
+    pushUndoEntry(`ページ「${deletedPage && deletedPage.name ? deletedPage.name : "無題"}」を削除`, PAGES_KEY, pages);
     persistPages(next);
     setConfirmDeletePage(null);
     if (activePageId === pageId && next.length > 0) {
@@ -1545,6 +1622,8 @@ export default function SlotDataTracker() {
   }
 
   function handleResetAll() {
+    const pageLabel = currentPage && currentPage.name ? currentPage.name : "このページ";
+    pushUndoEntry(`「${pageLabel}」のデータをリセット`, historyKey(activePageId), currentHistory);
     persistPageHistory(activePageId, []);
     setSelectedMachines([]);
     setConfirmReset(false);
@@ -1574,6 +1653,7 @@ export default function SlotDataTracker() {
   }
 
   function handleRemoveStrongEvent(name) {
+    pushUndoEntry(`強いイベント「${name}」を削除`, STRONG_EVENTS_KEY, strongEvents);
     persistStrongEvents(strongEvents.filter((s) => s.name !== name));
   }
 
@@ -1593,6 +1673,7 @@ export default function SlotDataTracker() {
   }
 
   function handleRemoveClosedDay(date) {
+    pushUndoEntry(`店休日 ${date} を削除`, CLOSED_DAYS_KEY, closedDays);
     persistClosedDays(closedDays.filter((c) => c.date !== date));
   }
 
@@ -1615,6 +1696,7 @@ export default function SlotDataTracker() {
 
   function handleRemoveRecommend(id) {
     if (!recommendTargetPageId) return;
+    pushUndoEntry("おすすめ機種期間を削除", recommendKey(recommendTargetPageId), recommendTargetList);
     persistPageRecommends(recommendTargetPageId, recommendTargetList.filter((r) => r.id !== id));
   }
 
@@ -1632,6 +1714,7 @@ export default function SlotDataTracker() {
   }
 
   async function handleRemoveDateEvent(date) {
+    pushUndoEntry(`イベント登録 ${date} を削除`, DATE_EVENT_MAP_KEY, dateEventMap);
     setDateEventMap((prev) => {
       const next = { ...prev };
       delete next[date];
@@ -1732,6 +1815,180 @@ export default function SlotDataTracker() {
           </div>
         ) : (
           <div style={{ fontSize: "11px", color: "#5a6272" }}>以下パターン：データ不足</div>
+        )}
+      </div>
+    );
+  }
+
+  // shared card renderer for pickList / overallModelPickList / overallDigitPickList
+  // so all three show the exact same signal breakdown (windows, streak, weekday,
+  // strong-event follow, planned event, recommend period, relative rotation, etc.)
+  function renderPickCard(p, labelOverride) {
+    return (
+      <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+          <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{labelOverride ? labelOverride(p) : `${p.no}番`}</span>
+            {p.grade && (
+              <span className="mono" style={{
+                fontSize: "13px", fontWeight: 800, width: "22px", height: "22px", lineHeight: "22px",
+                textAlign: "center", borderRadius: "50%", color: "#12161d",
+                background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
+              }}>
+                {p.grade}
+              </span>
+            )}
+            {p.overallScore !== null && (
+              <span className="mono" style={{
+                fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a",
+                borderRadius: "4px", padding: "1px 6px",
+              }}>
+                総合スコア {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
+              </span>
+            )}
+          </span>
+          <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}時点</span>
+        </div>
+
+        {p.matchedCount > 0 && (
+          <div style={{ fontSize: "11px", color: "#c7cbd4", marginBottom: "6px", padding: "6px 8px", background: "rgba(79,209,197,0.08)", borderRadius: "6px" }}>
+            総合判断：<span style={{ color: "#4fd1c5", fontWeight: 700 }}>{p.evaluableCount}期間中{p.matchedCount}期間</span>でプラス条件に該当
+            （平均勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.avgWinRate * 100)}%</span>）
+          </div>
+        )}
+
+        {p.windows.map((w) => (
+          <div key={w.windowSize} style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "3px" }}>
+            <span className="mono" style={{ color: "#c7cbd4" }}>{w.windowSize}日足</span>：
+            {!w.result ? (
+              <span>データ不足</span>
+            ) : w.result.reasons.length === 0 ? (
+              <span>
+                条件非該当（直近合計 {w.result.currentTrailing >= 0 ? "+" : ""}{fmtNum(w.result.currentTrailing)}枚）
+              </span>
+            ) : (
+              w.result.reasons.map((r, i) => (
+                <span key={i}>
+                  条件該当（直近合計 {w.result.currentTrailing >= 0 ? "+" : ""}{fmtNum(w.result.currentTrailing)}枚 ／ しきい値
+                  <span className="mono" style={{ color: "#c7cbd4" }}>
+                    {" "}{r.threshold >= 0 ? "+" : ""}{fmtNum(Math.round(r.threshold))}枚{r.direction === "above" ? "以上" : "以下"}
+                  </span>
+                  ／ 過去勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(r.winRate * 100)}%</span>（{r.sampleSize}件中））
+                </span>
+              ))
+            )}
+          </div>
+        ))}
+
+        {p.streakMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
+            連続日数：<span className="mono" style={{ color: "#c7cbd4" }}>{p.streakMatch.len}日連続{p.streakMatch.dir === "plus" ? "プラス" : "マイナス"}</span>
+            {p.streakMatch.exact ? (
+              <>
+                （ちょうど{p.streakMatch.exact.len}日連続だった時の翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.exact.winRate * 100)}%</span>、{p.streakMatch.exact.sampleSize}件中）
+              </>
+            ) : (
+              <>
+                （ちょうど{p.streakMatch.len}日連続の過去データが少ないため、参考として{p.streakMatch.minLen}日以上でまとめた翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.winRate * 100)}%</span>、{p.streakMatch.sampleSize}件中）
+              </>
+            )}
+          </div>
+        )}
+
+        {p.weekdayMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
+            曜日傾向：明日は<span className="mono" style={{ color: "#c7cbd4" }}>{p.weekdayTomorrow}曜日</span>
+            （過去平均 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{p.weekdayMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.weekdayMatch.avg))}枚</span>、{p.weekdayMatch.count}件中）
+          </div>
+        )}
+
+        {p.combinedWeekdayDigit && (
+          <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "3px", marginLeft: "12px" }}>
+            └ さらに絞って{p.weekdayTomorrow}曜日×{p.combinedWeekdayDigit.digit}のつく日：
+            {p.combinedWeekdayDigit.count === 0 ? (
+              <span>過去に該当日がまだありません</span>
+            ) : (
+              <span>
+                平均 <span style={{ color: p.combinedWeekdayDigit.avg >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+                  {p.combinedWeekdayDigit.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.combinedWeekdayDigit.avg))}枚
+                </span>（{p.combinedWeekdayDigit.count}件中 — サンプルが少ないので参考程度に）
+              </span>
+            )}
+          </div>
+        )}
+
+        {p.strongFollowMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
+            <Star size={10} style={{ display: "inline", marginRight: "2px", color: "#e5697a" }} fill="#e5697a" />
+            今日は強いイベント日 → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.strongFollowMatch.winRate * 100)}%</span>
+            （通常{Math.round(p.strongFollowMatch.normalRate * 100)}% ／ {p.strongFollowMatch.sampleSize}件中）
+          </div>
+        )}
+
+        {p.plannedEventMatch && (
+          <div style={{
+            fontSize: "11px", marginTop: "6px", padding: "6px 8px", borderRadius: "6px",
+            color: p.plannedEventMatch.favorable ? "#8b93a3" : "#e5697a",
+            background: p.plannedEventMatch.favorable ? "rgba(232,179,76,0.08)" : "rgba(229,105,122,0.06)",
+          }}>
+            📅 明日は予定イベント「{p.plannedEventMatch.name}」 → このイベントの翌日は過去
+            <span style={{ color: p.plannedEventMatch.favorable ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
+              {" "}{Math.round(p.plannedEventMatch.winRate * 100)}%
+            </span>
+            でプラス（{p.plannedEventMatch.sampleSize}件中、平均{p.plannedEventMatch.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(p.plannedEventMatch.avgNext))}枚）
+          </div>
+        )}
+
+        {p.recommendMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(191,161,247,0.08)", borderRadius: "6px" }}>
+            🏆 明日は「{p.recommendMatch.label}」期間中 → この期間の実績は勝率
+            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.recommendMatch.winRate * 100)}%</span>
+            ・平均{p.recommendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.recommendMatch.avg))}枚（{p.recommendMatch.sampleSize}件中）
+          </div>
+        )}
+
+        {p.settingMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(158,206,106,0.08)", borderRadius: "6px" }}>
+            🎯 今日は他と比べて回転数が多いのに大きく負けていない（設定良さそう）→ 過去このパターンの翌日は勝率
+            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.settingMatch.winRate * 100)}%</span>
+            ・平均{p.settingMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.settingMatch.avg))}枚（{p.settingMatch.sampleSize}件中）
+          </div>
+        )}
+
+        {p.settingCaution && (
+          <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
+            ⚠ 今日は他と比べて回転数が少ないのにプラス（早めに見切られた・低設定っぽい）→ 過去このパターンの翌日は勝率
+            <span style={{ fontWeight: 700 }}> {Math.round(p.settingCaution.winRate * 100)}%</span>
+            ・平均{p.settingCaution.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.settingCaution.avg))}枚（{p.settingCaution.sampleSize}件中）
+          </div>
+        )}
+
+        {p.volumeMismatch && (
+          <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
+            <div>
+              ⚠ 大量回転・低調：直近G数 <span className="mono">{fmtNum(p.volumeMismatch.lastGsu)}G</span>
+              （平均{fmtNum(Math.round(p.volumeMismatch.avgGsu))}G）に対し、差枚
+              <span className="mono"> {p.volumeMismatch.lastSada >= 0 ? "+" : ""}{fmtNum(p.volumeMismatch.lastSada)}枚</span>
+            </div>
+            {p.volumeMismatch.nextDayStats ? (
+              <div style={{ marginTop: "4px" }}>
+                過去、同じパターンの翌日：勝率 <span style={{ fontWeight: 700 }}>{Math.round(p.volumeMismatch.nextDayStats.winRate * 100)}%</span>
+                ・平均{p.volumeMismatch.nextDayStats.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.volumeMismatch.nextDayStats.avg))}枚
+                （{p.volumeMismatch.nextDayStats.sampleSize}件中）
+              </div>
+            ) : (
+              <div style={{ marginTop: "4px", color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（翌日）</div>
+            )}
+            {p.volumeMismatch.twoDayStats ? (
+              <div>
+                2日後：勝率 <span style={{ fontWeight: 700 }}>{Math.round(p.volumeMismatch.twoDayStats.winRate * 100)}%</span>
+                ・平均{p.volumeMismatch.twoDayStats.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.volumeMismatch.twoDayStats.avg))}枚
+                （{p.volumeMismatch.twoDayStats.sampleSize}件中）
+              </div>
+            ) : (
+              <div style={{ color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（2日後）</div>
+            )}
+          </div>
         )}
       </div>
     );
@@ -2245,28 +2502,8 @@ export default function SlotDataTracker() {
             {overallModelPickList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる機種はありません。</div>
             ) : (
-              <div className="scrollbar" style={{ maxHeight: "300px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
-                {overallModelPickList.map((p) => (
-                  <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "8px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      {p.grade && (
-                        <span className="mono" style={{
-                          fontSize: "12px", fontWeight: 800, width: "20px", height: "20px", lineHeight: "20px",
-                          textAlign: "center", borderRadius: "50%", color: "#12161d",
-                          background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
-                        }}>
-                          {p.grade}
-                        </span>
-                      )}
-                      <span style={{ fontSize: "12px", color: "#e8b34c" }}>{p.no}</span>
-                    </span>
-                    {p.overallScore !== null && (
-                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a", borderRadius: "4px", padding: "1px 6px" }}>
-                        {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
-                      </span>
-                    )}
-                  </div>
-                ))}
+              <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
+                {overallModelPickList.map((p) => renderPickCard(p, (pp) => pp.no))}
               </div>
             )}
           </div>
@@ -2281,28 +2518,8 @@ export default function SlotDataTracker() {
             {overallDigitPickList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる末尾はありません。</div>
             ) : (
-              <div className="scrollbar" style={{ maxHeight: "260px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
-                {overallDigitPickList.map((p) => (
-                  <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "8px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      {p.grade && (
-                        <span className="mono" style={{
-                          fontSize: "12px", fontWeight: 800, width: "20px", height: "20px", lineHeight: "20px",
-                          textAlign: "center", borderRadius: "50%", color: "#12161d",
-                          background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
-                        }}>
-                          {p.grade}
-                        </span>
-                      )}
-                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#7dcfff" }}>末尾{p.no}</span>
-                    </span>
-                    {p.overallScore !== null && (
-                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a", borderRadius: "4px", padding: "1px 6px" }}>
-                        {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
-                      </span>
-                    )}
-                  </div>
-                ))}
+              <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
+                {overallDigitPickList.map((p) => renderPickCard(p, (pp) => `末尾${pp.no}`))}
               </div>
             )}
           </div>
@@ -3074,174 +3291,7 @@ export default function SlotDataTracker() {
               <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
             ) : (
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
-                {pickList.map((p) => (
-                  <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
-                      <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                        <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
-                        {p.grade && (
-                          <span className="mono" style={{
-                            fontSize: "13px", fontWeight: 800, width: "22px", height: "22px", lineHeight: "22px",
-                            textAlign: "center", borderRadius: "50%", color: "#12161d",
-                            background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
-                          }}>
-                            {p.grade}
-                          </span>
-                        )}
-                        {p.overallScore !== null && (
-                          <span className="mono" style={{
-                            fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a",
-                            borderRadius: "4px", padding: "1px 6px",
-                          }}>
-                            総合スコア {Math.round(p.overallScore * 100)}%（{p.signalCount}件根拠）
-                          </span>
-                        )}
-                      </span>
-                      <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}時点</span>
-                    </div>
-
-                    {p.matchedCount > 0 && (
-                      <div style={{ fontSize: "11px", color: "#c7cbd4", marginBottom: "6px", padding: "6px 8px", background: "rgba(79,209,197,0.08)", borderRadius: "6px" }}>
-                        総合判断：<span style={{ color: "#4fd1c5", fontWeight: 700 }}>{p.evaluableCount}期間中{p.matchedCount}期間</span>でプラス条件に該当
-                        （平均勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.avgWinRate * 100)}%</span>）
-                      </div>
-                    )}
-
-                    {p.windows.map((w) => (
-                      <div key={w.windowSize} style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "3px" }}>
-                        <span className="mono" style={{ color: "#c7cbd4" }}>{w.windowSize}日足</span>：
-                        {!w.result ? (
-                          <span>データ不足</span>
-                        ) : w.result.reasons.length === 0 ? (
-                          <span>
-                            条件非該当（直近合計 {w.result.currentTrailing >= 0 ? "+" : ""}{fmtNum(w.result.currentTrailing)}枚）
-                          </span>
-                        ) : (
-                          w.result.reasons.map((r, i) => (
-                            <span key={i}>
-                              条件該当（直近合計 {w.result.currentTrailing >= 0 ? "+" : ""}{fmtNum(w.result.currentTrailing)}枚 ／ しきい値
-                              <span className="mono" style={{ color: "#c7cbd4" }}>
-                                {" "}{r.threshold >= 0 ? "+" : ""}{fmtNum(Math.round(r.threshold))}枚{r.direction === "above" ? "以上" : "以下"}
-                              </span>
-                              ／ 過去勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(r.winRate * 100)}%</span>（{r.sampleSize}件中））
-                            </span>
-                          ))
-                        )}
-                      </div>
-                    ))}
-
-                    {p.streakMatch && (
-                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
-                        連続日数：<span className="mono" style={{ color: "#c7cbd4" }}>{p.streakMatch.len}日連続{p.streakMatch.dir === "plus" ? "プラス" : "マイナス"}</span>
-                        {p.streakMatch.exact ? (
-                          <>
-                            （ちょうど{p.streakMatch.exact.len}日連続だった時の翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.exact.winRate * 100)}%</span>、{p.streakMatch.exact.sampleSize}件中）
-                          </>
-                        ) : (
-                          <>
-                            （ちょうど{p.streakMatch.len}日連続の過去データが少ないため、参考として{p.streakMatch.minLen}日以上でまとめた翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.winRate * 100)}%</span>、{p.streakMatch.sampleSize}件中）
-                          </>
-                        )}
-                      </div>
-                    )}
-
-                    {p.weekdayMatch && (
-                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
-                        曜日傾向：明日は<span className="mono" style={{ color: "#c7cbd4" }}>{p.weekdayTomorrow}曜日</span>
-                        （過去平均 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{p.weekdayMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.weekdayMatch.avg))}枚</span>、{p.weekdayMatch.count}件中）
-                      </div>
-                    )}
-
-                    {p.combinedWeekdayDigit && (
-                      <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "3px", marginLeft: "12px" }}>
-                        └ さらに絞って{p.weekdayTomorrow}曜日×{p.combinedWeekdayDigit.digit}のつく日：
-                        {p.combinedWeekdayDigit.count === 0 ? (
-                          <span>過去に該当日がまだありません</span>
-                        ) : (
-                          <span>
-                            平均 <span style={{ color: p.combinedWeekdayDigit.avg >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
-                              {p.combinedWeekdayDigit.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.combinedWeekdayDigit.avg))}枚
-                            </span>（{p.combinedWeekdayDigit.count}件中 — サンプルが少ないので参考程度に）
-                          </span>
-                        )}
-                      </div>
-                    )}
-
-                    {p.strongFollowMatch && (
-                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
-                        <Star size={10} style={{ display: "inline", marginRight: "2px", color: "#e5697a" }} fill="#e5697a" />
-                        今日は強いイベント日 → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.strongFollowMatch.winRate * 100)}%</span>
-                        （通常{Math.round(p.strongFollowMatch.normalRate * 100)}% ／ {p.strongFollowMatch.sampleSize}件中）
-                      </div>
-                    )}
-
-                    {p.plannedEventMatch && (
-                      <div style={{
-                        fontSize: "11px", marginTop: "6px", padding: "6px 8px", borderRadius: "6px",
-                        color: p.plannedEventMatch.favorable ? "#8b93a3" : "#e5697a",
-                        background: p.plannedEventMatch.favorable ? "rgba(232,179,76,0.08)" : "rgba(229,105,122,0.06)",
-                      }}>
-                        📅 明日は予定イベント「{p.plannedEventMatch.name}」 → このイベントの翌日は過去
-                        <span style={{ color: p.plannedEventMatch.favorable ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
-                          {" "}{Math.round(p.plannedEventMatch.winRate * 100)}%
-                        </span>
-                        でプラス（{p.plannedEventMatch.sampleSize}件中、平均{p.plannedEventMatch.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(p.plannedEventMatch.avgNext))}枚）
-                      </div>
-                    )}
-
-                    {p.recommendMatch && (
-                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(191,161,247,0.08)", borderRadius: "6px" }}>
-                        🏆 明日は「{p.recommendMatch.label}」期間中 → この期間の実績は勝率
-                        <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.recommendMatch.winRate * 100)}%</span>
-                        ・平均{p.recommendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.recommendMatch.avg))}枚（{p.recommendMatch.sampleSize}件中）
-                      </div>
-                    )}
-
-                    {p.settingMatch && (
-                      <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(158,206,106,0.08)", borderRadius: "6px" }}>
-                        🎯 今日は他の台と比べて回転数が多いのに大きく負けていない（設定良さそう）→ 過去このパターンの翌日は勝率
-                        <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.settingMatch.winRate * 100)}%</span>
-                        ・平均{p.settingMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.settingMatch.avg))}枚（{p.settingMatch.sampleSize}件中）
-                      </div>
-                    )}
-
-                    {p.settingCaution && (
-                      <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
-                        ⚠ 今日は他の台と比べて回転数が少ないのにプラス（早めに見切られた・低設定っぽい）→ 過去このパターンの翌日は勝率
-                        <span style={{ fontWeight: 700 }}> {Math.round(p.settingCaution.winRate * 100)}%</span>
-                        ・平均{p.settingCaution.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.settingCaution.avg))}枚（{p.settingCaution.sampleSize}件中）
-                      </div>
-                    )}
-
-                    {p.volumeMismatch && (
-                      <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
-                        <div>
-                          ⚠ 大量回転・低調：直近G数 <span className="mono">{fmtNum(p.volumeMismatch.lastGsu)}G</span>
-                          （平均{fmtNum(Math.round(p.volumeMismatch.avgGsu))}G）に対し、差枚
-                          <span className="mono"> {p.volumeMismatch.lastSada >= 0 ? "+" : ""}{fmtNum(p.volumeMismatch.lastSada)}枚</span>
-                        </div>
-                        {p.volumeMismatch.nextDayStats ? (
-                          <div style={{ marginTop: "4px" }}>
-                            過去、同じパターンの翌日：勝率 <span style={{ fontWeight: 700 }}>{Math.round(p.volumeMismatch.nextDayStats.winRate * 100)}%</span>
-                            ・平均{p.volumeMismatch.nextDayStats.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.volumeMismatch.nextDayStats.avg))}枚
-                            （{p.volumeMismatch.nextDayStats.sampleSize}件中）
-                          </div>
-                        ) : (
-                          <div style={{ marginTop: "4px", color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（翌日）</div>
-                        )}
-                        {p.volumeMismatch.twoDayStats ? (
-                          <div>
-                            2日後：勝率 <span style={{ fontWeight: 700 }}>{Math.round(p.volumeMismatch.twoDayStats.winRate * 100)}%</span>
-                            ・平均{p.volumeMismatch.twoDayStats.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.volumeMismatch.twoDayStats.avg))}枚
-                            （{p.volumeMismatch.twoDayStats.sampleSize}件中）
-                          </div>
-                        ) : (
-                          <div style={{ color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（2日後）</div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                ))}
+                {pickList.map((p) => renderPickCard(p))}
               </div>
             )}
           </div>
@@ -3332,6 +3382,59 @@ export default function SlotDataTracker() {
           .tracker-grid { grid-template-columns: 1fr !important; }
         }
       `}</style>
+
+      {/* fixed undo-history button, shown regardless of which tab/page is open */}
+      <div style={{ position: "fixed", right: "20px", bottom: "20px", zIndex: 50 }}>
+        {undoPanelOpen && (
+          <div className="card" style={{
+            width: "320px", maxHeight: "400px", overflowY: "auto", padding: "14px",
+            marginBottom: "10px", boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, color: "#c7cbd4" }}>🕐 操作履歴</div>
+              <button onClick={() => setUndoPanelOpen(false)} style={{ background: "none", border: "none", color: "#5a6272", cursor: "pointer" }}>✕</button>
+            </div>
+            {!undoHistoryLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
+            {undoHistoryLoaded && undoHistory.length === 0 && (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>取り消せる操作の履歴はまだありません。</div>
+            )}
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              {undoHistory.map((entry) => (
+                <div key={entry.id} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "8px 10px" }}>
+                  <div style={{ fontSize: "12px", color: "#e7e9ee", marginBottom: "4px" }}>{entry.label}</div>
+                  <div style={{ fontSize: "10px", color: "#5a6272", marginBottom: "6px" }}>
+                    {new Date(entry.timestamp).toLocaleString("ja-JP")}
+                  </div>
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button
+                      onClick={() => handleRestoreUndo(entry)}
+                      style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: "#9ece6a", border: "none", borderRadius: "6px", padding: "4px 10px", cursor: "pointer" }}
+                    >
+                      元に戻す
+                    </button>
+                    <button
+                      onClick={() => handleDismissUndoEntry(entry.id)}
+                      style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer" }}
+                    >
+                      閉じる
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        <button
+          onClick={() => setUndoPanelOpen((v) => !v)}
+          style={{
+            display: "flex", alignItems: "center", gap: "6px", background: "#1b212b", color: "#c7cbd4",
+            border: "1px solid #2a323f", borderRadius: "999px", padding: "10px 16px", fontSize: "12px",
+            fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 12px rgba(0,0,0,0.3)", float: "right",
+          }}
+        >
+          🕐 操作履歴{undoHistory.length > 0 ? `（${undoHistory.length}）` : ""}
+        </button>
+      </div>
     </div>
   );
 }
