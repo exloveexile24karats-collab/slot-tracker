@@ -35,6 +35,7 @@ const EVENT_NAMES_KEY = "slot-event-names-v1";
 const STRONG_EVENTS_KEY = "slot-strong-events-v1";
 const CLOSED_DAYS_KEY = "slot-closed-days-v1";
 const DATE_EVENT_MAP_KEY = "slot-date-event-map-v1";
+const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1";
 const DATALIST_ID = "slot-event-name-options";
 
 const PALETTE = [
@@ -48,7 +49,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.2";
+const APP_VERSION = "3.3";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1633,6 +1634,13 @@ export default function SlotDataTracker() {
       {/* page tabs */}
       <div style={{ display: "flex", alignItems: "flex-end", gap: "4px", marginBottom: "0", flexWrap: "wrap" }}>
         <div
+          className={"page-tab" + (viewMode === "ranking" ? " active" : "")}
+          onClick={() => setViewMode("ranking")}
+          style={{ display: "flex", alignItems: "center", gap: "6px" }}
+        >
+          <span>🏅 全体ランキング</span>
+        </div>
+        <div
           className={"page-tab" + (viewMode === "common" ? " active" : "")}
           onClick={() => setViewMode("common")}
           style={{ display: "flex", alignItems: "center", gap: "6px" }}
@@ -1684,10 +1692,10 @@ export default function SlotDataTracker() {
 
       <div style={{ borderTop: "1px solid #2a323f", marginBottom: "16px" }} />
 
-      {viewMode === "common" ? (
+      {viewMode === "ranking" ? (
         <div style={{ maxWidth: "760px" }}>
           {/* hall-wide combined ranking: every page's machines together, no 機種 boundary */}
-          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+          <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
               🏅 全機種合算ランキング（機種の隔たり無し）
             </div>
@@ -1723,7 +1731,9 @@ export default function SlotDataTracker() {
               </div>
             )}
           </div>
-
+        </div>
+      ) : viewMode === "common" ? (
+        <div style={{ maxWidth: "760px" }}>
           {unlocked ? (
             <>
           {/* recommended-model periods — one shared panel, target machine chosen via dropdown */}
