@@ -167,41 +167,65 @@ async function main() {
     pageDateSets[p.id] = new Set(hist.map((h) => h.date));
   }
 
-  // ---- find the latest report URL from the tag listing page ----
-  console.log("Finding latest report...");
-  const listHtml = await fetchHtml(TAG_LIST_URL);
-  const $list = cheerio.load(listHtml);
-  let latestUrl = null;
-  $list("table").each((_, table) => {
-    if (latestUrl) return;
-    const $table = $list(table);
-    const headerText = $table.find("tr").first().text();
-    if (!headerText.includes("日付") || !headerText.includes("総差枚")) return;
-    const firstDataRow = $table.find("tr").eq(1); // row 0 is the header
-    const href = firstDataRow.find("a").first().attr("href");
-    if (href && /^https:\/\/min-repo\.com\/\d+\/$/.test(href)) {
-      latestUrl = href;
+  // ---- collect {date, url} for every report, straight from the listing
+  //      page(s) — this is far more reliable than following "前日" links one
+  //      by one, since some days have no report at all and break that chain ----
+  console.log("Collecting report links...");
+  const reportLinks = [];
+  const nowIso = new Date().toISOString();
+  let pageNum = 1;
+  while (pageNum <= 12) {
+    const listUrl = pageNum === 1 ? TAG_LIST_URL : `${TAG_LIST_URL}page/${pageNum}/`;
+    let listHtml;
+    try {
+      listHtml = await fetchHtml(listUrl);
+    } catch (e) {
+      break; // no more pages
     }
-  });
-  if (!latestUrl) {
-    console.error("Could not find the latest report link on the tag page. Aborting.");
+    const $list = cheerio.load(listHtml);
+    let foundAnyOnThisPage = false;
+    let oldestDateOnThisPage = null;
+    $list("table").each((_, table) => {
+      const $table = $list(table);
+      const headerText = $table.find("tr").first().text();
+      if (!headerText.includes("日付") || !headerText.includes("総差枚")) return;
+      $table.find("tr").each((i, tr) => {
+        if (i === 0) return; // header row
+        const a = $list(tr).find("td").first().find("a").first();
+        const href = a.attr("href");
+        const text = a.text().trim();
+        if (!href || !/^https:\/\/min-repo\.com\/\d+\/$/.test(href)) return;
+        const date = resolveDate(text, nowIso);
+        if (!date) return;
+        reportLinks.push({ date, url: href });
+        foundAnyOnThisPage = true;
+        if (!oldestDateOnThisPage || date < oldestDateOnThisPage) oldestDateOnThisPage = date;
+      });
+    });
+    if (!foundAnyOnThisPage) break;
+    if (oldestDateOnThisPage && oldestDateOnThisPage < STOP_DATE) break; // gone far enough back
+    pageNum += 1;
+    await sleep(REQUEST_DELAY_MS);
+  }
+  if (reportLinks.length === 0) {
+    console.error("Could not find any report links on the tag page. Aborting.");
     process.exit(1);
   }
-  console.log("Latest report:", latestUrl);
+  const relevantLinks = reportLinks
+    .filter((l) => l.date >= STOP_DATE)
+    .sort((a, b) => b.date.localeCompare(a.date));
+  console.log(`Found ${relevantLinks.length} reports from ${STOP_DATE} onward.`);
 
-  let currentUrl = latestUrl;
-  const visitedUrls = new Set();
   let overallChanged = false;
   const changedPageIds = new Set();
   let stepCount = 0;
 
-  while (currentUrl && stepCount < MAX_DAYS_PER_RUN) {
-    if (visitedUrls.has(currentUrl)) {
-      console.log(`Already visited ${currentUrl} — stopping to avoid a loop.`);
+  for (const { date, url: currentUrl } of relevantLinks) {
+    stepCount += 1;
+    if (stepCount > MAX_DAYS_PER_RUN) {
+      console.log(`Hit the ${MAX_DAYS_PER_RUN}-day safety limit for this run. Stopping early.`);
       break;
     }
-    visitedUrls.add(currentUrl);
-    stepCount += 1;
     await sleep(REQUEST_DELAY_MS);
 
     let html;
@@ -209,21 +233,9 @@ async function main() {
       html = await fetchHtml(currentUrl);
     } catch (e) {
       console.error("Failed to fetch", currentUrl, e.message);
-      break;
+      continue;
     }
     const $ = cheerio.load(html);
-
-    const h1Text = $("h1").first().text().trim(); // e.g. "7/21(火) プラザ本店II"
-    const timeIso = $("time.date").attr("datetime") || new Date().toISOString();
-    const date = resolveDate(h1Text, timeIso);
-    if (!date) {
-      console.error("Could not parse date from", currentUrl, "h1:", h1Text);
-      break;
-    }
-    if (date < STOP_DATE) {
-      console.log(`Reached ${date}, before the ${STOP_DATE} cutoff. Stopping.`);
-      break;
-    }
     console.log(`Processing ${date} (${currentUrl})`);
 
     // ---- overall summary (機種別 + 末尾別) ----
@@ -270,17 +282,6 @@ async function main() {
         console.log(`  + ${p.name || p.id}: ${machines.length} machines`);
       }
     }
-
-    // ---- follow the "前日" (previous day) link to keep walking backward ----
-    let prevHref = null;
-    $(".prev_next_link a").each((_, a) => {
-      if ($(a).text().includes("前日")) prevHref = $(a).attr("href");
-    });
-    if (!prevHref) {
-      console.log("No previous-day link found. Stopping.");
-      break;
-    }
-    currentUrl = new URL(prevHref, currentUrl).toString();
   }
 
   // ---- persist whatever changed ----
