@@ -172,11 +172,14 @@ async function main() {
   const listHtml = await fetchHtml(TAG_LIST_URL);
   const $list = cheerio.load(listHtml);
   let latestUrl = null;
-  $list("a").each((_, a) => {
+  $list("table").each((_, table) => {
     if (latestUrl) return;
-    const href = $list(a).attr("href") || "";
-    const text = $list(a).text();
-    if (/^https:\/\/min-repo\.com\/\d+\/$/.test(href) && /プラザ本店II/.test(text)) {
+    const $table = $list(table);
+    const headerText = $table.find("tr").first().text();
+    if (!headerText.includes("日付") || !headerText.includes("総差枚")) return;
+    const firstDataRow = $table.find("tr").eq(1); // row 0 is the header
+    const href = firstDataRow.find("a").first().attr("href");
+    if (href && /^https:\/\/min-repo\.com\/\d+\/$/.test(href)) {
       latestUrl = href;
     }
   });
