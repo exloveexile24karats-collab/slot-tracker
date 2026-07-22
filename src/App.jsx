@@ -50,7 +50,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "3.11";
+const APP_VERSION = "3.12";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1233,7 +1233,16 @@ export default function SlotDataTracker() {
       const digit2 = findBestThresholds(digit2Pairs, 3);
       const digit7 = findBestThresholds(digit7Pairs, 3);
 
-      return { no, overall, digit2, digit7 };
+      return {
+        no,
+        overall,
+        digit2,
+        digit7,
+        validDays: series.length,
+        overallPairsCount: allPairs.length,
+        digit2PairsCount: digit2Pairs.length,
+        digit7PairsCount: digit7Pairs.length,
+      };
     });
   }, [selectedMachines, sortedHistory, analysisWindow]);
 
@@ -1799,10 +1808,12 @@ export default function SlotDataTracker() {
     });
   }, [viewDateMachines, viewWindowDates, historyByDate]);
 
-  function renderThresholdResult(result, label) {
+  function renderThresholdResult(result, label, pairsCount) {
     if (!result) {
       return (
-        <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "6px" }}>{label}：十分なデータがありません</div>
+        <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "6px" }}>
+          {label}：十分なデータがありません（有効な組み合わせ {pairsCount ?? 0}件、最低5件必要）
+        </div>
       );
     }
     const { bestAbove, bestBelow } = result;
@@ -1816,7 +1827,7 @@ export default function SlotDataTracker() {
             （{bestAbove.sampleSize}件中、平均{bestAbove.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(bestAbove.avgNext))}枚）
           </div>
         ) : (
-          <div style={{ fontSize: "11px", color: "#5a6272" }}>以上パターン：データ不足</div>
+          <div style={{ fontSize: "11px", color: "#5a6272" }}>以上パターン：データ不足（有効な組み合わせ {pairsCount ?? 0}件）</div>
         )}
         {bestBelow ? (
           <div style={{ fontSize: "12px", color: "#c7cbd4" }}>
@@ -1825,7 +1836,7 @@ export default function SlotDataTracker() {
             （{bestBelow.sampleSize}件中、平均{bestBelow.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(bestBelow.avgNext))}枚）
           </div>
         ) : (
-          <div style={{ fontSize: "11px", color: "#5a6272" }}>以下パターン：データ不足</div>
+          <div style={{ fontSize: "11px", color: "#5a6272" }}>以下パターン：データ不足（有効な組み合わせ {pairsCount ?? 0}件）</div>
         )}
       </div>
     );
@@ -3373,11 +3384,12 @@ export default function SlotDataTracker() {
                 {thresholdAnalyses.map((a) => (
                   <div key={a.no} style={{ borderTop: "1px solid #232b37", paddingTop: "10px" }}>
                     <div className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c", marginBottom: "6px" }}>
-                      {a.no}番
+                      {a.no}番　
+                      <span style={{ fontSize: "10px", color: "#5a6272", fontWeight: 400 }}>（有効データ {a.validDays}日分）</span>
                     </div>
-                    {renderThresholdResult(a.overall, "全日")}
-                    {renderThresholdResult(a.digit2, "翌日が2のつく日のみ")}
-                    {renderThresholdResult(a.digit7, "翌日が7のつく日のみ")}
+                    {renderThresholdResult(a.overall, "全日", a.overallPairsCount)}
+                    {renderThresholdResult(a.digit2, "翌日が2のつく日のみ", a.digit2PairsCount)}
+                    {renderThresholdResult(a.digit7, "翌日が7のつく日のみ", a.digit7PairsCount)}
                   </div>
                 ))}
               </div>
