@@ -50,7 +50,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "4.0";
+const APP_VERSION = "4.3";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -970,6 +970,31 @@ export default function SlotDataTracker() {
     setConfirmDeleteAllOverall(false);
   }
 
+  // export every piece of stored data as one JSON file — used for offline
+  // analysis / backtesting of the pickup scoring rules
+  function handleExportData() {
+    const exportObj = {
+      exportedAt: new Date().toISOString(),
+      pages,
+      pageHistories,
+      pageRecommends,
+      dateEventMap,
+      strongEvents,
+      closedDays,
+      overallSummaries,
+      eventNames,
+    };
+    const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `slot-tracker-export-${todayStr()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   // race-safe upsert: merges against the LATEST state (via the functional
   // setState form) instead of a value captured in a stale closure, so
   // saving several dates back-to-back can't silently drop earlier entries
@@ -1564,6 +1589,34 @@ export default function SlotDataTracker() {
     [overallSummaries]
   );
 
+  // store-wide 総差枚/平均差枚/平均G数 per date, reconstructed from the
+  // 機種別サマリー rows (avgSada × 台数, summed across every model) — this
+  // recovers the real negative totals that min-repo's own report list hides
+  const dailyStoreTotals = useMemo(() => {
+    return [...overallSortedSummaries]
+      .map((s) => {
+        let totalSamai = 0;
+        let totalGsuWeighted = 0;
+        let machineCount = 0;
+        s.modelRows.forEach((r) => {
+          if (r.total && r.avgSada !== null && r.avgSada !== undefined && r.avgGsu !== null && r.avgGsu !== undefined) {
+            totalSamai += r.avgSada * r.total;
+            totalGsuWeighted += r.avgGsu * r.total;
+            machineCount += r.total;
+          }
+        });
+        return {
+          date: s.date,
+          event: s.event,
+          machineCount,
+          totalSamai: machineCount > 0 ? Math.round(totalSamai) : null,
+          avgSamai: machineCount > 0 ? totalSamai / machineCount : null,
+          avgGsu: machineCount > 0 ? totalGsuWeighted / machineCount : null,
+        };
+      })
+      .sort((a, b) => b.date.localeCompare(a.date)); // newest first
+  }, [overallSortedSummaries]);
+
   const overallModelPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
       date: s.date,
@@ -1661,6 +1714,10 @@ export default function SlotDataTracker() {
 
   function handleSave() {
     if (!activePageId) return;
+    if (closedDateSet.has(entryDate)) {
+      setStatus({ type: "error", msg: `${entryDate} は店休日として登録されているため、データを保存できません。` });
+      return;
+    }
     const parsedMachines = parseTable(pasteText);
     if (parsedMachines.length === 0) {
       setStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
@@ -2266,6 +2323,25 @@ export default function SlotDataTracker() {
         <div style={{ maxWidth: "760px" }}>
           {unlocked ? (
             <>
+          {/* export everything for offline analysis / backtesting */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📤 データをエクスポート
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              全機種のデータ（日付・イベント名・台番号ごとの差枚/G数/出率/BB/RB/合成）、共通のイベント登録、強いイベント、店休日、おすすめ機種期間、全体データを、まとめて1つのJSONファイルとして書き出します。
+            </div>
+            <button
+              onClick={handleExportData}
+              style={{
+                width: "100%", background: "#7aa2f7", color: "#12161d", border: "none", borderRadius: "8px",
+                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+              }}
+            >
+              ダウンロード
+            </button>
+          </div>
+
           {/* recommended-model periods — one shared panel, target machine chosen via dropdown */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
@@ -2600,6 +2676,57 @@ export default function SlotDataTracker() {
         </div>
       ) : viewMode === "overall" ? (
         <div style={{ maxWidth: "760px" }}>
+          {/* store-wide daily totals, reconstructed from 機種別サマリー — shows
+              the real signed 総差枚/平均差枚, even on days min-repo itself hides
+              the negative total */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📈 店全体の推移（総差枚・平均差枚・平均G数）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
+              「機種別サマリー」の平均差枚×台数を全機種分足し合わせて算出しています。マイナスも隠さずそのまま表示します。
+            </div>
+            {dailyStoreTotals.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "320px", overflowY: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+                  <thead>
+                    <tr style={{ position: "sticky", top: 0, background: "#12161d" }}>
+                      <th style={{ textAlign: "left", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>日付</th>
+                      <th style={{ textAlign: "right", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>総差枚</th>
+                      <th style={{ textAlign: "right", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>平均差枚</th>
+                      <th style={{ textAlign: "right", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>平均G数</th>
+                      <th style={{ textAlign: "right", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>台数</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dailyStoreTotals.map((d) => (
+                      <tr key={d.date}>
+                        <td className="mono" style={{ padding: "5px 8px", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
+                          {d.date}
+                          {d.event && <span style={{ marginLeft: "6px", color: "#e8b34c", fontSize: "10px" }}>★{d.event}</span>}
+                        </td>
+                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: d.totalSamai >= 0 ? "#9ece6a" : "#e5697a", borderBottom: "1px solid #1c2129" }}>
+                          {d.totalSamai === null ? "―" : `${d.totalSamai >= 0 ? "+" : ""}${fmtNum(d.totalSamai)}`}
+                        </td>
+                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: d.avgSamai >= 0 ? "#9ece6a" : "#e5697a", borderBottom: "1px solid #1c2129" }}>
+                          {d.avgSamai === null ? "―" : `${d.avgSamai >= 0 ? "+" : ""}${fmtNum(Math.round(d.avgSamai))}`}
+                        </td>
+                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
+                          {d.avgGsu === null ? "―" : fmtNum(Math.round(d.avgGsu))}
+                        </td>
+                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: "#5a6272", borderBottom: "1px solid #1c2129" }}>
+                          {d.machineCount || "―"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
           {/* public: today's recommendations from the store-wide summaries, no lock needed */}
           <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
@@ -2849,7 +2976,7 @@ export default function SlotDataTracker() {
             )}
             {entryDateIsClosed && (
               <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
-                ⚠ この日付は店休日として登録されています。本当にデータを入力しますか？
+                ⚠ この日付は店休日として登録されているため、データは保存できません。
               </div>
             )}
             {dateGapWarning && (
@@ -2890,14 +3017,19 @@ export default function SlotDataTracker() {
 
             <button
               onClick={handleSave}
+              disabled={entryDateIsClosed}
               style={{
-                width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                width: "100%",
+                background: entryDateIsClosed ? "#3a3f4a" : "#e8b34c",
+                color: entryDateIsClosed ? "#8b93a3" : "#1b1508",
+                border: "none", borderRadius: "8px",
+                padding: "10px", fontWeight: 700, fontSize: "13px",
+                cursor: entryDateIsClosed ? "not-allowed" : "pointer",
                 display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
               }}
             >
               <Save size={15} />
-              この日のデータを保存
+              {entryDateIsClosed ? "店休日のため保存できません" : "この日のデータを保存"}
             </button>
 
             {status && (
