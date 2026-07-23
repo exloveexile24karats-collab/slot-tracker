@@ -35,6 +35,21 @@ const EVENT_NAMES_KEY = "slot-event-names-v1";
 const STRONG_EVENTS_KEY = "slot-strong-events-v1";
 const CLOSED_DAYS_KEY = "slot-closed-days-v1";
 const DATE_EVENT_MAP_KEY = "slot-date-event-map-v1";
+
+// a single date can now have MULTIPLE event tags (e.g. "2のつく日" AND "新台
+//入れ替え" on the same day) — stored as one delimited string so every
+// existing piece of code that treats dateEventMap[date] / h.event as a plain
+// string (display, propagation to page histories, etc.) keeps working as-is
+const EVENT_DELIMITER = "、";
+function splitEventNames(compositeStr) {
+  return (compositeStr || "")
+    .split(EVENT_DELIMITER)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+function joinEventNames(names) {
+  return names.filter(Boolean).join(EVENT_DELIMITER);
+}
 const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1";
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
@@ -50,7 +65,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "4.4";
+const APP_VERSION = "4.5";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -507,7 +522,7 @@ function evaluateEventNamePerformance(series, historyByDate, eventName) {
   const pairs = [];
   for (let i = 0; i < series.length - 1; i++) {
     const entry = historyByDate[series[i].date];
-    if (entry && entry.event && entry.event.trim() === eventName) {
+    if (entry && entry.event && splitEventNames(entry.event).includes(eventName)) {
       pairs.push({ nextSada: series[i + 1].sada });
     }
   }
@@ -1251,9 +1266,13 @@ export default function SlotDataTracker() {
   // strong-event name — so registering a name once flags every occurrence,
   // past or future, without re-registering each date
   const strongDatesInHistory = useMemo(() => {
-    return sortedHistory
-      .filter((h) => h.event && strongEventColorByName[h.event.trim()])
-      .map((h) => ({ date: h.date, name: h.event.trim(), color: strongEventColorByName[h.event.trim()] }));
+    const result = [];
+    sortedHistory.forEach((h) => {
+      if (!h.event) return;
+      const matched = splitEventNames(h.event).find((n) => strongEventColorByName[n]);
+      if (matched) result.push({ date: h.date, name: matched, color: strongEventColorByName[matched] });
+    });
+    return result;
   }, [sortedHistory, strongEventColorByName]);
 
   // dates flagged as "strong" / "closed" that actually fall within the visible chart
@@ -1525,17 +1544,19 @@ export default function SlotDataTracker() {
         strongFollowMatch = { ...strongFollowEval.strong, normalRate };
       }
 
-      // is tomorrow pre-registered (via イベント登録) as a specific named event?
-      // if so, look up THAT event name's own historical track record for this
-      // machine — works for any event name, not just the curated strong list
+      // is tomorrow pre-registered (via イベント登録) as one or more named
+      // events? tomorrow may have several tags at once (e.g. "2のつく日、新
+      // 台入れ替え") — check each individually and use whichever has the
+      // best historical track record for THIS machine
       const plannedEventName = dateEventMap[tomorrowDate];
+      const plannedEventNameList = splitEventNames(plannedEventName);
       let plannedEventMatch = null;
-      if (plannedEventName) {
-        const perf = evaluateEventNamePerformance(series, pageHistoryByDate, plannedEventName);
-        if (perf) {
-          plannedEventMatch = { name: plannedEventName, favorable: perf.winRate > baseRate, ...perf };
+      plannedEventNameList.forEach((name) => {
+        const perf = evaluateEventNamePerformance(series, pageHistoryByDate, name);
+        if (perf && (!plannedEventMatch || perf.winRate > plannedEventMatch.winRate)) {
+          plannedEventMatch = { name, favorable: perf.winRate > baseRate, ...perf };
         }
-      }
+      });
 
       // is tomorrow within a hall-declared "おすすめ機種" period for this page (機種)?
       let recommendMatch = null;
@@ -1999,18 +2020,36 @@ export default function SlotDataTracker() {
       setFutureEventStatus({ type: "error", msg: "日付とイベント名を入力してください。" });
       return;
     }
-    await upsertDateEvent(futureEventDate, name);
+    const existingNames = splitEventNames(dateEventMap[futureEventDate]);
+    if (existingNames.includes(name)) {
+      setFutureEventStatus({ type: "error", msg: `${futureEventDate} には既に「${name}」が登録されています。` });
+      return;
+    }
+    const combined = joinEventNames([...existingNames, name]);
+    await upsertDateEvent(futureEventDate, combined);
     rememberEventName(name);
-    setFutureEventStatus({ type: "ok", msg: `${futureEventDate} に「${name}」を登録しました（既に保存済みの全ページのデータも更新しました）。` });
+    const msg =
+      existingNames.length > 0
+        ? `${futureEventDate} に「${name}」を追加しました（登録済み：${combined}）。既に保存済みの全ページのデータも更新しました。`
+        : `${futureEventDate} に「${name}」を登録しました（既に保存済みの全ページのデータも更新しました）。`;
+    setFutureEventStatus({ type: "ok", msg });
     setFutureEventName("");
     setFutureEventDate(addDays(futureEventDate, 1));
   }
 
-  async function handleRemoveDateEvent(date) {
-    pushUndoEntry(`イベント登録 ${date} を削除`, DATE_EVENT_MAP_KEY, dateEventMap);
+  async function handleRemoveDateEvent(date, tagName) {
+    const existingNames = splitEventNames(dateEventMap[date]);
+    const remainingNames = tagName ? existingNames.filter((n) => n !== tagName) : [];
+    const remainingComposite = joinEventNames(remainingNames);
+    const label = tagName ? `イベント登録 ${date} の「${tagName}」を削除` : `イベント登録 ${date} を削除`;
+    pushUndoEntry(label, DATE_EVENT_MAP_KEY, dateEventMap);
     setDateEventMap((prev) => {
       const next = { ...prev };
-      delete next[date];
+      if (remainingComposite) {
+        next[date] = remainingComposite;
+      } else {
+        delete next[date];
+      }
       storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch(() => {});
       return next;
     });
@@ -2026,7 +2065,7 @@ export default function SlotDataTracker() {
       }
       const idx = hist.findIndex((h) => h.date === date);
       if (idx === -1 || !hist[idx].event) continue;
-      const nextHist = hist.map((h, i) => (i === idx ? { ...h, event: "" } : h));
+      const nextHist = hist.map((h, i) => (i === idx ? { ...h, event: remainingComposite } : h));
       loadedHistoryRef.current.add(p.id);
       setPageHistories((prev) => ({ ...prev, [p.id]: nextHist }));
       storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch(() => {});
@@ -2678,7 +2717,7 @@ export default function SlotDataTracker() {
               📅 イベント登録（全ページ共通）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              過去・今日・未来、どの日付でもここでイベント名を登録できます。各ページの「データ入力」にはイベント欄はもう無く、保存するときにここの登録内容を自動で読み込みます。ここで登録・削除すると、既に保存済みの全ページのデータも自動で書き換わります（再保存は不要です）。
+              過去・今日・未来、どの日付でもここでイベント名を登録できます。同じ日に複数のイベント（例：「2のつく日」＋「新台入れ替え」）を追加登録することもできます。各ページの「データ入力」にはイベント欄はもう無く、保存するときにここの登録内容を自動で読み込みます。ここで登録・削除すると、既に保存済みの全ページのデータも自動で書き換わります（再保存は不要です）。
             </div>
             <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
               <input
@@ -2717,21 +2756,32 @@ export default function SlotDataTracker() {
               </div>
             )}
 
-            <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+            <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "200px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
               {Object.entries(dateEventMap)
                 .sort((a, b) => b[0].localeCompare(a[0]))
-                .map(([d, name]) => (
+                .map(([d, composite]) => (
                   <div key={d} style={{
                     display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
-                    background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "5px 8px",
+                    background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "5px 8px", gap: "8px",
                   }}>
-                    <span>
-                      <span className="mono" style={{ color: "#7aa2f7" }}>{d}</span>
-                      <span style={{ marginLeft: "6px", color: "#c7cbd4" }}>{name}</span>
+                    <span className="mono" style={{ color: "#7aa2f7", flexShrink: 0 }}>{d}</span>
+                    <span style={{ display: "flex", flexWrap: "wrap", gap: "4px", flex: 1 }}>
+                      {splitEventNames(composite).map((tag) => (
+                        <span key={tag} style={{
+                          display: "inline-flex", alignItems: "center", gap: "4px",
+                          background: "#1b212b", borderRadius: "4px", padding: "2px 6px", color: "#c7cbd4",
+                        }}>
+                          {tag}
+                          <button
+                            onClick={() => handleRemoveDateEvent(d, tag)}
+                            style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272", padding: 0, display: "flex" }}
+                            title={`「${tag}」だけ削除`}
+                          >
+                            <Trash2 size={10} />
+                          </button>
+                        </span>
+                      ))}
                     </span>
-                    <button onClick={() => handleRemoveDateEvent(d)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
-                      <Trash2 size={12} />
-                    </button>
                   </div>
                 ))}
               {Object.keys(dateEventMap).length === 0 && (
