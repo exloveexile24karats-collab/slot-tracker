@@ -65,7 +65,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "4.5";
+const APP_VERSION = "4.6";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -312,10 +312,14 @@ function sampleWeight(sampleSize) {
 }
 
 // core building block for the new scoring system: (winRate - baseline) in
-// percentage points, scaled down when the sample size is small
+// percentage points, scaled down when the sample size is small. the diff
+// itself is capped — an in-sample threshold search can occasionally turn up
+// an extreme (90%+) win rate purely from overfitting a small history, and
+// without a cap that one signal would swamp everything else in the total
 function computePoints(winRate, baseline, sampleSize) {
   if (winRate === null || winRate === undefined || baseline === null || baseline === undefined) return 0;
-  return (winRate - baseline) * 100 * sampleWeight(sampleSize);
+  const diff = Math.max(-0.15, Math.min(0.15, winRate - baseline));
+  return diff * 100 * sampleWeight(sampleSize);
 }
 
 // expected-value component: how much better/worse is the AVERAGE payout
@@ -328,7 +332,7 @@ function computeEvPoints(signalAvg, baselineAvg, typicalMagnitude, sampleSize) {
   const diff = signalAvg - (baselineAvg || 0);
   const normalized = diff / typicalMagnitude;
   const capped = Math.max(-1, Math.min(1, normalized));
-  return capped * 15 * sampleWeight(sampleSize);
+  return capped * 8 * sampleWeight(sampleSize);
 }
 
 // per-signal weight multipliers, calibrated from a walk-forward backtest on
@@ -519,16 +523,31 @@ function evaluateInterEventTrend(seriesFullWithEvent, isTomorrowEvent) {
 // how has this machine historically done the day AFTER any occurrence of a
 // specific named event (not limited to the curated "strong" list)?
 function evaluateEventNamePerformance(series, historyByDate, eventName) {
-  const pairs = [];
+  const matchPairs = [];
+  const otherPairs = [];
   for (let i = 0; i < series.length - 1; i++) {
     const entry = historyByDate[series[i].date];
-    if (entry && entry.event && splitEventNames(entry.event).includes(eventName)) {
-      pairs.push({ nextSada: series[i + 1].sada });
-    }
+    const isMatch = entry && entry.event && splitEventNames(entry.event).includes(eventName);
+    (isMatch ? matchPairs : otherPairs).push({ nextSada: series[i + 1].sada });
   }
-  if (pairs.length < 3) return null;
-  const wins = pairs.filter((p) => p.nextSada > 0).length;
-  return { sampleSize: pairs.length, winRate: wins / pairs.length, avgNext: pairs.reduce((a, p) => a + p.nextSada, 0) / pairs.length };
+  if (matchPairs.length < 3) return null;
+  function summarize(arr) {
+    if (arr.length < 3) return null;
+    const wins = arr.filter((p) => p.nextSada > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avgNext: arr.reduce((a, p) => a + p.nextSada, 0) / arr.length };
+  }
+  const matched = summarize(matchPairs);
+  const other = summarize(otherPairs);
+  return {
+    sampleSize: matched.sampleSize,
+    winRate: matched.winRate,
+    avgNext: matched.avgNext,
+    // the win rate on days that AREN'T this event — the correct baseline
+    // for judging this event's real edge, since frequent events (every ~10
+    // days) are otherwise already baked into the machine's overall base rate
+    normalRate: other ? other.winRate : null,
+    normalAvg: other ? other.avgNext : null,
+  };
 }
 
 // every calendar date from start to end, inclusive (used for recommend periods)
@@ -1522,16 +1541,25 @@ export default function SlotDataTracker() {
       // generalized "日付末尾" signal for ANY digit 0-9 (not just a hand-picked
       // 2/7 combo) — backtesting on real data showed "2のつく日" is a strong
       // positive and "0のつく日" a strong negative, so this is scored like any
-      // other signal rather than assumed
-      const digitDates = series.filter((pt) => parseInt(pt.date.slice(-2), 10) % 10 === tomorrowDigit);
+      // other signal rather than assumed. compared against the OTHER 9
+      // digits' combined rate, not the plain base rate, for the same reason
+      // planned events are (digit-days are frequent enough to already be
+      // baked into the plain base rate otherwise)
+      const digitDates = [];
+      const otherDigitDates = [];
+      series.forEach((pt) => {
+        (parseInt(pt.date.slice(-2), 10) % 10 === tomorrowDigit ? digitDates : otherDigitDates).push(pt);
+      });
       let digitDayMatch = null;
       if (digitDates.length >= 5) {
         const wins = digitDates.filter((pt) => pt.sada > 0).length;
+        const otherWins = otherDigitDates.filter((pt) => pt.sada > 0).length;
         digitDayMatch = {
           digit: tomorrowDigit,
           winRate: wins / digitDates.length,
           avg: digitDates.reduce((a, p) => a + p.sada, 0) / digitDates.length,
           sampleSize: digitDates.length,
+          normalRate: otherDigitDates.length >= 5 ? otherWins / otherDigitDates.length : baseRate,
         };
       }
 
@@ -1547,14 +1575,17 @@ export default function SlotDataTracker() {
       // is tomorrow pre-registered (via イベント登録) as one or more named
       // events? tomorrow may have several tags at once (e.g. "2のつく日、新
       // 台入れ替え") — check each individually and use whichever has the
-      // best historical track record for THIS machine
+      // best historical track record for THIS machine, compared against
+      // this machine's OWN non-event-day rate (not the plain base rate,
+      // which already has these frequent events mixed into it)
       const plannedEventName = dateEventMap[tomorrowDate];
       const plannedEventNameList = splitEventNames(plannedEventName);
       let plannedEventMatch = null;
       plannedEventNameList.forEach((name) => {
         const perf = evaluateEventNamePerformance(series, pageHistoryByDate, name);
         if (perf && (!plannedEventMatch || perf.winRate > plannedEventMatch.winRate)) {
-          plannedEventMatch = { name, favorable: perf.winRate > baseRate, ...perf };
+          const normalRate = perf.normalRate !== null ? perf.normalRate : baseRate;
+          plannedEventMatch = { name, favorable: perf.winRate > normalRate, normalRate, ...perf };
         }
       });
 
@@ -1620,7 +1651,7 @@ export default function SlotDataTracker() {
       // showed they're only genuinely reliable when tomorrow is ALSO an
       // event day; on a normal day they were closer to a coin flip (or
       // worse), so they're heavily discounted unless tomorrow is an event
-      const windowEventMultiplier = isTomorrowEvent ? 1.3 : 0.35;
+      const windowEventMultiplier = isTomorrowEvent ? 0.6 : 0.15;
       matchedWindows.forEach((w) => {
         const bestReason = w.result.reasons.reduce((a, r) => (!a || r.winRate > a.winRate ? r : a), null);
         const winPts = computePoints(bestReason.winRate, baseRate, bestReason.sampleSize);
@@ -1638,7 +1669,7 @@ export default function SlotDataTracker() {
         scoreItems.push({ label: "曜日傾向", points: (winPts + evPts) * SIGNAL_WEIGHTS.weekday });
       }
       if (digitDayMatch) {
-        const winPts = computePoints(digitDayMatch.winRate, baseRate, digitDayMatch.sampleSize);
+        const winPts = computePoints(digitDayMatch.winRate, digitDayMatch.normalRate, digitDayMatch.sampleSize);
         const evPts = computeEvPoints(digitDayMatch.avg, machineAvgSada, machineTypicalMagnitude, digitDayMatch.sampleSize);
         scoreItems.push({ label: `日付末尾=${digitDayMatch.digit}`, points: (winPts + evPts) * SIGNAL_WEIGHTS.digitDay });
       }
@@ -1648,8 +1679,8 @@ export default function SlotDataTracker() {
         scoreItems.push({ label: "強いイベント翌日", points: (winPts + evPts) * SIGNAL_WEIGHTS.strongFollow });
       }
       if (plannedEventMatch) {
-        const winPts = computePoints(plannedEventMatch.winRate, baseRate, plannedEventMatch.sampleSize);
-        const evPts = computeEvPoints(plannedEventMatch.avgNext, machineAvgSada, machineTypicalMagnitude, plannedEventMatch.sampleSize);
+        const winPts = computePoints(plannedEventMatch.winRate, plannedEventMatch.normalRate, plannedEventMatch.sampleSize);
+        const evPts = computeEvPoints(plannedEventMatch.avgNext, plannedEventMatch.normalAvg ?? machineAvgSada, machineTypicalMagnitude, plannedEventMatch.sampleSize);
         scoreItems.push({ label: "イベント登録連動", points: (winPts + evPts) * SIGNAL_WEIGHTS.plannedEvent });
       }
       if (interEventTrendMatch) {
@@ -2183,6 +2214,10 @@ export default function SlotDataTracker() {
             )}
           </span>
           <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}時点</span>
+        </div>
+
+        <div style={{ fontSize: "10px", color: "#5a6272", marginBottom: "8px", fontStyle: "italic" }}>
+          ※ スコア・グレードは複数の弱い手がかりを足し合わせた参考値です。精度が検証された予測ではないので、あくまで判断材料の一つとして見てください。
         </div>
 
         {p.matchedCount > 0 && (
