@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.1";
+const APP_VERSION = "5.2";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -3658,11 +3658,6 @@ export default function SlotDataTracker() {
           }}
         />
       </div>
-      <datalist id={MODEL_NAME_DATALIST_ID}>
-        {allKnownModelNames.map((n) => (
-          <option value={n} key={n} />
-        ))}
-      </datalist>
 
       <div
         style={{
@@ -4362,6 +4357,14 @@ export default function SlotDataTracker() {
           .tracker-grid { grid-template-columns: 1fr !important; }
         }
       `}</style>
+
+      {/* always in the DOM regardless of active tab, since inputs on multiple
+          tabs (共通設定, 機種ページ) reference this same datalist by id */}
+      <datalist id={MODEL_NAME_DATALIST_ID}>
+        {allKnownModelNames.map((n) => (
+          <option value={n} key={n} />
+        ))}
+      </datalist>
 
       {/* fixed undo-history button, shown regardless of which tab/page is open */}
       <div style={{ position: "fixed", right: "20px", bottom: "20px", zIndex: 50 }}>
