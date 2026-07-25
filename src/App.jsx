@@ -52,8 +52,10 @@ function joinEventNames(names) {
   return names.filter(Boolean).join(EVENT_DELIMITER);
 }
 const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1";
+const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,startDate,endDate,label}]}
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
+const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
 
 const PALETTE = [
   "#e8b34c", "#4fd1c5", "#e5697a", "#7aa2f7", "#9ece6a",
@@ -61,12 +63,14 @@ const PALETTE = [
 ];
 
 const STRONG_COLORS = ["#e5484d", "#f2a541", "#4fd1c5", "#7aa2f7", "#bb9af7", "#9ece6a"];
+const SEMI_EVENT_COLOR = "#9ece6a"; // 準イベント is always green — no per-event color choice
+const EVENT_STAR_COLOR = "#f2d24b"; // ordinary (non-strong/semi) registered events — yellow star
 const DIGIT2_COLOR = "#7dcfff";
 const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "4.7";
+const APP_VERSION = "5.0";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -528,21 +532,21 @@ function evaluateInterEventTrend(seriesFullWithEvent, isTomorrowEvent, eventDate
 // how has this machine historically done the day AFTER any occurrence of a
 // specific named event (not limited to the curated "strong" list)?
 function evaluateEventNamePerformance(series, historyByDate, eventName) {
-  const matchPairs = [];
-  const otherPairs = [];
-  for (let i = 0; i < series.length - 1; i++) {
-    const entry = historyByDate[series[i].date];
+  const matchVals = [];
+  const otherVals = [];
+  series.forEach((s) => {
+    const entry = historyByDate[s.date];
     const isMatch = entry && entry.event && splitEventNames(entry.event).includes(eventName);
-    (isMatch ? matchPairs : otherPairs).push({ nextSada: series[i + 1].sada });
-  }
-  if (matchPairs.length < 3) return null;
+    (isMatch ? matchVals : otherVals).push(s.sada);
+  });
+  if (matchVals.length < 3) return null;
   function summarize(arr) {
     if (arr.length < 3) return null;
-    const wins = arr.filter((p) => p.nextSada > 0).length;
-    return { sampleSize: arr.length, winRate: wins / arr.length, avgNext: arr.reduce((a, p) => a + p.nextSada, 0) / arr.length };
+    const wins = arr.filter((v) => v > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avgNext: arr.reduce((a, v) => a + v, 0) / arr.length };
   }
-  const matched = summarize(matchPairs);
-  const other = summarize(otherPairs);
+  const matched = summarize(matchVals);
+  const other = summarize(otherVals);
   return {
     sampleSize: matched.sampleSize,
     winRate: matched.winRate,
@@ -707,6 +711,17 @@ export default function SlotDataTracker() {
   const [recommendLabel, setRecommendLabel] = useState("");
   const [recommendStatus, setRecommendStatus] = useState(null);
 
+  // ---- おすすめ機種期間, keyed by MODEL NAME instead of page — for models
+  // in 全体データ (機種別サマリー) that aren't necessarily one of the
+  // tracked pages. a tracked page whose 正式名称 matches a name here will
+  // also see these periods in its own daily pickup. ----
+  const [overallRecommends, setOverallRecommends] = useState({});
+  const [overallRecommendModelName, setOverallRecommendModelName] = useState("");
+  const [overallRecommendStart, setOverallRecommendStart] = useState(todayStr());
+  const [overallRecommendEnd, setOverallRecommendEnd] = useState(todayStr());
+  const [overallRecommendLabel, setOverallRecommendLabel] = useState("");
+  const [overallRecommendStatus, setOverallRecommendStatus] = useState(null);
+
   // ---- global event registries ----
   const [eventNames, setEventNames] = useState([]);
   const [strongEvents, setStrongEvents] = useState([]); // [{name,color}] - matched by event NAME, not a specific date
@@ -717,7 +732,6 @@ export default function SlotDataTracker() {
   // ---- 準イベント (semi events): a third, weaker tier — 強いイベント ＞ イベント ＞ 準イベント ----
   const [semiEvents, setSemiEvents] = useState([]); // [{name,color}]
   const [semiName, setSemiName] = useState("");
-  const [semiColor, setSemiColor] = useState(STRONG_COLORS[0]);
   const [semiStatus, setSemiStatus] = useState(null);
 
   // ---- closed days (global, shared across all pages) ----
@@ -831,6 +845,15 @@ export default function SlotDataTracker() {
         if (rSemi && rSemi.value) {
           const raw = JSON.parse(rSemi.value);
           if (Array.isArray(raw)) setSemiEvents(raw);
+        }
+      } catch (e) {
+        // none yet
+      }
+      try {
+        const rOverallRec = await storage.get(OVERALL_RECOMMEND_KEY, false);
+        if (rOverallRec && rOverallRec.value) {
+          const raw = JSON.parse(rOverallRec.value);
+          if (raw && typeof raw === "object") setOverallRecommends(raw);
         }
       } catch (e) {
         // none yet
@@ -967,6 +990,15 @@ export default function SlotDataTracker() {
     }
   }, []);
 
+  const persistOverallRecommends = useCallback(async (next) => {
+    setOverallRecommends(next);
+    try {
+      await storage.set(OVERALL_RECOMMEND_KEY, JSON.stringify(next), false);
+    } catch (e) {
+      // ignore
+    }
+  }, []);
+
   const persistEventNames = useCallback(async (next) => {
     setEventNames(next);
     try {
@@ -1052,6 +1084,8 @@ export default function SlotDataTracker() {
       setStrongEvents(value || []);
     } else if (storageKey === SEMI_EVENTS_KEY) {
       setSemiEvents(value || []);
+    } else if (storageKey === OVERALL_RECOMMEND_KEY) {
+      setOverallRecommends(value || {});
     } else if (storageKey === DATE_EVENT_MAP_KEY) {
       setDateEventMap(value || {});
     } else if (storageKey.startsWith("slot-history-")) {
@@ -1190,6 +1224,10 @@ export default function SlotDataTracker() {
     persistPages(pages.map((p) => (p.id === pageId ? { ...p, name } : p)));
   }
 
+  function handleSetOfficialName(pageId, officialName) {
+    persistPages(pages.map((p) => (p.id === pageId ? { ...p, officialName } : p)));
+  }
+
   function handleDeletePage(pageId) {
     const deletedPage = pages.find((p) => p.id === pageId);
     const next = pages.filter((p) => p.id !== pageId);
@@ -1205,7 +1243,12 @@ export default function SlotDataTracker() {
   const historyLoading = activePageId && pageHistories[activePageId] === undefined;
   const currentPage = pages.find((p) => p.id === activePageId);
   // this page's own recommend periods (used for this page's own predictions)
-  const activePageRecommends = pageRecommends[activePageId] || [];
+  const activePageRecommends = useMemo(() => {
+    const own = pageRecommends[activePageId] || [];
+    const officialName = currentPage && currentPage.officialName;
+    const linked = officialName ? overallRecommends[officialName] || [] : [];
+    return linked.length > 0 ? [...own, ...linked] : own;
+  }, [pageRecommends, activePageId, currentPage, overallRecommends]);
   // whichever page is selected in the 共通設定 tab's dropdown (used for that UI)
   const recommendTargetList = pageRecommends[recommendTargetPageId] || [];
 
@@ -1536,8 +1579,15 @@ export default function SlotDataTracker() {
   // active page (pickList) AND for every page at once (allPagesPickList)
   function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet) {
     const results = [];
-    const pageRecommendDateSet = new Set();
-    pageRecommendsList.forEach((r) => enumerateDateRange(r.startDate, r.endDate).forEach((d) => pageRecommendDateSet.add(d)));
+    // pageRecommendsList is usually one shared list (applies to every machine
+    // on this page) — but for the overall 機種別 list, each "no" is a
+    // different model name with its OWN periods, so it can also be passed as
+    // a Map/object keyed by "no" instead
+    function recommendsFor(no) {
+      if (Array.isArray(pageRecommendsList)) return pageRecommendsList;
+      if (pageRecommendsList instanceof Map) return pageRecommendsList.get(no) || [];
+      return pageRecommendsList[no] || [];
+    }
     const dailySettingFlags = computeDailySettingFlags(pageSortedHistory);
     // "tomorrow" must mean the same date for every machine/model/digit on this
     // page — anchored to the page's own most recent entered date, NOT each
@@ -1669,12 +1719,16 @@ export default function SlotDataTracker() {
         }
       });
 
-      // is tomorrow within a hall-declared "おすすめ機種" period for this page (機種)?
+      // is tomorrow within a hall-declared "おすすめ機種" period for this
+      // page/model (機種)? each model can have its OWN periods (see recommendsFor)
+      const thisRecommendsList = recommendsFor(no);
+      const pageRecommendDateSet = new Set();
+      thisRecommendsList.forEach((r) => enumerateDateRange(r.startDate, r.endDate).forEach((d) => pageRecommendDateSet.add(d)));
       let recommendMatch = null;
       if (pageRecommendDateSet.has(tomorrowDate)) {
         const perf = evaluateMembershipPerformance(series, pageRecommendDateSet);
         if (perf) {
-          const activePeriod = pageRecommendsList.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
+          const activePeriod = thisRecommendsList.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
           recommendMatch = { label: activePeriod ? activePeriod.label : "おすすめ期間", ...perf };
         }
       }
@@ -1904,6 +1958,14 @@ export default function SlotDataTracker() {
     [overallSummaries]
   );
 
+  // every model name that has ever appeared in a 機種別サマリー snapshot —
+  // used as autocomplete options for 正式名称 and for the model-name-based
+  // おすすめ機種期間 registration
+  const allKnownModelNames = useMemo(
+    () => Array.from(new Set(overallSummaries.flatMap((s) => s.modelRows.map((r) => r.name)))).sort(),
+    [overallSummaries]
+  );
+
   // store-wide 総差枚/平均差枚/平均G数 per date, reconstructed from the
   // 機種別サマリー rows (avgSada × 台数, summed across every model) — this
   // recovers the real negative totals that min-repo's own report list hides
@@ -1951,8 +2013,8 @@ export default function SlotDataTracker() {
         .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
         .map((h) => h.date)
     );
-    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, [], oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet));
-  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap]);
+    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, overallRecommends, oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet));
+  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap, overallRecommends]);
 
   const overallDigitPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
@@ -2143,7 +2205,7 @@ export default function SlotDataTracker() {
       setSemiStatus({ type: "error", msg: "イベント名を入力してください。" });
       return;
     }
-    const next = [...semiEvents.filter((s) => s.name !== name), { name, color: semiColor }];
+    const next = [...semiEvents.filter((s) => s.name !== name), { name, color: SEMI_EVENT_COLOR }];
     persistSemiEvents(next);
     rememberEventName(name);
     setSemiStatus({
@@ -2199,6 +2261,37 @@ export default function SlotDataTracker() {
     if (!recommendTargetPageId) return;
     pushUndoEntry("おすすめ機種期間を削除", recommendKey(recommendTargetPageId), recommendTargetList);
     persistPageRecommends(recommendTargetPageId, recommendTargetList.filter((r) => r.id !== id));
+  }
+
+  function handleAddOverallRecommend() {
+    const name = overallRecommendModelName.trim();
+    if (!name) {
+      setOverallRecommendStatus({ type: "error", msg: "機種名を入力してください。" });
+      return;
+    }
+    if (!overallRecommendStart || !overallRecommendEnd) {
+      setOverallRecommendStatus({ type: "error", msg: "開始日と終了日を入力してください。" });
+      return;
+    }
+    if (overallRecommendStart > overallRecommendEnd) {
+      setOverallRecommendStatus({ type: "error", msg: "終了日は開始日より後にしてください。" });
+      return;
+    }
+    const label = overallRecommendLabel.trim() || "おすすめ期間";
+    const existing = overallRecommends[name] || [];
+    const next = { ...overallRecommends, [name]: [...existing, { id: `orec-${Date.now()}`, startDate: overallRecommendStart, endDate: overallRecommendEnd, label }] };
+    persistOverallRecommends(next);
+    setOverallRecommendStatus({ type: "ok", msg: `「${name}」の${overallRecommendStart}〜${overallRecommendEnd}を「${label}」として登録しました。` });
+    setOverallRecommendLabel("");
+  }
+
+  function handleRemoveOverallRecommend(name, id) {
+    pushUndoEntry(`おすすめ機種期間「${name}」を削除`, OVERALL_RECOMMEND_KEY, overallRecommends);
+    const remaining = (overallRecommends[name] || []).filter((r) => r.id !== id);
+    const next = { ...overallRecommends };
+    if (remaining.length > 0) next[name] = remaining;
+    else delete next[name];
+    persistOverallRecommends(next);
   }
 
   async function handleAddFutureEvent() {
@@ -2466,7 +2559,7 @@ export default function SlotDataTracker() {
 
         {p.semiFollowMatch && (
           <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
-            <Star size={9} style={{ display: "inline", marginRight: "2px", color: "#7aa2f7" }} />
+            <Flag size={9} style={{ display: "inline", marginRight: "2px", color: SEMI_EVENT_COLOR }} />
             今日は準イベント日 → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.semiFollowMatch.winRate * 100)}%</span>
             （通常{Math.round(p.semiFollowMatch.normalRate * 100)}% ／ {p.semiFollowMatch.sampleSize}件中）
           </div>
@@ -2478,7 +2571,7 @@ export default function SlotDataTracker() {
             color: p.plannedEventMatch.favorable ? "#8b93a3" : "#e5697a",
             background: p.plannedEventMatch.favorable ? "rgba(232,179,76,0.08)" : "rgba(229,105,122,0.06)",
           }}>
-            📅 明日は予定イベント「{p.plannedEventMatch.name}」 → このイベントの翌日は過去
+            📅 明日は予定イベント「{p.plannedEventMatch.name}」 → このイベントの日は過去
             <span style={{ color: p.plannedEventMatch.favorable ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
               {" "}{Math.round(p.plannedEventMatch.winRate * 100)}%
             </span>
@@ -2851,6 +2944,107 @@ export default function SlotDataTracker() {
             </div>
           </div>
 
+          {/* recommended-model periods keyed by MODEL NAME — for 全体データ
+              (機種別サマリー) models, including ones that aren't a tracked
+              page. a tracked page whose 正式名称 matches will also see these
+              periods in its own daily pickup. */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🏆 おすすめ機種期間（機種名で登録・全体データ用）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              追跡していない機種も含めて、機種名を直接指定しておすすめ期間を登録できます。「全体データ」タブの機種別ピックアップに反映されます。ページの「正式名称」欄と同じ名前を使うと、そのページ自身の毎日のピックアップにも反映されます。
+            </div>
+            <div style={{ marginBottom: "10px" }}>
+              <label style={{ fontSize: "11px", color: "#8b93a3" }}>機種名</label>
+              <input
+                type="text"
+                list={MODEL_NAME_DATALIST_ID}
+                value={overallRecommendModelName}
+                onChange={(e) => setOverallRecommendModelName(e.target.value)}
+                placeholder="例：Lパチスロからくりサーカス2"
+                style={{
+                  width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", boxSizing: "border-box",
+                }}
+              />
+            </div>
+            <div style={{ display: "flex", gap: "8px", marginBottom: "8px", flexWrap: "wrap" }}>
+              <input
+                type="date"
+                value={overallRecommendStart}
+                onChange={(e) => setOverallRecommendStart(e.target.value)}
+                style={{
+                  flex: "1 1 120px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 6px", color: "#e7e9ee", fontSize: "12px",
+                }}
+              />
+              <span style={{ color: "#5a6272", alignSelf: "center" }}>〜</span>
+              <input
+                type="date"
+                value={overallRecommendEnd}
+                onChange={(e) => setOverallRecommendEnd(e.target.value)}
+                style={{
+                  flex: "1 1 120px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 6px", color: "#e7e9ee", fontSize: "12px",
+                }}
+              />
+            </div>
+            <input
+              type="text"
+              value={overallRecommendLabel}
+              onChange={(e) => setOverallRecommendLabel(e.target.value)}
+              placeholder="ラベル（例：7月のおすすめ、今週のイチ押し など）"
+              style={{
+                width: "100%", marginBottom: "8px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", boxSizing: "border-box",
+              }}
+            />
+            <button
+              onClick={handleAddOverallRecommend}
+              style={{
+                width: "100%", background: "#bb9af7", color: "#12161d", border: "none", borderRadius: "8px",
+                padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
+              }}
+            >
+              おすすめ期間として登録
+            </button>
+            {overallRecommendStatus && (
+              <div style={{ marginTop: "8px", fontSize: "11px", color: overallRecommendStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                {overallRecommendStatus.msg}
+              </div>
+            )}
+
+            <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "220px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+              {Object.entries(overallRecommends)
+                .sort((a, b) => a[0].localeCompare(b[0]))
+                .flatMap(([name, periods]) =>
+                  [...periods]
+                    .sort((a, b) => b.startDate.localeCompare(a.startDate))
+                    .map((r) => ({ name, ...r }))
+                )
+                .map((r) => (
+                  <div key={r.id} style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                    background: "#12161d", border: "1px solid #2a2540", borderRadius: "6px", padding: "5px 8px", gap: "8px",
+                  }}>
+                    <span style={{ minWidth: 0 }}>
+                      <span style={{ color: "#e8b34c", fontWeight: 700 }}>{r.name}</span>
+                      <br />
+                      <span className="mono" style={{ color: "#bb9af7" }}>{r.startDate}〜{r.endDate}</span>
+                      <span style={{ marginLeft: "6px", color: "#c7cbd4" }}>{r.label}</span>
+                    </span>
+                    <button onClick={() => handleRemoveOverallRecommend(r.name, r.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272", flexShrink: 0 }}>
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                ))}
+              {Object.keys(overallRecommends).length === 0 && (
+                <div style={{ fontSize: "11px", color: "#5a6272" }}>登録されたおすすめ期間はまだありません。</div>
+              )}
+            </div>
+          </div>
+
           {/* strong event management (global, shared across all pages) */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
@@ -2927,11 +3121,11 @@ export default function SlotDataTracker() {
           {/* semi event management — a third, weaker tier: 強いイベント ＞ イベント ＞ 準イベント */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
-              <Star size={12} color="#7aa2f7" />
+              <Flag size={12} color={SEMI_EVENT_COLOR} />
               準イベント（全ページ共通・強いイベントより弱い扱い）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              「理由はあるけど強いイベントというほどではない」ものを登録します。強いイベントと同じ日付には登録しないでください（強いイベントの方が優先されます）。ピックアップでは強いイベントより控えめな重みで反映されます。
+              「理由はあるけど強いイベントというほどではない」ものを登録します。強いイベントと同じ日付には登録しないでください（強いイベントの方が優先されます）。グラフでは緑の点線・旗マークで表示され、ピックアップでは強いイベントより控えめな重みで反映されます。
             </div>
 
             <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
@@ -2947,24 +3141,10 @@ export default function SlotDataTracker() {
                 }}
               />
             </div>
-            <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
-              {STRONG_COLORS.map((c) => (
-                <button
-                  key={c}
-                  onClick={() => setSemiColor(c)}
-                  title={c}
-                  style={{
-                    width: "20px", height: "20px", borderRadius: "50%", background: c, cursor: "pointer",
-                    border: semiColor === c ? "2px solid #e7e9ee" : "2px solid transparent",
-                    boxShadow: semiColor === c ? "0 0 0 2px " + c : "none",
-                  }}
-                />
-              ))}
-            </div>
             <button
               onClick={handleAddSemiEvent}
               style={{
-                width: "100%", background: semiColor, color: "#12161d", border: "none", borderRadius: "8px",
+                width: "100%", background: SEMI_EVENT_COLOR, color: "#12161d", border: "none", borderRadius: "8px",
                 padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
               }}
             >
@@ -3420,7 +3600,7 @@ export default function SlotDataTracker() {
       ) : (
         <>
       {/* machine model name (manual entry) for current page */}
-      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
+      <div style={{ marginBottom: "8px", display: "flex", alignItems: "center", gap: "8px" }}>
         <Pencil size={14} color="#5a6272" />
         <input
           type="text"
@@ -3439,6 +3619,30 @@ export default function SlotDataTracker() {
           }}
         />
       </div>
+      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
+        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（全体データと連携・任意）：</span>
+        <input
+          type="text"
+          list={MODEL_NAME_DATALIST_ID}
+          value={currentPage ? currentPage.officialName || "" : ""}
+          onChange={(e) => handleSetOfficialName(activePageId, e.target.value)}
+          placeholder="例：Lパチスロからくりサーカス2"
+          style={{
+            fontSize: "12px",
+            background: "#12161d",
+            border: "1px solid #2a323f",
+            borderRadius: "6px",
+            color: "#e7e9ee",
+            padding: "5px 8px",
+            minWidth: "280px",
+          }}
+        />
+      </div>
+      <datalist id={MODEL_NAME_DATALIST_ID}>
+        {allKnownModelNames.map((n) => (
+          <option value={n} key={n} />
+        ))}
+      </datalist>
 
       <div
         style={{
@@ -3764,12 +3968,12 @@ export default function SlotDataTracker() {
                       label={{ value: se.name, position: "top", fill: se.color || "#e5697a", fontSize: 10 }} />
                   ))}
                   {semiDatesInView.map((se) => (
-                    <ReferenceLine key={"semi-" + se.date} x={se.date} stroke={se.color || "#7aa2f7"} strokeDasharray="2 4" strokeWidth={1} strokeOpacity={0.7}
-                      label={{ value: se.name, position: "top", fill: se.color || "#7aa2f7", fontSize: 9 }} />
+                    <ReferenceLine key={"semi-" + se.date} x={se.date} stroke={SEMI_EVENT_COLOR} strokeDasharray="2 4" strokeWidth={1} strokeOpacity={0.8}
+                      label={{ value: "🚩" + se.name, position: "top", fill: SEMI_EVENT_COLOR, fontSize: 9 }} />
                   ))}
                   {eventDates.map((e) => (
-                    <ReferenceLine key={"event-" + e.date} x={e.date} stroke="#e8b34c" strokeDasharray="4 3"
-                      label={{ value: "★", position: "top", fill: "#e8b34c", fontSize: 11 }} />
+                    <ReferenceLine key={"event-" + e.date} x={e.date} stroke={EVENT_STAR_COLOR} strokeDasharray="4 3"
+                      label={{ value: "★", position: "top", fill: EVENT_STAR_COLOR, fontSize: 11 }} />
                   ))}
                   {selectedMachines.map((no, i) => (
                     <Line key={no} type="monotone" dataKey={String(no)} name={`${no}番`}
@@ -3779,7 +3983,7 @@ export default function SlotDataTracker() {
               </ResponsiveContainer>
             )}
             <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "6px" }}>
-              単位：枚　★ = 通常イベント　太い点線(色付き) = 強いイベント　細い点線(色付き) = 準イベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日
+              単位：枚　★(黄) = 通常イベント　太い点線(赤系) = 強いイベント　細い点線(緑・🚩) = 準イベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日
             </div>
           </div>
 
