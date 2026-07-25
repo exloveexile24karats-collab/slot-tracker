@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.2";
+const APP_VERSION = "5.3";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1252,6 +1252,28 @@ export default function SlotDataTracker() {
   // whichever page is selected in the 共通設定 tab's dropdown (used for that UI)
   const recommendTargetList = pageRecommends[recommendTargetPageId] || [];
 
+  // actual realized performance for each registered おすすめ機種期間 (per-page
+  // list) — pools every machine's daily result within that date range
+  const recommendPeriodStats = useMemo(() => {
+    const hist = pageHistories[recommendTargetPageId];
+    const stats = {};
+    if (!hist) return stats;
+    recommendTargetList.forEach((r) => {
+      let total = 0, wins = 0, sum = 0;
+      hist.forEach((h) => {
+        if (h.date < r.startDate || h.date > r.endDate) return;
+        h.machines.forEach((m) => {
+          if (m.sada === null || m.sada === undefined) return;
+          total += 1;
+          if (m.sada > 0) wins += 1;
+          sum += m.sada;
+        });
+      });
+      stats[r.id] = total > 0 ? { total, winRate: wins / total, avg: sum / total } : null;
+    });
+    return stats;
+  }, [pageHistories, recommendTargetPageId, recommendTargetList]);
+
   const allMachineNumbers = useMemo(() => {
     const set = new Set();
     currentHistory.forEach((h) => h.machines.forEach((m) => set.add(m.no)));
@@ -1965,6 +1987,29 @@ export default function SlotDataTracker() {
     () => Array.from(new Set(overallSummaries.flatMap((s) => s.modelRows.map((r) => r.name)))).sort(),
     [overallSummaries]
   );
+
+  // actual realized performance for each registered おすすめ機種期間 (machine
+  // name based, 全体データ用) — pools every 機種別サマリー day within range
+  // for that specific model name
+  const overallRecommendPeriodStats = useMemo(() => {
+    const stats = {};
+    Object.entries(overallRecommends).forEach(([name, periods]) => {
+      stats[name] = {};
+      periods.forEach((r) => {
+        let total = 0, wins = 0, sum = 0;
+        overallSortedSummaries.forEach((s) => {
+          if (s.date < r.startDate || s.date > r.endDate) return;
+          const row = s.modelRows.find((mr) => mr.name === name);
+          if (!row || row.avgSada === null || row.avgSada === undefined) return;
+          total += 1;
+          if (row.avgSada > 0) wins += 1;
+          sum += row.avgSada;
+        });
+        stats[name][r.id] = total > 0 ? { total, winRate: wins / total, avg: sum / total } : null;
+      });
+    });
+    return stats;
+  }, [overallRecommends, overallSortedSummaries]);
 
   // store-wide 総差枚/平均差枚/平均G数 per date, reconstructed from the
   // 機種別サマリー rows (avgSada × 台数, summed across every model) — this
@@ -2932,13 +2977,20 @@ export default function SlotDataTracker() {
               {[...recommendTargetList].sort((a, b) => b.startDate.localeCompare(a.startDate)).map((r) => (
                 <div key={r.id} style={{
                   display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
-                  background: "#12161d", border: "1px solid #2a2540", borderRadius: "6px", padding: "5px 8px",
+                  background: "#12161d", border: "1px solid #2a2540", borderRadius: "6px", padding: "5px 8px", gap: "8px",
                 }}>
-                  <span>
+                  <span style={{ minWidth: 0 }}>
                     <span className="mono" style={{ color: "#bb9af7" }}>{r.startDate}〜{r.endDate}</span>
                     <span style={{ marginLeft: "6px", color: "#c7cbd4" }}>{r.label}</span>
+                    {recommendPeriodStats[r.id] && (
+                      <div style={{ fontSize: "10px", color: "#5a6272", marginTop: "2px" }}>
+                        実績：勝率<span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(recommendPeriodStats[r.id].winRate * 100)}%</span>
+                        ・平均{recommendPeriodStats[r.id].avg >= 0 ? "+" : ""}{fmtNum(Math.round(recommendPeriodStats[r.id].avg))}枚
+                        （{recommendPeriodStats[r.id].total}件）
+                      </div>
+                    )}
                   </span>
-                  <button onClick={() => handleRemoveRecommend(r.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                  <button onClick={() => handleRemoveRecommend(r.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272", flexShrink: 0 }}>
                     <Trash2 size={12} />
                   </button>
                 </div>
@@ -3038,6 +3090,13 @@ export default function SlotDataTracker() {
                       <br />
                       <span className="mono" style={{ color: "#bb9af7" }}>{r.startDate}〜{r.endDate}</span>
                       <span style={{ marginLeft: "6px", color: "#c7cbd4" }}>{r.label}</span>
+                      {overallRecommendPeriodStats[r.name] && overallRecommendPeriodStats[r.name][r.id] && (
+                        <div style={{ fontSize: "10px", color: "#5a6272", marginTop: "2px" }}>
+                          実績：勝率<span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(overallRecommendPeriodStats[r.name][r.id].winRate * 100)}%</span>
+                          ・平均{overallRecommendPeriodStats[r.name][r.id].avg >= 0 ? "+" : ""}{fmtNum(Math.round(overallRecommendPeriodStats[r.name][r.id].avg))}枚
+                          （{overallRecommendPeriodStats[r.name][r.id].total}日）
+                        </div>
+                      )}
                     </span>
                     <button onClick={() => handleRemoveOverallRecommend(r.name, r.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272", flexShrink: 0 }}>
                       <Trash2 size={12} />
