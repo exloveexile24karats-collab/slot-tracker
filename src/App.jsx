@@ -33,6 +33,7 @@ const historyKey = (pageId) => `slot-history-${pageId}`;
 const recommendKey = (pageId) => `slot-recommend-${pageId}`;
 const EVENT_NAMES_KEY = "slot-event-names-v1";
 const STRONG_EVENTS_KEY = "slot-strong-events-v1";
+const SEMI_EVENTS_KEY = "slot-semi-events-v1";
 const CLOSED_DAYS_KEY = "slot-closed-days-v1";
 const DATE_EVENT_MAP_KEY = "slot-date-event-map-v1";
 
@@ -65,7 +66,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "4.6";
+const APP_VERSION = "4.7";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -343,6 +344,7 @@ const SIGNAL_WEIGHTS = {
   streak: 0.3, // 連続日数 — backtested near/below baseline
   weekday: 0.3, // 曜日傾向 — backtested near baseline
   strongFollow: 1,
+  semiFollow: 0.5, // 準イベント翌日 — weaker tier than 強いイベント
   plannedEvent: 1.5, // イベント登録連動 — backtested clearly above baseline
   recommend: 1,
   settingGood: 1.5, // 相対ローテーション（設定良さそう）— backtested clearly above baseline
@@ -350,6 +352,8 @@ const SIGNAL_WEIGHTS = {
   volumeMismatch: 0.3, // 大量回転・低調 — backtested ~no edge
   digitDay: 1, // any 日付末尾, generalized (not just 2/7) — backtested strong for "2", strong AGAINST for "0"
   interEventTrend: 0.7, // new: modest but consistent edge in backtest
+  strongInterEventTrend: 0.9, // 強いイベント同士の間のトレンド — strongest tier
+  semiInterEventTrend: 0.4, // 準イベント同士の間のトレンド — weakest tier
 };
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -477,11 +481,12 @@ function evaluateStrongFollow(series, strongDateSet) {
 // whether an UPCOMING event day (tomorrow) will itself be a good day? this
 // only returns a result when tomorrow is actually a registered event —
 // otherwise there's nothing to predict
-function evaluateInterEventTrend(seriesFullWithEvent, isTomorrowEvent) {
+function evaluateInterEventTrend(seriesFullWithEvent, isTomorrowEvent, eventDateSet) {
   if (!isTomorrowEvent) return null;
   const eventIdx = [];
   seriesFullWithEvent.forEach((s, i) => {
-    if (s.event && s.event.trim()) eventIdx.push(i);
+    const isEventDay = eventDateSet ? eventDateSet.has(s.date) : s.event && s.event.trim();
+    if (isEventDay) eventIdx.push(i);
   });
   if (eventIdx.length < 2) return null;
 
@@ -709,6 +714,12 @@ export default function SlotDataTracker() {
   const [strongColor, setStrongColor] = useState(STRONG_COLORS[0]);
   const [strongStatus, setStrongStatus] = useState(null);
 
+  // ---- 準イベント (semi events): a third, weaker tier — 強いイベント ＞ イベント ＞ 準イベント ----
+  const [semiEvents, setSemiEvents] = useState([]); // [{name,color}]
+  const [semiName, setSemiName] = useState("");
+  const [semiColor, setSemiColor] = useState(STRONG_COLORS[0]);
+  const [semiStatus, setSemiStatus] = useState(null);
+
   // ---- closed days (global, shared across all pages) ----
   const [closedDays, setClosedDays] = useState([]); // [{date}]
   const [closedDate, setClosedDate] = useState(todayStr());
@@ -811,6 +822,15 @@ export default function SlotDataTracker() {
             });
             setStrongEvents(Object.values(byName));
           }
+        }
+      } catch (e) {
+        // none yet
+      }
+      try {
+        const rSemi = await storage.get(SEMI_EVENTS_KEY, false);
+        if (rSemi && rSemi.value) {
+          const raw = JSON.parse(rSemi.value);
+          if (Array.isArray(raw)) setSemiEvents(raw);
         }
       } catch (e) {
         // none yet
@@ -965,6 +985,15 @@ export default function SlotDataTracker() {
     }
   }, []);
 
+  const persistSemiEvents = useCallback(async (next) => {
+    setSemiEvents(next);
+    try {
+      await storage.set(SEMI_EVENTS_KEY, JSON.stringify(next), false);
+    } catch (e) {
+      // ignore
+    }
+  }, []);
+
   const persistClosedDays = useCallback(async (next) => {
     setClosedDays(next);
     try {
@@ -1021,6 +1050,8 @@ export default function SlotDataTracker() {
       setClosedDays(value || []);
     } else if (storageKey === STRONG_EVENTS_KEY) {
       setStrongEvents(value || []);
+    } else if (storageKey === SEMI_EVENTS_KEY) {
+      setSemiEvents(value || []);
     } else if (storageKey === DATE_EVENT_MAP_KEY) {
       setDateEventMap(value || {});
     } else if (storageKey.startsWith("slot-history-")) {
@@ -1324,6 +1355,46 @@ export default function SlotDataTracker() {
     return map;
   }, [strongDatesInHistory]);
 
+  const semiEventColorByName = useMemo(() => {
+    const map = {};
+    semiEvents.forEach((s) => {
+      map[s.name] = s.color;
+    });
+    return map;
+  }, [semiEvents]);
+
+  const strongEventNameSet = useMemo(() => new Set(Object.keys(strongEventColorByName)), [strongEventColorByName]);
+  const semiEventNameSet = useMemo(() => new Set(Object.keys(semiEventColorByName)), [semiEventColorByName]);
+
+  // 準イベント: same idea as strong events but the weaker, third tier —
+  // 強いイベント ＞ イベント ＞ 準イベント. a date only counts as 準イベント
+  // if it's registered here AND not already a strong event (strong wins)
+  const semiDatesInHistory = useMemo(() => {
+    const result = [];
+    sortedHistory.forEach((h) => {
+      if (!h.event) return;
+      const names = splitEventNames(h.event);
+      if (names.some((n) => strongEventColorByName[n])) return; // already strong, don't double-count as semi
+      const matched = names.find((n) => semiEventColorByName[n]);
+      if (matched) result.push({ date: h.date, name: matched, color: semiEventColorByName[matched] });
+    });
+    return result;
+  }, [sortedHistory, semiEventColorByName, strongEventColorByName]);
+
+  const semiDatesInView = useMemo(() => {
+    const visibleDates = new Set(visibleTimelineDates);
+    return semiDatesInHistory.filter((se) => visibleDates.has(se.date));
+  }, [semiDatesInHistory, visibleTimelineDates]);
+
+  const semiDateSet = useMemo(() => new Set(semiDatesInHistory.map((s) => s.date)), [semiDatesInHistory]);
+  const semiColorByDate = useMemo(() => {
+    const map = {};
+    semiDatesInHistory.forEach((s) => {
+      map[s.date] = s.color;
+    });
+    return map;
+  }, [semiDatesInHistory]);
+
   // ordinary (non-strong) events, shown as a gold star marker
   const eventDates = useMemo(
     () =>
@@ -1463,7 +1534,7 @@ export default function SlotDataTracker() {
   // (computed across all machines this page has ever seen)
   // core per-machine signal computation, parameterized so it can run for the
   // active page (pickList) AND for every page at once (allPagesPickList)
-  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList) {
+  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet) {
     const results = [];
     const pageRecommendDateSet = new Set();
     pageRecommendsList.forEach((r) => enumerateDateRange(r.startDate, r.endDate).forEach((d) => pageRecommendDateSet.add(d)));
@@ -1565,11 +1636,20 @@ export default function SlotDataTracker() {
 
       // did today follow a registered strong-event day, and how did that
       // pattern historically do (compared to non-event-day follow-throughs)?
-      const strongFollowEval = series.length >= 6 ? evaluateStrongFollow(series, strongDateSet) : null;
+      const strongFollowEval = series.length >= 6 ? evaluateStrongFollow(series, pageStrongDateSet) : null;
       let strongFollowMatch = null;
-      if (strongFollowEval && strongFollowEval.strong && strongDateSet.has(lastDate)) {
+      if (strongFollowEval && strongFollowEval.strong && pageStrongDateSet.has(lastDate)) {
         const normalRate = strongFollowEval.normal ? strongFollowEval.normal.winRate : 0.5;
         strongFollowMatch = { ...strongFollowEval.strong, normalRate };
+      }
+
+      // 準イベント翌日 — same idea as strongFollowMatch but the weaker third
+      // tier (強いイベント ＞ イベント ＞ 準イベント)
+      const semiFollowEval = pageSemiDateSet && series.length >= 6 ? evaluateStrongFollow(series, pageSemiDateSet) : null;
+      let semiFollowMatch = null;
+      if (semiFollowEval && semiFollowEval.strong && pageSemiDateSet.has(lastDate)) {
+        const normalRate = semiFollowEval.normal ? semiFollowEval.normal.winRate : 0.5;
+        semiFollowMatch = { ...semiFollowEval.strong, normalRate };
       }
 
       // is tomorrow pre-registered (via イベント登録) as one or more named
@@ -1600,7 +1680,17 @@ export default function SlotDataTracker() {
       }
 
       // does the 差枚 trend since the last event predict tomorrow's event (if any)?
+      // computed separately per tier (強いイベント ＞ イベント ＞ 準イベント) so a
+      // weaker 準イベント's between-trend isn't diluted by unrelated regular events
+      const isTomorrowStrongTier = strongNameSet && plannedEventNameList.some((n) => strongNameSet.has(n));
+      const isTomorrowSemiTier = semiNameSet && !isTomorrowStrongTier && plannedEventNameList.some((n) => semiNameSet.has(n));
       const interEventTrendMatch = evaluateInterEventTrend(seriesFull, !!plannedEventName);
+      const strongInterEventTrendMatch = isTomorrowStrongTier
+        ? evaluateInterEventTrend(seriesFull, true, pageStrongDateSet)
+        : null;
+      const semiInterEventTrendMatch = isTomorrowSemiTier
+        ? evaluateInterEventTrend(seriesFull, true, pageSemiDateSet)
+        : null;
 
       // relative-to-peers rotation signal: was TODAY flagged "good" (heavily
       // played, not badly losing) or "low" (little played despite being
@@ -1629,13 +1719,16 @@ export default function SlotDataTracker() {
         streakMatch ||
         weekdayMatch ||
         strongFollowMatch ||
+        semiFollowMatch ||
         plannedEventMatch ||
         recommendMatch ||
         settingMatch ||
         settingCaution ||
         volumeMismatch ||
         digitDayMatch ||
-        interEventTrendMatch;
+        interEventTrendMatch ||
+        strongInterEventTrendMatch ||
+        semiInterEventTrendMatch;
       if (!hasAnySignal) return;
 
       // ---- additive/subtractive scoring: every signal (favorable OR
@@ -1678,6 +1771,11 @@ export default function SlotDataTracker() {
         const evPts = computeEvPoints(strongFollowMatch.avgNext, machineAvgSada, machineTypicalMagnitude, strongFollowMatch.sampleSize);
         scoreItems.push({ label: "強いイベント翌日", points: (winPts + evPts) * SIGNAL_WEIGHTS.strongFollow });
       }
+      if (semiFollowMatch) {
+        const winPts = computePoints(semiFollowMatch.winRate, semiFollowMatch.normalRate, semiFollowMatch.sampleSize);
+        const evPts = computeEvPoints(semiFollowMatch.avgNext, machineAvgSada, machineTypicalMagnitude, semiFollowMatch.sampleSize);
+        scoreItems.push({ label: "準イベント翌日", points: (winPts + evPts) * SIGNAL_WEIGHTS.semiFollow });
+      }
       if (plannedEventMatch) {
         const winPts = computePoints(plannedEventMatch.winRate, plannedEventMatch.normalRate, plannedEventMatch.sampleSize);
         const evPts = computeEvPoints(plannedEventMatch.avgNext, plannedEventMatch.normalAvg ?? machineAvgSada, machineTypicalMagnitude, plannedEventMatch.sampleSize);
@@ -1687,6 +1785,16 @@ export default function SlotDataTracker() {
         const winPts = computePoints(interEventTrendMatch.winRate, baseRate, interEventTrendMatch.sampleSize);
         const evPts = computeEvPoints(interEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, interEventTrendMatch.sampleSize);
         scoreItems.push({ label: `イベント間トレンド（${interEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.interEventTrend });
+      }
+      if (strongInterEventTrendMatch) {
+        const winPts = computePoints(strongInterEventTrendMatch.winRate, baseRate, strongInterEventTrendMatch.sampleSize);
+        const evPts = computeEvPoints(strongInterEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, strongInterEventTrendMatch.sampleSize);
+        scoreItems.push({ label: `強いイベント間トレンド（${strongInterEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.strongInterEventTrend });
+      }
+      if (semiInterEventTrendMatch) {
+        const winPts = computePoints(semiInterEventTrendMatch.winRate, baseRate, semiInterEventTrendMatch.sampleSize);
+        const evPts = computeEvPoints(semiInterEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, semiInterEventTrendMatch.sampleSize);
+        scoreItems.push({ label: `準イベント間トレンド（${semiInterEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.semiInterEventTrend });
       }
       if (recommendMatch) {
         const winPts = computePoints(recommendMatch.winRate, baseRate, recommendMatch.sampleSize);
@@ -1726,9 +1834,12 @@ export default function SlotDataTracker() {
         combinedWeekdayDigit,
         digitDayMatch,
         strongFollowMatch,
+        semiFollowMatch,
         plannedEventMatch,
         recommendMatch,
         interEventTrendMatch,
+        strongInterEventTrendMatch,
+        semiInterEventTrendMatch,
         settingMatch,
         settingCaution,
         volumeMismatch,
@@ -1752,8 +1863,8 @@ export default function SlotDataTracker() {
   }
 
   const pickList = useMemo(() => {
-    return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends));
-  }, [allMachineNumbers, sortedHistory, strongDateSet, historyByDate, dateEventMap, activePageRecommends]);
+    return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet));
+  }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends]);
 
   // hall-wide: every page's machines combined into ONE ranked list, no
   // page/機種 boundary — for spotting the single best "aim" machine anywhere
@@ -1770,12 +1881,20 @@ export default function SlotDataTracker() {
       });
       const machineNos = Array.from(new Set(sorted.flatMap((h) => h.machines.map((m) => m.no)))).sort((a, b) => a - b);
       const recs = pageRecommends[p.id] || [];
-      const pageResults = computeSignalsForPage(machineNos, sorted, hbd, recs);
+      const pStrongDateSet = new Set(
+        sorted.filter((h) => h.event && splitEventNames(h.event).some((n) => strongEventColorByName[n])).map((h) => h.date)
+      );
+      const pSemiDateSet = new Set(
+        sorted
+          .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
+          .map((h) => h.date)
+      );
+      const pageResults = computeSignalsForPage(machineNos, sorted, hbd, recs, pStrongDateSet, pSemiDateSet, strongEventNameSet, semiEventNameSet);
       const pageLabel = p.name && p.name.trim() ? p.name : `機種${i + 1}`;
       pageResults.forEach((r) => combined.push({ ...r, pageId: p.id, pageLabel }));
     });
     return sortPickResults(combined);
-  }, [pages, pageHistories, pageRecommends, strongDateSet, dateEventMap]);
+  }, [pages, pageHistories, pageRecommends, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap]);
 
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
   // engine (it doesn't care whether "no" is a machine number, a model name,
@@ -1824,8 +1943,16 @@ export default function SlotDataTracker() {
       hbd[h.date] = h;
     });
     const names = Array.from(new Set(sortedH.flatMap((h) => h.machines.map((m) => m.no)))).sort();
-    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, []));
-  }, [overallSortedSummaries, strongDateSet, dateEventMap]);
+    const oStrongDateSet = new Set(
+      sortedH.filter((h) => h.event && splitEventNames(h.event).some((n) => strongEventColorByName[n])).map((h) => h.date)
+    );
+    const oSemiDateSet = new Set(
+      sortedH
+        .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
+        .map((h) => h.date)
+    );
+    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, [], oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet));
+  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap]);
 
   const overallDigitPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
@@ -1838,8 +1965,16 @@ export default function SlotDataTracker() {
       hbd[h.date] = h;
     });
     const names = Array.from(new Set(sortedH.flatMap((h) => h.machines.map((m) => m.no)))).sort();
-    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, []));
-  }, [overallSortedSummaries, strongDateSet, dateEventMap]);
+    const oStrongDateSet = new Set(
+      sortedH.filter((h) => h.event && splitEventNames(h.event).some((n) => strongEventColorByName[n])).map((h) => h.date)
+    );
+    const oSemiDateSet = new Set(
+      sortedH
+        .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
+        .map((h) => h.date)
+    );
+    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, [], oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet));
+  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap]);
 
   // system-wide reference accuracy: aggregates every 10/20/30-day threshold
   // rule found across every machine on this page, weighted by sample size.
@@ -2000,6 +2135,27 @@ export default function SlotDataTracker() {
   function handleRemoveStrongEvent(name) {
     pushUndoEntry(`強いイベント「${name}」を削除`, STRONG_EVENTS_KEY, strongEvents);
     persistStrongEvents(strongEvents.filter((s) => s.name !== name));
+  }
+
+  function handleAddSemiEvent() {
+    const name = semiName.trim();
+    if (!name) {
+      setSemiStatus({ type: "error", msg: "イベント名を入力してください。" });
+      return;
+    }
+    const next = [...semiEvents.filter((s) => s.name !== name), { name, color: semiColor }];
+    persistSemiEvents(next);
+    rememberEventName(name);
+    setSemiStatus({
+      type: "ok",
+      msg: `「${name}」を準イベントとして登録しました（強いイベントより弱い扱いになります）。`,
+    });
+    setSemiName("");
+  }
+
+  function handleRemoveSemiEvent(name) {
+    pushUndoEntry(`準イベント「${name}」を削除`, SEMI_EVENTS_KEY, semiEvents);
+    persistSemiEvents(semiEvents.filter((s) => s.name !== name));
   }
 
   function handleAddClosedDay() {
@@ -2308,6 +2464,14 @@ export default function SlotDataTracker() {
           </div>
         )}
 
+        {p.semiFollowMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
+            <Star size={9} style={{ display: "inline", marginRight: "2px", color: "#7aa2f7" }} />
+            今日は準イベント日 → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.semiFollowMatch.winRate * 100)}%</span>
+            （通常{Math.round(p.semiFollowMatch.normalRate * 100)}% ／ {p.semiFollowMatch.sampleSize}件中）
+          </div>
+        )}
+
         {p.plannedEventMatch && (
           <div style={{
             fontSize: "11px", marginTop: "6px", padding: "6px 8px", borderRadius: "6px",
@@ -2322,11 +2486,27 @@ export default function SlotDataTracker() {
           </div>
         )}
 
+        {p.strongInterEventTrendMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.06)", borderRadius: "6px" }}>
+            📈 強いイベント同士の間の差枚が{p.strongInterEventTrendMatch.direction}傾向 → 明日の強いイベント当日は過去
+            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.strongInterEventTrendMatch.winRate * 100)}%</span>
+            でプラス（{p.strongInterEventTrendMatch.sampleSize}件中、平均{p.strongInterEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.strongInterEventTrendMatch.avg))}枚）
+          </div>
+        )}
+
         {p.interEventTrendMatch && (
           <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(122,162,247,0.08)", borderRadius: "6px" }}>
             📈 前回のイベントからの差枚が{p.interEventTrendMatch.direction}傾向 → 明日のイベント当日は過去
             <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.interEventTrendMatch.winRate * 100)}%</span>
             でプラス（{p.interEventTrendMatch.sampleSize}件中、平均{p.interEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.interEventTrendMatch.avg))}枚）
+          </div>
+        )}
+
+        {p.semiInterEventTrendMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(122,162,247,0.05)", borderRadius: "6px" }}>
+            📈 準イベント同士の間の差枚が{p.semiInterEventTrendMatch.direction}傾向 → 明日の準イベント当日は過去
+            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.semiInterEventTrendMatch.winRate * 100)}%</span>
+            でプラス（{p.semiInterEventTrendMatch.sampleSize}件中、平均{p.semiInterEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.semiInterEventTrendMatch.avg))}枚）
           </div>
         )}
 
@@ -2740,6 +2920,79 @@ export default function SlotDataTracker() {
               ))}
               {strongEvents.length === 0 && (
                 <div style={{ fontSize: "11px", color: "#5a6272" }}>登録された強いイベントはまだありません。</div>
+              )}
+            </div>
+          </div>
+
+          {/* semi event management — a third, weaker tier: 強いイベント ＞ イベント ＞ 準イベント */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
+              <Star size={12} color="#7aa2f7" />
+              準イベント（全ページ共通・強いイベントより弱い扱い）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              「理由はあるけど強いイベントというほどではない」ものを登録します。強いイベントと同じ日付には登録しないでください（強いイベントの方が優先されます）。ピックアップでは強いイベントより控えめな重みで反映されます。
+            </div>
+
+            <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
+              <input
+                type="text"
+                list={DATALIST_ID}
+                value={semiName}
+                onChange={(e) => setSemiName(e.target.value)}
+                placeholder="イベント名（例：末尾5の日）"
+                style={{
+                  flex: 1, background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", minWidth: 0,
+                }}
+              />
+            </div>
+            <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
+              {STRONG_COLORS.map((c) => (
+                <button
+                  key={c}
+                  onClick={() => setSemiColor(c)}
+                  title={c}
+                  style={{
+                    width: "20px", height: "20px", borderRadius: "50%", background: c, cursor: "pointer",
+                    border: semiColor === c ? "2px solid #e7e9ee" : "2px solid transparent",
+                    boxShadow: semiColor === c ? "0 0 0 2px " + c : "none",
+                  }}
+                />
+              ))}
+            </div>
+            <button
+              onClick={handleAddSemiEvent}
+              style={{
+                width: "100%", background: semiColor, color: "#12161d", border: "none", borderRadius: "8px",
+                padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
+              }}
+            >
+              準イベントとして登録
+            </button>
+            {semiStatus && (
+              <div style={{ marginTop: "8px", fontSize: "11px", color: semiStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                {semiStatus.msg}
+              </div>
+            )}
+
+            <div className="scrollbar" style={{ marginTop: "12px", maxHeight: "160px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+              {[...semiEvents].sort((a, b) => a.name.localeCompare(b.name)).map((s) => (
+                <div key={s.name} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                  background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "5px 8px",
+                }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                    <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: s.color || "#7aa2f7", display: "inline-block" }} />
+                    <span style={{ color: "#c7cbd4" }}>{s.name}</span>
+                  </span>
+                  <button onClick={() => handleRemoveSemiEvent(s.name)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+              {semiEvents.length === 0 && (
+                <div style={{ fontSize: "11px", color: "#5a6272" }}>登録された準イベントはまだありません。</div>
               )}
             </div>
           </div>
@@ -3510,6 +3763,10 @@ export default function SlotDataTracker() {
                     <ReferenceLine key={"strong-" + se.date} x={se.date} stroke={se.color || "#e5484d"} strokeDasharray="5 3" strokeWidth={2}
                       label={{ value: se.name, position: "top", fill: se.color || "#e5697a", fontSize: 10 }} />
                   ))}
+                  {semiDatesInView.map((se) => (
+                    <ReferenceLine key={"semi-" + se.date} x={se.date} stroke={se.color || "#7aa2f7"} strokeDasharray="2 4" strokeWidth={1} strokeOpacity={0.7}
+                      label={{ value: se.name, position: "top", fill: se.color || "#7aa2f7", fontSize: 9 }} />
+                  ))}
                   {eventDates.map((e) => (
                     <ReferenceLine key={"event-" + e.date} x={e.date} stroke="#e8b34c" strokeDasharray="4 3"
                       label={{ value: "★", position: "top", fill: "#e8b34c", fontSize: 11 }} />
@@ -3522,7 +3779,7 @@ export default function SlotDataTracker() {
               </ResponsiveContainer>
             )}
             <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "6px" }}>
-              単位：枚　★ = 通常イベント　点線(色付き) = 強いイベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日
+              単位：枚　★ = 通常イベント　太い点線(色付き) = 強いイベント　細い点線(色付き) = 準イベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日
             </div>
           </div>
 
