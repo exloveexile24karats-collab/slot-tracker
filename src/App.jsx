@@ -63,6 +63,7 @@ const PALETTE = [
 ];
 
 const STRONG_COLORS = ["#e5484d", "#f2a541", "#4fd1c5", "#7aa2f7", "#bb9af7", "#9ece6a"];
+const STRONG_EVENT_COLOR = "#e5484d"; // 強いイベントは常に赤（塗りつぶし★）
 const SEMI_EVENT_COLOR = "#9ece6a"; // 準イベント is always green — no per-event color choice
 const EVENT_STAR_COLOR = "#f2d24b"; // ordinary (non-strong/semi) registered events — yellow star
 const DIGIT2_COLOR = "#7dcfff";
@@ -70,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.0";
+const APP_VERSION = "5.1";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -726,7 +727,6 @@ export default function SlotDataTracker() {
   const [eventNames, setEventNames] = useState([]);
   const [strongEvents, setStrongEvents] = useState([]); // [{name,color}] - matched by event NAME, not a specific date
   const [strongName, setStrongName] = useState("");
-  const [strongColor, setStrongColor] = useState(STRONG_COLORS[0]);
   const [strongStatus, setStrongStatus] = useState(null);
 
   // ---- 準イベント (semi events): a third, weaker tier — 強いイベント ＞ イベント ＞ 準イベント ----
@@ -1443,8 +1443,8 @@ export default function SlotDataTracker() {
     () =>
       visibleTimelineDates
         .map((d) => historyByDate[d])
-        .filter((e) => e && e.event && e.event.trim().length > 0 && !strongDateSet.has(e.date)),
-    [visibleTimelineDates, historyByDate, strongDateSet]
+        .filter((e) => e && e.event && e.event.trim().length > 0 && !strongDateSet.has(e.date) && !semiDateSet.has(e.date)),
+    [visibleTimelineDates, historyByDate, strongDateSet, semiDateSet]
   );
 
   const machineSummaries = useMemo(() => {
@@ -1982,9 +1982,14 @@ export default function SlotDataTracker() {
             machineCount += r.total;
           }
         });
+        const names = splitEventNames(s.event);
+        const isStrong = names.some((n) => strongEventColorByName[n]);
+        const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
+        const eventTier = isStrong ? "strong" : isSemi ? "semi" : names.length > 0 ? "event" : null;
         return {
           date: s.date,
           event: s.event,
+          eventTier,
           machineCount,
           totalSamai: machineCount > 0 ? Math.round(totalSamai) : null,
           avgSamai: machineCount > 0 ? totalSamai / machineCount : null,
@@ -1992,7 +1997,7 @@ export default function SlotDataTracker() {
         };
       })
       .sort((a, b) => b.date.localeCompare(a.date)); // newest first
-  }, [overallSortedSummaries]);
+  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName]);
 
   const overallModelPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
@@ -2184,7 +2189,7 @@ export default function SlotDataTracker() {
       setStrongStatus({ type: "error", msg: "イベント名を入力してください。" });
       return;
     }
-    const next = [...strongEvents.filter((s) => s.name !== name), { name, color: strongColor }];
+    const next = [...strongEvents.filter((s) => s.name !== name), { name, color: STRONG_EVENT_COLOR }];
     persistStrongEvents(next);
     rememberEventName(name);
     setStrongStatus({
@@ -3048,11 +3053,11 @@ export default function SlotDataTracker() {
           {/* strong event management (global, shared across all pages) */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
-              <Star size={13} color="#e5697a" fill="#e5697a" />
+              <Star size={13} color={STRONG_EVENT_COLOR} fill={STRONG_EVENT_COLOR} />
               強いイベント（全ページ共通）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              イベント名を1度登録すれば、そのイベント名が付いた日付は過去・今後を問わず全ページのグラフに自動で表示されます（日付ごとの再登録は不要です）
+              イベント名を1度登録すれば、そのイベント名が付いた日付は過去・今後を問わず全ページのグラフに自動で表示されます（日付ごとの再登録は不要です）。グラフでは赤い塗りつぶしの★で表示されます。
             </div>
 
             <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
@@ -3068,24 +3073,10 @@ export default function SlotDataTracker() {
                 }}
               />
             </div>
-            <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
-              {STRONG_COLORS.map((c) => (
-                <button
-                  key={c}
-                  onClick={() => setStrongColor(c)}
-                  title={c}
-                  style={{
-                    width: "20px", height: "20px", borderRadius: "50%", background: c, cursor: "pointer",
-                    border: strongColor === c ? "2px solid #e7e9ee" : "2px solid transparent",
-                    boxShadow: strongColor === c ? "0 0 0 2px " + c : "none",
-                  }}
-                />
-              ))}
-            </div>
             <button
               onClick={handleAddStrongEvent}
               style={{
-                width: "100%", background: strongColor, color: "#12161d", border: "none", borderRadius: "8px",
+                width: "100%", background: STRONG_EVENT_COLOR, color: "#12161d", border: "none", borderRadius: "8px",
                 padding: "8px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
               }}
             >
@@ -3388,7 +3379,15 @@ export default function SlotDataTracker() {
                       <tr key={d.date}>
                         <td className="mono" style={{ padding: "5px 8px", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
                           {d.date}
-                          {d.event && <span style={{ marginLeft: "6px", color: "#e8b34c", fontSize: "10px" }}>★{d.event}</span>}
+                          {d.event && d.eventTier === "strong" && (
+                            <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR, fontSize: "10px" }}>★{d.event}</span>
+                          )}
+                          {d.event && d.eventTier === "semi" && (
+                            <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR, fontSize: "10px" }}>🚩{d.event}</span>
+                          )}
+                          {d.event && d.eventTier === "event" && (
+                            <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR, fontSize: "10px" }}>☆{d.event}</span>
+                          )}
                         </td>
                         <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: d.totalSamai >= 0 ? "#9ece6a" : "#e5697a", borderBottom: "1px solid #1c2129" }}>
                           {d.totalSamai === null ? "―" : `${d.totalSamai >= 0 ? "+" : ""}${fmtNum(d.totalSamai)}`}
@@ -3537,12 +3536,33 @@ export default function SlotDataTracker() {
                     }}>
                       <div>
                         <span className="mono">{s.date}</span>
-                        {s.event && (
-                          <span style={{ marginLeft: "6px", color: "#e8b34c" }}>
-                            <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
-                            {s.event}
-                          </span>
-                        )}
+                        {s.event && (() => {
+                          const names = splitEventNames(s.event);
+                          const isStrong = names.some((n) => strongEventColorByName[n]);
+                          const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
+                          if (isStrong) {
+                            return (
+                              <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR }}>
+                                <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={STRONG_EVENT_COLOR} />
+                                {s.event}
+                              </span>
+                            );
+                          }
+                          if (isSemi) {
+                            return (
+                              <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR }}>
+                                <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
+                                {s.event}
+                              </span>
+                            );
+                          }
+                          return (
+                            <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR }}>
+                              <Star size={10} style={{ display: "inline", marginRight: "2px" }} />
+                              {s.event}
+                            </span>
+                          );
+                        })()}
                         <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>
                       </div>
                       {confirmDeleteOverall === s.date ? (
@@ -3775,13 +3795,20 @@ export default function SlotDataTracker() {
                     <div>
                       <span className="mono">{h.date}</span>
                       {strongDateSet.has(h.date) && (
-                        <span style={{ marginLeft: "6px", color: strongColorByDate[h.date] || "#e5697a" }}>
-                          <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={strongColorByDate[h.date] || "#e5697a"} />
+                        <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR }}>
+                          <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={STRONG_EVENT_COLOR} />
+                          {h.event}
                         </span>
                       )}
-                      {h.event && (
-                        <span style={{ marginLeft: "6px", color: "#e8b34c" }}>
+                      {!strongDateSet.has(h.date) && semiDateSet.has(h.date) && (
+                        <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR }}>
                           <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
+                          {h.event}
+                        </span>
+                      )}
+                      {!strongDateSet.has(h.date) && !semiDateSet.has(h.date) && h.event && (
+                        <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR }}>
+                          <Star size={10} style={{ display: "inline", marginRight: "2px" }} />
                           {h.event}
                         </span>
                       )}
@@ -3964,8 +3991,8 @@ export default function SlotDataTracker() {
                       label={{ value: "7", position: "top", fill: DIGIT7_COLOR, fontSize: 9 }} />
                   ))}
                   {strongDatesInView.map((se) => (
-                    <ReferenceLine key={"strong-" + se.date} x={se.date} stroke={se.color || "#e5484d"} strokeDasharray="5 3" strokeWidth={2}
-                      label={{ value: se.name, position: "top", fill: se.color || "#e5697a", fontSize: 10 }} />
+                    <ReferenceLine key={"strong-" + se.date} x={se.date} stroke={STRONG_EVENT_COLOR} strokeDasharray="5 3" strokeWidth={2}
+                      label={{ value: "★" + se.name, position: "top", fill: STRONG_EVENT_COLOR, fontSize: 10 }} />
                   ))}
                   {semiDatesInView.map((se) => (
                     <ReferenceLine key={"semi-" + se.date} x={se.date} stroke={SEMI_EVENT_COLOR} strokeDasharray="2 4" strokeWidth={1} strokeOpacity={0.8}
@@ -3973,7 +4000,7 @@ export default function SlotDataTracker() {
                   ))}
                   {eventDates.map((e) => (
                     <ReferenceLine key={"event-" + e.date} x={e.date} stroke={EVENT_STAR_COLOR} strokeDasharray="4 3"
-                      label={{ value: "★", position: "top", fill: EVENT_STAR_COLOR, fontSize: 11 }} />
+                      label={{ value: "☆", position: "top", fill: EVENT_STAR_COLOR, fontSize: 11 }} />
                   ))}
                   {selectedMachines.map((no, i) => (
                     <Line key={no} type="monotone" dataKey={String(no)} name={`${no}番`}
@@ -3983,7 +4010,7 @@ export default function SlotDataTracker() {
               </ResponsiveContainer>
             )}
             <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "6px" }}>
-              単位：枚　★(黄) = 通常イベント　太い点線(赤系) = 強いイベント　細い点線(緑・🚩) = 準イベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日
+              単位：枚　★(赤・塗) = 強いイベント　☆(黄・抜き) = 通常イベント　🚩(緑) = 準イベント　水色点線 = 2のつく日　オレンジ点線 = 7のつく日　グレー帯 = 店休日
             </div>
           </div>
 
