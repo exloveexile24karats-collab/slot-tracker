@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.0";
+const APP_VERSION = "6.1";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4361,18 +4361,6 @@ export default function SlotDataTracker() {
             </div>
           </div>
 
-          {/* 台番号×日付マトリクス表（このページ用・イベント複数選択で絞り込み） */}
-          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              📋 台番号×日付マトリクス表
-            </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              このページの台番号ごとに、日付ごとの出率ベースの簡易マーク（▲＝出率110%以上・◯＝出率105%以上）を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
-            </div>
-            {renderEventMultiSelect(pageGridEventFilter, setPageGridEventFilter)}
-            {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => `${no}番`)}
-          </div>
-
           <button
             onClick={() => { setUnlocked(false); setPinInput(""); setPinError(false); }}
             style={{
@@ -4420,6 +4408,18 @@ export default function SlotDataTracker() {
             )}
           </div>
           )}
+
+          {/* 台番号×日付マトリクス表（このページ用・イベント複数選択で絞り込み）— ロック不要 */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📋 台番号×日付マトリクス表
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              このページの台番号ごとに、日付ごとの出率ベースの簡易マーク（▲＝出率110%以上・◯＝出率105%以上）を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
+            </div>
+            {renderEventMultiSelect(pageGridEventFilter, setPageGridEventFilter)}
+            {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => `${no}番`)}
+          </div>
         </div>
 
         {/* RIGHT: chart + summary */}
