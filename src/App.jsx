@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.4";
+const APP_VERSION = "5.5";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1224,6 +1224,16 @@ export default function SlotDataTracker() {
         setPageHistories((prev) => ({ ...prev, [p.id]: nextHist }));
         storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch(() => {});
       }
+      // also patch 全体データ（機種別サマリー・末尾別データ）— this was missing,
+      // so events registered/edited after an overall-data day was saved never
+      // showed up there even though every per-page record got fixed
+      setOverallSummaries((prevSummaries) => {
+        const idx = prevSummaries.findIndex((s) => s.date === date);
+        if (idx === -1 || prevSummaries[idx].event === name) return prevSummaries;
+        const next = prevSummaries.map((s, i) => (i === idx ? { ...s, event: name } : s));
+        storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false).catch(() => {});
+        return next;
+      });
     },
     [pages, pageHistories]
   );
@@ -2468,6 +2478,13 @@ export default function SlotDataTracker() {
       setPageHistories((prev) => ({ ...prev, [p.id]: nextHist }));
       storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch(() => {});
     }
+    setOverallSummaries((prevSummaries) => {
+      const idx = prevSummaries.findIndex((s) => s.date === date);
+      if (idx === -1 || !prevSummaries[idx].event) return prevSummaries;
+      const next = prevSummaries.map((s, i) => (i === idx ? { ...s, event: remainingComposite } : s));
+      storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false).catch(() => {});
+      return next;
+    });
   }
 
   function handleUnlock() {
