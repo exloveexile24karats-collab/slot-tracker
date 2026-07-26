@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.1";
+const APP_VERSION = "6.2";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2721,7 +2721,7 @@ export default function SlotDataTracker() {
       return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
     }
     return (
-      <div className="scrollbar" style={{ overflowX: "auto", maxHeight: "480px", overflowY: "auto" }}>
+      <div className="scrollbar" style={{ overflowX: "auto", maxHeight: "480px", overflowY: "auto", maxWidth: "100%", width: "100%" }}>
         <table style={{ borderCollapse: "collapse", fontSize: "11px" }}>
           <thead>
             <tr>
@@ -3018,7 +3018,7 @@ export default function SlotDataTracker() {
 
       <style>{`
         .mono { font-family: 'JetBrains Mono', 'Menlo', monospace; font-variant-numeric: tabular-nums; }
-        .card { background: #1b212b; border: 1px solid #2a323f; border-radius: 10px; }
+        .card { background: #1b212b; border: 1px solid #2a323f; border-radius: 10px; min-width: 0; max-width: 100%; }
         .chip { transition: all .15s ease; cursor: pointer; user-select: none; }
         .chip:hover { transform: translateY(-1px); }
         input[type="date"] { color-scheme: dark; }
@@ -4182,7 +4182,7 @@ export default function SlotDataTracker() {
         className="tracker-grid"
       >
         {/* LEFT: input panel */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: "16px", minWidth: 0 }}>
           {unlocked ? (
           <>
           <div className="card" style={{ padding: "18px" }}>
@@ -4423,7 +4423,7 @@ export default function SlotDataTracker() {
         </div>
 
         {/* RIGHT: chart + summary */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: "16px", minWidth: 0 }}>
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ display: "flex", flexWrap: "wrap", gap: "10px", justifyContent: "flex-end", alignItems: "center", marginBottom: "10px" }}>
               <div style={{ display: "flex", gap: "6px" }}>
