@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.8";
+const APP_VERSION = "5.9";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2143,12 +2143,15 @@ export default function SlotDataTracker() {
 
   // ---- 全体データ用マトリクス表: 機種名（台数順）× 日付、セルは☆◎◯▲ ----
   const overallGridDates = useMemo(() => {
+    let dates;
     if (overallGridEventFilter.length > 0) {
-      return overallSortedSummaries
+      dates = overallSortedSummaries
         .filter((s) => s.event && splitEventNames(s.event).some((n) => overallGridEventFilter.includes(n)))
         .map((s) => s.date);
+    } else {
+      dates = overallSortedSummaries.slice(-30).map((s) => s.date);
     }
-    return overallSortedSummaries.slice(-30).map((s) => s.date);
+    return [...dates].sort((a, b) => b.localeCompare(a)); // newest first (left side)
   }, [overallSortedSummaries, overallGridEventFilter]);
 
   const overallGridRows = useMemo(() => {
@@ -2174,12 +2177,15 @@ export default function SlotDataTracker() {
 
   // ---- 機種ページ用マトリクス表: 台番号 × 日付、セルは出率ベースの簡易マーク ----
   const pageGridDates = useMemo(() => {
+    let dates;
     if (pageGridEventFilter.length > 0) {
-      return sortedHistory
+      dates = sortedHistory
         .filter((h) => h.event && splitEventNames(h.event).some((n) => pageGridEventFilter.includes(n)))
         .map((h) => h.date);
+    } else {
+      dates = sortedHistory.slice(-30).map((h) => h.date);
     }
-    return sortedHistory.slice(-30).map((h) => h.date);
+    return [...dates].sort((a, b) => b.localeCompare(a)); // newest first (left side)
   }, [sortedHistory, pageGridEventFilter]);
 
   const pageGridRows = useMemo(() => {
