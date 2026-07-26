@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.5";
+const APP_VERSION = "5.6";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2391,6 +2391,23 @@ export default function SlotDataTracker() {
     persistPageRecommends(recommendTargetPageId, recommendTargetList.filter((r) => r.id !== id));
   }
 
+  function handleResyncOverallEvents() {
+    let changedCount = 0;
+    const next = overallSummaries.map((s) => {
+      const correctEvent = (dateEventMap[s.date] || "").trim();
+      if (s.event === correctEvent) return s;
+      changedCount += 1;
+      return { ...s, event: correctEvent };
+    });
+    if (changedCount === 0) {
+      setOverallStatus({ type: "ok", msg: "既にすべて最新の状態です。直す必要はありませんでした。" });
+      return;
+    }
+    pushUndoEntry("全体データのイベントを再同期", OVERALL_SUMMARY_KEY, overallSummaries);
+    persistOverallSummaries(next);
+    setOverallStatus({ type: "ok", msg: `${changedCount}件の日付のイベントを最新の登録内容に合わせて直しました。` });
+  }
+
   function handleAddOverallRecommend() {
     const name = overallRecommendModelName.trim();
     if (!name) {
@@ -3494,6 +3511,30 @@ export default function SlotDataTracker() {
         </div>
       ) : viewMode === "overall" ? (
         <div style={{ maxWidth: "760px" }}>
+          {/* one-click fix for stale event fields on already-saved 全体データ
+              days — needed because retroactive event registration only
+              patches records going forward from when it happens, not data
+              saved before that fix existed */}
+          <div className="card" style={{ padding: "14px 18px", marginBottom: "16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
+            <div style={{ fontSize: "11px", color: "#5a6272" }}>
+              過去に登録・変更したイベントが、全体データ側に反映されていないことがあります。ボタンを押すと、今のイベント登録内容に合わせて全部の日付を最新化します。
+            </div>
+            <button
+              onClick={handleResyncOverallEvents}
+              style={{
+                background: "#4fd1c5", color: "#12161d", border: "none", borderRadius: "8px",
+                padding: "8px 14px", fontWeight: 700, fontSize: "12px", cursor: "pointer", flexShrink: 0,
+              }}
+            >
+              イベントを再同期
+            </button>
+          </div>
+          {overallStatus && (
+            <div style={{ marginTop: "-10px", marginBottom: "14px", fontSize: "11px", color: overallStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+              {overallStatus.msg}
+            </div>
+          )}
+
           {/* store-wide daily totals, reconstructed from 機種別サマリー — shows
               the real signed 総差枚/平均差枚, even on days min-repo itself hides
               the negative total */}
