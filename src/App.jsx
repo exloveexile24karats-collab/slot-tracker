@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.3";
+const APP_VERSION = "5.4";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -152,6 +152,25 @@ function fmtNum(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return "―";
   return v.toLocaleString();
 }
+
+// min-repo's own rating marks for a 機種別サマリー row, applied to our own
+// data so we can show the same "notable machines" list for any date:
+// ☆ = 出率110%以上 & 勝率100%　◎ = 出率110%以上 & 勝率80%以上
+// ◯ = 出率105%以上 & 勝率80%以上　▲ = 出率110%以上
+// condition: 2台以上設置 かつ 平均G数3000以上
+function classifyMinRepoMark(row) {
+  if (!row.total || row.total < 2) return null;
+  if (row.avgGsu === null || row.avgGsu === undefined || row.avgGsu < 3000) return null;
+  if (row.shutsu === null || row.shutsu === undefined) return null;
+  const winRate = row.wins !== null && row.wins !== undefined && row.total ? row.wins / row.total : null;
+  if (winRate === null) return null;
+  if (row.shutsu >= 110 && winRate >= 1) return "☆";
+  if (row.shutsu >= 110 && winRate >= 0.8) return "◎";
+  if (row.shutsu >= 105 && winRate >= 0.8) return "◯";
+  if (row.shutsu >= 110) return "▲";
+  return null;
+}
+const MARK_PRIORITY = { "☆": 0, "◎": 1, "◯": 2, "▲": 3 };
 
 // parse a store-wide summary table: 機種名(or 末尾)\t平均差枚\t平均G数\t勝率(x/y)\t出率
 // handles "-" as null, and labels that wrap onto their own line (e.g. "ゾロ目"
@@ -722,6 +741,11 @@ export default function SlotDataTracker() {
   const [overallRecommendEnd, setOverallRecommendEnd] = useState(todayStr());
   const [overallRecommendLabel, setOverallRecommendLabel] = useState("");
   const [overallRecommendStatus, setOverallRecommendStatus] = useState(null);
+
+  // ---- 全体データ: イベントを選択して過去を見る / 機種を選択して過去一覧を見る ----
+  const [eventHistorySelection, setEventHistorySelection] = useState("");
+  const [modelHistorySelection, setModelHistorySelection] = useState("");
+  const [modelHistoryEventFilter, setModelHistoryEventFilter] = useState("");
 
   // ---- global event registries ----
   const [eventNames, setEventNames] = useState([]);
@@ -2031,6 +2055,10 @@ export default function SlotDataTracker() {
         const isStrong = names.some((n) => strongEventColorByName[n]);
         const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
         const eventTier = isStrong ? "strong" : isSemi ? "semi" : names.length > 0 ? "event" : null;
+        const marks = s.modelRows
+          .map((r) => ({ name: r.name, mark: classifyMinRepoMark(r) }))
+          .filter((m) => m.mark)
+          .sort((a, b) => MARK_PRIORITY[a.mark] - MARK_PRIORITY[b.mark]);
         return {
           date: s.date,
           event: s.event,
@@ -2039,10 +2067,50 @@ export default function SlotDataTracker() {
           totalSamai: machineCount > 0 ? Math.round(totalSamai) : null,
           avgSamai: machineCount > 0 ? totalSamai / machineCount : null,
           avgGsu: machineCount > 0 ? totalGsuWeighted / machineCount : null,
+          marks,
         };
       })
       .sort((a, b) => b.date.localeCompare(a.date)); // newest first
   }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName]);
+
+  // every distinct event name ever registered (any tier) — used as the
+  // selector options for "イベントを選択して過去を見る"
+  const allKnownEventNames = useMemo(() => {
+    const set = new Set();
+    Object.values(dateEventMap).forEach((composite) => splitEventNames(composite).forEach((n) => set.add(n)));
+    return Array.from(set).sort();
+  }, [dateEventMap]);
+
+  // past occurrences of the selected event, reusing dailyStoreTotals (which
+  // already has totals + ☆◎◯▲ marks computed per date)
+  const eventHistoryResults = useMemo(() => {
+    if (!eventHistorySelection) return [];
+    return dailyStoreTotals.filter((d) => d.event && splitEventNames(d.event).includes(eventHistorySelection));
+  }, [dailyStoreTotals, eventHistorySelection]);
+
+  // full per-date history for the selected model name, optionally filtered
+  // to only dates that also had a specific event registered
+  const modelHistoryResults = useMemo(() => {
+    if (!modelHistorySelection) return [];
+    return overallSortedSummaries
+      .map((s) => {
+        const row = s.modelRows.find((r) => r.name === modelHistorySelection);
+        if (!row) return null;
+        if (modelHistoryEventFilter && !splitEventNames(s.event).includes(modelHistoryEventFilter)) return null;
+        return {
+          date: s.date,
+          event: s.event,
+          avgSada: row.avgSada,
+          avgGsu: row.avgGsu,
+          shutsu: row.shutsu,
+          wins: row.wins,
+          total: row.total,
+          mark: classifyMinRepoMark(row),
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }, [overallSortedSummaries, modelHistorySelection, modelHistoryEventFilter]);
 
   const overallModelPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
@@ -3434,31 +3502,179 @@ export default function SlotDataTracker() {
                     </tr>
                   </thead>
                   <tbody>
-                    {dailyStoreTotals.map((d) => (
-                      <tr key={d.date}>
-                        <td className="mono" style={{ padding: "5px 8px", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
-                          {d.date}
-                          {d.event && d.eventTier === "strong" && (
-                            <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR, fontSize: "10px" }}>★{d.event}</span>
-                          )}
-                          {d.event && d.eventTier === "semi" && (
-                            <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR, fontSize: "10px" }}>🚩{d.event}</span>
-                          )}
-                          {d.event && d.eventTier === "event" && (
-                            <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR, fontSize: "10px" }}>☆{d.event}</span>
-                          )}
-                        </td>
-                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: d.totalSamai >= 0 ? "#9ece6a" : "#e5697a", borderBottom: "1px solid #1c2129" }}>
+                    {dailyStoreTotals.flatMap((d) => {
+                      const rows = [
+                        <tr key={d.date}>
+                          <td className="mono" style={{ padding: "5px 8px", color: "#c7cbd4", borderBottom: d.marks.length > 0 ? "none" : "1px solid #1c2129" }}>
+                            {d.date}
+                            {d.event && d.eventTier === "strong" && (
+                              <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR, fontSize: "10px" }}>★{d.event}</span>
+                            )}
+                            {d.event && d.eventTier === "semi" && (
+                              <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR, fontSize: "10px" }}>🚩{d.event}</span>
+                            )}
+                            {d.event && d.eventTier === "event" && (
+                              <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR, fontSize: "10px" }}>☆{d.event}</span>
+                            )}
+                          </td>
+                          <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: d.totalSamai >= 0 ? "#9ece6a" : "#e5697a", borderBottom: d.marks.length > 0 ? "none" : "1px solid #1c2129" }}>
+                            {d.totalSamai === null ? "―" : `${d.totalSamai >= 0 ? "+" : ""}${fmtNum(d.totalSamai)}`}
+                          </td>
+                          <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: d.avgSamai >= 0 ? "#9ece6a" : "#e5697a", borderBottom: d.marks.length > 0 ? "none" : "1px solid #1c2129" }}>
+                            {d.avgSamai === null ? "―" : `${d.avgSamai >= 0 ? "+" : ""}${fmtNum(Math.round(d.avgSamai))}`}
+                          </td>
+                          <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: "#c7cbd4", borderBottom: d.marks.length > 0 ? "none" : "1px solid #1c2129" }}>
+                            {d.avgGsu === null ? "―" : fmtNum(Math.round(d.avgGsu))}
+                          </td>
+                          <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: "#5a6272", borderBottom: d.marks.length > 0 ? "none" : "1px solid #1c2129" }}>
+                            {d.machineCount || "―"}
+                          </td>
+                        </tr>,
+                      ];
+                      if (d.marks.length > 0) {
+                        rows.push(
+                          <tr key={d.date + "-marks"}>
+                            <td colSpan={5} style={{ padding: "2px 8px 8px 8px", borderBottom: "1px solid #1c2129", fontSize: "11px" }}>
+                              {d.marks.map((m, i) => (
+                                <div key={i} style={{ color: m.mark === "☆" ? "#f2d24b" : m.mark === "▲" ? "#e5697a" : "#9ece6a" }}>
+                                  {m.mark}{m.name}
+                                </div>
+                              ))}
+                            </td>
+                          </tr>
+                        );
+                      }
+                      return rows;
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* イベントを選択して過去を見る */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📅 イベントを選択して過去を見る
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              登録済みのイベント名（強い/準/通常すべて）から選ぶと、そのイベントがあった過去の日付一覧と、その日の☆◎◯▲機種を表示します。
+            </div>
+            <select
+              value={eventHistorySelection}
+              onChange={(e) => setEventHistorySelection(e.target.value)}
+              style={{
+                width: "100%", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", marginBottom: "10px",
+              }}
+            >
+              <option value="">イベントを選択...</option>
+              {allKnownEventNames.map((n) => (
+                <option value={n} key={n}>{n}</option>
+              ))}
+            </select>
+            {eventHistorySelection && eventHistoryResults.length === 0 && (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>このイベントの過去データはまだありません。</div>
+            )}
+            {eventHistoryResults.length > 0 && (
+              <div className="scrollbar" style={{ maxHeight: "320px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
+                {eventHistoryResults.map((d) => (
+                  <div key={d.date} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px", padding: "8px 10px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "4px" }}>
+                      <span className="mono" style={{ color: "#c7cbd4" }}>{d.date}</span>
+                      <span className="mono">
+                        総差枚 <span style={{ color: d.totalSamai >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
                           {d.totalSamai === null ? "―" : `${d.totalSamai >= 0 ? "+" : ""}${fmtNum(d.totalSamai)}`}
+                        </span>
+                        {"　"}平均{d.avgSamai === null ? "―" : `${d.avgSamai >= 0 ? "+" : ""}${fmtNum(Math.round(d.avgSamai))}`}枚
+                        {"　"}G数{d.avgGsu === null ? "―" : fmtNum(Math.round(d.avgGsu))}
+                      </span>
+                    </div>
+                    {d.marks.length > 0 && (
+                      <div style={{ fontSize: "11px" }}>
+                        {d.marks.map((m, i) => (
+                          <div key={i} style={{ color: m.mark === "☆" ? "#f2d24b" : m.mark === "▲" ? "#e5697a" : "#9ece6a" }}>
+                            {m.mark}{m.name}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 機種を選択して過去一覧を見る */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🎰 機種を選択して過去一覧を見る
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              機種別サマリーに登場した機種名から選ぶと、日付ごとの平均差枚・G数・出率・勝率の一覧を表示します。イベントでの絞り込みも可能です。
+            </div>
+            <div style={{ display: "flex", gap: "8px", marginBottom: "10px", flexWrap: "wrap" }}>
+              <select
+                value={modelHistorySelection}
+                onChange={(e) => setModelHistorySelection(e.target.value)}
+                style={{
+                  flex: "2 1 220px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 8px", color: "#e7e9ee", fontSize: "12px",
+                }}
+              >
+                <option value="">機種を選択...</option>
+                {allKnownModelNames.map((n) => (
+                  <option value={n} key={n}>{n}</option>
+                ))}
+              </select>
+              <select
+                value={modelHistoryEventFilter}
+                onChange={(e) => setModelHistoryEventFilter(e.target.value)}
+                style={{
+                  flex: "1 1 160px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "7px 8px", color: "#e7e9ee", fontSize: "12px",
+                }}
+              >
+                <option value="">イベントで絞り込み（任意）</option>
+                {allKnownEventNames.map((n) => (
+                  <option value={n} key={n}>{n}</option>
+                ))}
+              </select>
+            </div>
+            {modelHistorySelection && modelHistoryResults.length === 0 && (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>該当するデータはまだありません。</div>
+            )}
+            {modelHistoryResults.length > 0 && (
+              <div className="scrollbar" style={{ maxHeight: "360px", overflowY: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+                  <thead>
+                    <tr style={{ position: "sticky", top: 0, background: "#12161d" }}>
+                      <th style={{ textAlign: "left", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>日付</th>
+                      <th style={{ textAlign: "right", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>平均差枚</th>
+                      <th style={{ textAlign: "right", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>G数</th>
+                      <th style={{ textAlign: "right", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>出率</th>
+                      <th style={{ textAlign: "right", padding: "6px 8px", color: "#8b93a3", borderBottom: "1px solid #2a323f" }}>勝率</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {modelHistoryResults.map((r) => (
+                      <tr key={r.date}>
+                        <td className="mono" style={{ padding: "5px 8px", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
+                          {r.mark && <span style={{ marginRight: "4px", color: r.mark === "☆" ? "#f2d24b" : r.mark === "▲" ? "#e5697a" : "#9ece6a" }}>{r.mark}</span>}
+                          {r.date}
+                          {r.event && <span style={{ marginLeft: "6px", color: "#5a6272", fontSize: "10px" }}>{r.event}</span>}
                         </td>
-                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: d.avgSamai >= 0 ? "#9ece6a" : "#e5697a", borderBottom: "1px solid #1c2129" }}>
-                          {d.avgSamai === null ? "―" : `${d.avgSamai >= 0 ? "+" : ""}${fmtNum(Math.round(d.avgSamai))}`}
+                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: r.avgSada >= 0 ? "#9ece6a" : "#e5697a", borderBottom: "1px solid #1c2129" }}>
+                          {r.avgSada === null ? "―" : `${r.avgSada >= 0 ? "+" : ""}${fmtNum(Math.round(r.avgSada))}`}
                         </td>
                         <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
-                          {d.avgGsu === null ? "―" : fmtNum(Math.round(d.avgGsu))}
+                          {r.avgGsu === null ? "―" : fmtNum(Math.round(r.avgGsu))}
                         </td>
-                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: "#5a6272", borderBottom: "1px solid #1c2129" }}>
-                          {d.machineCount || "―"}
+                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
+                          {r.shutsu === null ? "―" : `${r.shutsu}%`}
+                        </td>
+                        <td className="mono" style={{ padding: "5px 8px", textAlign: "right", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
+                          {r.wins === null || !r.total ? "―" : `${r.wins}/${r.total}`}
                         </td>
                       </tr>
                     ))}
@@ -3467,6 +3683,7 @@ export default function SlotDataTracker() {
               </div>
             )}
           </div>
+
 
           {/* public: today's recommendations from the store-wide summaries, no lock needed */}
           <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
