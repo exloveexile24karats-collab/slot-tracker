@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.9";
+const APP_VERSION = "6.0";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -326,19 +326,24 @@ function scoreToGrade(score) {
   return GRADE_BANDS.find((b) => score >= b.min).grade;
 }
 
-// point-based grading for the new additive/subtractive scoring system: each
-// signal contributes (its winRate - its own baseline) in percentage points,
-// discounted by sample-size confidence, and all signals (pro AND caution)
-// are summed together — so a total can go negative.
+// backtesting (real hall data, walk-forward) showed these specific signals
+// have a genuine, repeatable edge; everything else is kept as a smaller
+// tie-breaker rather than being dropped, since it still carries some signal
+const STRONG_SIGNAL_LABELS = new Set(["強いイベント間トレンド", "相対ローテーション（設定良さそう）", "イベント登録連動"]);
+function isStrongSignalLabel(label) {
+  const baseLabel = label.replace(/[（(].*[）)]/g, "").trim();
+  return STRONG_SIGNAL_LABELS.has(baseLabel) || baseLabel.startsWith("日付末尾");
+}
+
+// grade bands for the hybrid score: count-of-proven-signals * 100, plus a
+// capped tie-breaker from every other (weaker but non-zero) signal
 const POINT_GRADE_BANDS = [
-  { min: 35, grade: "S" },
-  { min: 20, grade: "A" },
-  { min: 10, grade: "B" },
-  { min: 3, grade: "C" },
-  { min: -3, grade: "D" },
-  { min: -10, grade: "E" },
-  { min: -20, grade: "F" },
-  { min: -Infinity, grade: "G" },
+  { min: 350, grade: "S" },
+  { min: 250, grade: "A" },
+  { min: 150, grade: "B" },
+  { min: 50, grade: "C" },
+  { min: -20, grade: "D" },
+  { min: -Infinity, grade: "E" },
 ];
 function pointsToGrade(points) {
   if (points === null || points === undefined) return null;
@@ -1197,8 +1202,10 @@ export default function SlotDataTracker() {
       pages,
       pageHistories,
       pageRecommends,
+      overallRecommends,
       dateEventMap,
       strongEvents,
+      semiEvents,
       closedDays,
       overallSummaries,
       eventNames,
@@ -1946,7 +1953,13 @@ export default function SlotDataTracker() {
         scoreItems.push({ label: "大量回転・低調", points: (winPts + evPts) * SIGNAL_WEIGHTS.volumeMismatch });
       }
 
-      const totalPoints = scoreItems.reduce((a, s) => a + s.points, 0);
+      let strongSignalCount = 0;
+      let tieBreakerPoints = 0;
+      scoreItems.forEach((s) => {
+        if (isStrongSignalLabel(s.label) && s.points > 0) strongSignalCount += 1;
+        else tieBreakerPoints += s.points;
+      });
+      const totalPoints = strongSignalCount * 100 + Math.max(-40, Math.min(40, tieBreakerPoints));
       const signalCount = scoreItems.length;
       const grade = pointsToGrade(totalPoints);
 
@@ -1974,6 +1987,8 @@ export default function SlotDataTracker() {
         volumeMismatch,
         scoreItems,
         totalPoints,
+        strongSignalCount,
+        tieBreakerPoints,
         signalCount,
         grade,
       });
@@ -2762,7 +2777,7 @@ export default function SlotDataTracker() {
                 background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a",
                 borderRadius: "4px", padding: "1px 6px",
               }}>
-                総合スコア {p.totalPoints >= 0 ? "+" : ""}{Math.round(p.totalPoints)}pt（{p.signalCount}件根拠）
+                実証済み根拠{p.strongSignalCount}個（微調整{p.tieBreakerPoints >= 0 ? "+" : ""}{Math.round(p.tieBreakerPoints)}pt・全{p.signalCount}件根拠）
               </span>
             )}
           </span>
@@ -3126,7 +3141,7 @@ export default function SlotDataTracker() {
                     </span>
                     {p.totalPoints !== null && p.totalPoints !== undefined && (
                       <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a", borderRadius: "4px", padding: "1px 6px" }}>
-                        {p.totalPoints >= 0 ? "+" : ""}{Math.round(p.totalPoints)}pt（{p.signalCount}件根拠）
+                        実証済み{p.strongSignalCount}個（全{p.signalCount}件根拠）
                       </span>
                     )}
                   </div>
