@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.7";
+const APP_VERSION = "5.8";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -177,6 +177,16 @@ function markColor(mark) {
   if (mark === "☆" || mark === "◎") return "#e5484d";
   if (mark === "◯") return "#f2d24b";
   return "#9ece6a"; // ▲
+}
+
+// per-MACHINE version of the same idea — an individual machine on a single
+// day doesn't have a "win rate across installed units" (that concept only
+// applies to a model as a whole), so this classifies by 出率 alone
+function classifyMachineMark(m) {
+  if (!m || m.shutsu === null || m.shutsu === undefined) return null;
+  if (m.shutsu >= 110) return "▲";
+  if (m.shutsu >= 105) return "◯";
+  return null;
 }
 
 // parse a store-wide summary table: 機種名(or 末尾)\t平均差枚\t平均G数\t勝率(x/y)\t出率
@@ -751,6 +761,8 @@ export default function SlotDataTracker() {
 
   // ---- 全体データ: イベントを選択して過去を見る / 機種を選択して過去一覧を見る ----
   const [eventHistorySelection, setEventHistorySelection] = useState("");
+  const [overallGridEventFilter, setOverallGridEventFilter] = useState([]);
+  const [pageGridEventFilter, setPageGridEventFilter] = useState([]);
   const [modelHistorySelection, setModelHistorySelection] = useState("");
   const [modelHistoryEventFilter, setModelHistoryEventFilter] = useState("");
 
@@ -2129,6 +2141,64 @@ export default function SlotDataTracker() {
       .sort((a, b) => b.date.localeCompare(a.date));
   }, [overallSortedSummaries, modelHistorySelection, modelHistoryEventFilter]);
 
+  // ---- 全体データ用マトリクス表: 機種名（台数順）× 日付、セルは☆◎◯▲ ----
+  const overallGridDates = useMemo(() => {
+    if (overallGridEventFilter.length > 0) {
+      return overallSortedSummaries
+        .filter((s) => s.event && splitEventNames(s.event).some((n) => overallGridEventFilter.includes(n)))
+        .map((s) => s.date);
+    }
+    return overallSortedSummaries.slice(-30).map((s) => s.date);
+  }, [overallSortedSummaries, overallGridEventFilter]);
+
+  const overallGridRows = useMemo(() => {
+    const totalByName = {};
+    overallSortedSummaries.forEach((s) => {
+      s.modelRows.forEach((r) => {
+        if (r.total) totalByName[r.name] = Math.max(totalByName[r.name] || 0, r.total);
+      });
+    });
+    return Object.keys(totalByName).sort((a, b) => (totalByName[b] || 0) - (totalByName[a] || 0));
+  }, [overallSortedSummaries]);
+
+  const overallGridMarks = useMemo(() => {
+    const map = {};
+    overallSortedSummaries.forEach((s) => {
+      s.modelRows.forEach((r) => {
+        if (!map[r.name]) map[r.name] = {};
+        map[r.name][s.date] = classifyMinRepoMark(r);
+      });
+    });
+    return map;
+  }, [overallSortedSummaries]);
+
+  // ---- 機種ページ用マトリクス表: 台番号 × 日付、セルは出率ベースの簡易マーク ----
+  const pageGridDates = useMemo(() => {
+    if (pageGridEventFilter.length > 0) {
+      return sortedHistory
+        .filter((h) => h.event && splitEventNames(h.event).some((n) => pageGridEventFilter.includes(n)))
+        .map((h) => h.date);
+    }
+    return sortedHistory.slice(-30).map((h) => h.date);
+  }, [sortedHistory, pageGridEventFilter]);
+
+  const pageGridRows = useMemo(() => {
+    const nos = new Set();
+    sortedHistory.forEach((h) => h.machines.forEach((m) => nos.add(m.no)));
+    return Array.from(nos).sort((a, b) => a - b);
+  }, [sortedHistory]);
+
+  const pageGridMarks = useMemo(() => {
+    const map = {};
+    sortedHistory.forEach((h) => {
+      h.machines.forEach((m) => {
+        if (!map[m.no]) map[m.no] = {};
+        map[m.no][h.date] = classifyMachineMark(m);
+      });
+    });
+    return map;
+  }, [sortedHistory]);
+
   const overallModelPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
       date: s.date,
@@ -2596,7 +2666,76 @@ export default function SlotDataTracker() {
   // shared card renderer for pickList / overallModelPickList / overallDigitPickList
   // so all three show the exact same signal breakdown (windows, streak, weekday,
   // strong-event follow, planned event, recommend period, relative rotation, etc.)
+  function toggleEventFilter(list, setList, name) {
+    setList(list.includes(name) ? list.filter((n) => n !== name) : [...list, name]);
+  }
+
+  function renderEventMultiSelect(selectedList, setSelectedList) {
+    return (
+      <div className="scrollbar" style={{ maxHeight: "120px", overflowY: "auto", display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "10px", padding: "8px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px" }}>
+        {allKnownEventNames.length === 0 && <span style={{ fontSize: "11px", color: "#5a6272" }}>登録済みのイベントがまだありません。</span>}
+        {allKnownEventNames.map((n) => {
+          const active = selectedList.includes(n);
+          return (
+            <button
+              key={n}
+              onClick={() => toggleEventFilter(selectedList, setSelectedList, n)}
+              style={{
+                fontSize: "11px", padding: "3px 8px", borderRadius: "999px", cursor: "pointer",
+                border: active ? "1px solid #7aa2f7" : "1px solid #2a323f",
+                background: active ? "rgba(122,162,247,0.15)" : "transparent",
+                color: active ? "#7aa2f7" : "#8b93a3",
+              }}
+            >
+              {n}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderMarkGrid(dates, rows, marksMap, rowLabelFn) {
+    if (rows.length === 0 || dates.length === 0) {
+      return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
+    }
+    return (
+      <div className="scrollbar" style={{ overflowX: "auto", maxHeight: "480px", overflowY: "auto" }}>
+        <table style={{ borderCollapse: "collapse", fontSize: "11px" }}>
+          <thead>
+            <tr>
+              <th style={{ position: "sticky", left: 0, top: 0, zIndex: 2, background: "#12161d", padding: "4px 8px", textAlign: "left", borderBottom: "1px solid #2a323f" }} />
+              {dates.map((d) => (
+                <th key={d} className="mono" style={{ position: "sticky", top: 0, background: "#12161d", padding: "4px 3px", color: "#5a6272", borderBottom: "1px solid #2a323f", fontSize: "9px", whiteSpace: "nowrap" }}>
+                  {d.slice(5)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row}>
+                <td style={{ position: "sticky", left: 0, background: "#12161d", padding: "4px 8px", color: "#c7cbd4", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap" }}>
+                  {rowLabelFn(row)}
+                </td>
+                {dates.map((d) => {
+                  const mark = marksMap[row] && marksMap[row][d];
+                  return (
+                    <td key={d} className="mono" style={{ padding: "4px 3px", textAlign: "center", color: mark ? markColor(mark) : "#2a323f", borderBottom: "1px solid #1c2129" }}>
+                      {mark || "・"}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
   function renderPickCard(p, labelOverride) {
+
     return (
       <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
@@ -3750,7 +3889,19 @@ export default function SlotDataTracker() {
           </div>
 
 
-          {/* public: today's recommendations from the store-wide summaries, no lock needed */}
+          {/* 機種×日付マトリクス表（台数順・イベント複数選択で絞り込み） */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📋 機種×日付マトリクス表
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              機種名を台数の多い順に並べ、日付ごとの☆◎◯▲を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
+            </div>
+            {renderEventMultiSelect(overallGridEventFilter, setOverallGridEventFilter)}
+            {renderMarkGrid(overallGridDates, overallGridRows, overallGridMarks, (name) => name)}
+          </div>
+
+
           <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
               🎯 本日のおすすめ機種（未追跡の機種も含む）
@@ -4187,6 +4338,18 @@ export default function SlotDataTracker() {
                 </div>
               )}
             </div>
+          </div>
+
+          {/* 台番号×日付マトリクス表（このページ用・イベント複数選択で絞り込み） */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📋 台番号×日付マトリクス表
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              このページの台番号ごとに、日付ごとの出率ベースの簡易マーク（▲＝出率110%以上・◯＝出率105%以上）を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
+            </div>
+            {renderEventMultiSelect(pageGridEventFilter, setPageGridEventFilter)}
+            {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => `${no}番`)}
           </div>
 
           <button
