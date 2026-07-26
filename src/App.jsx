@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "5.6";
+const APP_VERSION = "5.7";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -171,6 +171,13 @@ function classifyMinRepoMark(row) {
   return null;
 }
 const MARK_PRIORITY = { "☆": 0, "◎": 1, "◯": 2, "▲": 3 };
+// color priority: 赤 ＞ 黄色 ＞ 緑 — ☆/◎ need 出率110%+ (red), ◯ needs 105%+
+// (yellow), ▲ is the loosest condition (no win-rate requirement, green)
+function markColor(mark) {
+  if (mark === "☆" || mark === "◎") return "#e5484d";
+  if (mark === "◯") return "#f2d24b";
+  return "#9ece6a"; // ▲
+}
 
 // parse a store-wide summary table: 機種名(or 末尾)\t平均差枚\t平均G数\t勝率(x/y)\t出率
 // handles "-" as null, and labels that wrap onto their own line (e.g. "ゾロ目"
@@ -3594,7 +3601,7 @@ export default function SlotDataTracker() {
                           <tr key={d.date + "-marks"}>
                             <td colSpan={5} style={{ padding: "2px 8px 8px 8px", borderBottom: "1px solid #1c2129", fontSize: "11px" }}>
                               {d.marks.map((m, i) => (
-                                <div key={i} style={{ color: m.mark === "☆" ? "#f2d24b" : m.mark === "▲" ? "#e5697a" : "#9ece6a" }}>
+                                <div key={i} style={{ color: markColor(m.mark) }}>
                                   {m.mark}{m.name}
                                 </div>
                               ))}
@@ -3651,7 +3658,7 @@ export default function SlotDataTracker() {
                     {d.marks.length > 0 && (
                       <div style={{ fontSize: "11px" }}>
                         {d.marks.map((m, i) => (
-                          <div key={i} style={{ color: m.mark === "☆" ? "#f2d24b" : m.mark === "▲" ? "#e5697a" : "#9ece6a" }}>
+                          <div key={i} style={{ color: markColor(m.mark) }}>
                             {m.mark}{m.name}
                           </div>
                         ))}
@@ -3718,7 +3725,7 @@ export default function SlotDataTracker() {
                     {modelHistoryResults.map((r) => (
                       <tr key={r.date}>
                         <td className="mono" style={{ padding: "5px 8px", color: "#c7cbd4", borderBottom: "1px solid #1c2129" }}>
-                          {r.mark && <span style={{ marginRight: "4px", color: r.mark === "☆" ? "#f2d24b" : r.mark === "▲" ? "#e5697a" : "#9ece6a" }}>{r.mark}</span>}
+                          {r.mark && <span style={{ marginRight: "4px", color: markColor(r.mark) }}>{r.mark}</span>}
                           {r.date}
                           {r.event && <span style={{ marginLeft: "6px", color: "#5a6272", fontSize: "10px" }}>{r.event}</span>}
                         </td>
