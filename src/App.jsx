@@ -71,7 +71,7 @@ const DIGIT7_COLOR = "#f6a04d";
 
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.2";
+const APP_VERSION = "6.3";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -329,7 +329,7 @@ function scoreToGrade(score) {
 // backtesting (real hall data, walk-forward) showed these specific signals
 // have a genuine, repeatable edge; everything else is kept as a smaller
 // tie-breaker rather than being dropped, since it still carries some signal
-const STRONG_SIGNAL_LABELS = new Set(["強いイベント間トレンド", "相対ローテーション（設定良さそう）", "イベント登録連動"]);
+const STRONG_SIGNAL_LABELS = new Set(["強いイベント間トレンド", "相対ローテーション（設定良さそう）", "イベント登録連動", "イベント直前10日トレンド"]);
 function isStrongSignalLabel(label) {
   const baseLabel = label.replace(/[（(].*[）)]/g, "").trim();
   return STRONG_SIGNAL_LABELS.has(baseLabel) || baseLabel.startsWith("日付末尾");
@@ -400,6 +400,7 @@ const SIGNAL_WEIGHTS = {
   interEventTrend: 0.7, // new: modest but consistent edge in backtest
   strongInterEventTrend: 0.9, // 強いイベント同士の間のトレンド — strongest tier
   semiInterEventTrend: 0.4, // 準イベント同士の間のトレンド — weakest tier
+  preEventTrend: 1.5, // イベント直前10日トレンド — backtested strong for 2のつく日(13pt)/7のつく日(7pt)
 };
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -599,6 +600,28 @@ function evaluateEventNamePerformance(series, historyByDate, eventName) {
     normalRate: other ? other.winRate : null,
     normalAvg: other ? other.avgNext : null,
   };
+}
+
+// does the trailing 10-day 差枚 trend BEFORE a named event's own past
+// occurrences predict how THAT event day itself went? backtested per-event
+// (not blanket "any event") since the effect size varies a lot by name —
+// e.g. real and large for "2のつく日"/"7のつく日", much weaker for others
+function evaluatePreEventTrend(series, historyByDate, eventName, windowSize = 10) {
+  const upVals = [];
+  const downVals = [];
+  for (let i = windowSize; i < series.length; i++) {
+    const entry = historyByDate[series[i].date];
+    if (!entry || !entry.event || !splitEventNames(entry.event).includes(eventName)) continue;
+    const pre = series.slice(i - windowSize, i);
+    const preSum = pre.reduce((a, p) => a + p.sada, 0);
+    (preSum > 0 ? upVals : downVals).push(series[i].sada);
+  }
+  function summarize(arr) {
+    if (arr.length < 5) return null;
+    const wins = arr.filter((v) => v > 0).length;
+    return { sampleSize: arr.length, winRate: wins / arr.length, avg: arr.reduce((a, v) => a + v, 0) / arr.length };
+  }
+  return { up: summarize(upVals), down: summarize(downVals) };
 }
 
 // every calendar date from start to end, inclusive (used for recommend periods)
@@ -1801,6 +1824,31 @@ export default function SlotDataTracker() {
         }
       });
 
+      // does the trailing 10-day trend (as of today) predict how this
+      // specific upcoming named event will go, based on that event's own
+      // past instances split the same way? only meaningful per-event-name
+      // (backtested: strong for 2のつく日/7のつく日, much weaker for others)
+      let preEventTrendMatch = null;
+      if (series.length >= 10) {
+        const trailing10 = series.slice(-10).reduce((a, s) => a + s.sada, 0);
+        const currentDir = trailing10 > 0 ? "up" : "down";
+        plannedEventNameList.forEach((name) => {
+          const trend = evaluatePreEventTrend(series, pageHistoryByDate, name, 10);
+          const current = trend[currentDir];
+          const other = trend[currentDir === "up" ? "down" : "up"];
+          if (current && (!preEventTrendMatch || current.winRate > preEventTrendMatch.winRate)) {
+            preEventTrendMatch = {
+              name,
+              direction: currentDir === "up" ? "上昇" : "下降",
+              winRate: current.winRate,
+              avg: current.avg,
+              sampleSize: current.sampleSize,
+              baselineRate: other ? other.winRate : baseRate,
+            };
+          }
+        });
+      }
+
       // is tomorrow within a hall-declared "おすすめ機種" period for this
       // page/model (機種)? each model can have its OWN periods (see recommendsFor)
       const thisRecommendsList = recommendsFor(no);
@@ -1864,7 +1912,8 @@ export default function SlotDataTracker() {
         digitDayMatch ||
         interEventTrendMatch ||
         strongInterEventTrendMatch ||
-        semiInterEventTrendMatch;
+        semiInterEventTrendMatch ||
+        preEventTrendMatch;
       if (!hasAnySignal) return;
 
       // ---- additive/subtractive scoring: every signal (favorable OR
@@ -1932,6 +1981,11 @@ export default function SlotDataTracker() {
         const evPts = computeEvPoints(semiInterEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, semiInterEventTrendMatch.sampleSize);
         scoreItems.push({ label: `準イベント間トレンド（${semiInterEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.semiInterEventTrend });
       }
+      if (preEventTrendMatch) {
+        const winPts = computePoints(preEventTrendMatch.winRate, preEventTrendMatch.baselineRate, preEventTrendMatch.sampleSize);
+        const evPts = computeEvPoints(preEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, preEventTrendMatch.sampleSize);
+        scoreItems.push({ label: `イベント直前10日トレンド（${preEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.preEventTrend });
+      }
       if (recommendMatch) {
         const winPts = computePoints(recommendMatch.winRate, baseRate, recommendMatch.sampleSize);
         const evPts = computeEvPoints(recommendMatch.avg, machineAvgSada, machineTypicalMagnitude, recommendMatch.sampleSize);
@@ -1982,6 +2036,7 @@ export default function SlotDataTracker() {
         interEventTrendMatch,
         strongInterEventTrendMatch,
         semiInterEventTrendMatch,
+        preEventTrendMatch,
         settingMatch,
         settingCaution,
         volumeMismatch,
@@ -2919,6 +2974,14 @@ export default function SlotDataTracker() {
             📈 準イベント同士の間の差枚が{p.semiInterEventTrendMatch.direction}傾向 → 明日の準イベント当日は過去
             <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.semiInterEventTrendMatch.winRate * 100)}%</span>
             でプラス（{p.semiInterEventTrendMatch.sampleSize}件中、平均{p.semiInterEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.semiInterEventTrendMatch.avg))}枚）
+          </div>
+        )}
+
+        {p.preEventTrendMatch && (
+          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(232,179,76,0.08)", borderRadius: "6px" }}>
+            📊 直前10日間の差枚が{p.preEventTrendMatch.direction}傾向 → 明日の「{p.preEventTrendMatch.name}」当日は過去
+            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.preEventTrendMatch.winRate * 100)}%</span>
+            でプラス（{p.preEventTrendMatch.sampleSize}件中、平均{p.preEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.preEventTrendMatch.avg))}枚）
           </div>
         )}
 
