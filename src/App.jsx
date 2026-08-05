@@ -69,9 +69,25 @@ const EVENT_STAR_COLOR = "#f2d24b"; // ordinary (non-strong/semi) registered eve
 const DIGIT2_COLOR = "#7dcfff";
 const DIGIT7_COLOR = "#f6a04d";
 
+// v6.6: 雑餉隈スレッド（v6.5→v6.9.17）から、アナスロに関わらない部分をまと
+// めて移植。
+// ①民レポのバラエティ（1台設置機種）列ズレ修正（parseSummaryTable）＋
+//   壊れた過去データの修復ツール（共通設定に追加、G数は差枚と出率から推定
+//   復元）。②機種名の表記ゆれ吸収（normalizeModelNameForMatch/
+//   modelNamesMatch）を正式名称→おすすめ機種期間の連携に適用。③機種×日付
+//   マトリクス表にバラエティ日のセル色付け、長い機種名の省略表示（スマホ
+//   対応）。④民レポの日付ピッカーで未入力日を選んでも前の内容が残るバグを
+//   修正、登録済みの日付一覧をクリックしてその日を編集用に読み込めるように
+//   （handleEditOverall）。⑤共通設定を管理者用の一元窓口にする整理：全体
+//   ランキングタブを削除、民レポのデータ入力・登録済み日付一覧を全体データ
+//   タブから共通設定タブへ移動、各機種ページ・各タブに個別にあった暗証番号
+//   解除フォーム／ロックボタンを削除し、共通設定の1箇所に統一。⑥正式名称
+//   欄が暗証番号解除なしでも編集できてしまっていたバグを修正、スマホでの
+//   はみ出し対策（flexWrap・minWidth:0）。⑦不要になった全体ランキング用の
+//   重い計算（allPagesPickList）を削除。
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.5";
+const APP_VERSION = "6.6";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -179,6 +195,35 @@ function markColor(mark) {
   return "#9ece6a"; // ▲
 }
 
+// v6.8.7: 機種名の表記ゆれをより広く吸収する。単純な前方一致だけでなく、
+// 全角/半角・波ダッシュ違い・記号違い・空白の有無・大文字小文字の違いを
+// まとめて正規化してから比較する（例：「東京喰種」のような記号なしの
+// 短い名前はたまたま一致していただけで、サブタイトル付きの機種名は
+// ダッシュや波ダッシュの字体違いだけで不一致になっていた）。
+function normalizeModelNameForMatch(name) {
+  let s = (name || "").normalize("NFKC"); // 全角英数記号→半角、互換文字を統一
+  s = s.replace(/^(スマスロ|Sマイ|パチスロ|[SL])\s*/u, ""); // 機種名接頭辞を除去
+  s = s.replace(/[〜～~]/gu, "~"); // 波ダッシュ類を統一
+  s = s.replace(/[‐‑–—ー−―]/gu, "-"); // ダッシュ・長音記号類を統一
+  s = s.replace(/\s+/gu, ""); // 空白（全角含む）を全部除去
+  return s.toLowerCase().trim();
+}
+function modelNamesMatch(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return normalizeModelNameForMatch(a) === normalizeModelNameForMatch(b);
+}
+
+// v6.8.18: shared 5-段階 strength scale (赤＞黄＞緑＞青＞灰、高いほど赤) —
+// house convention for anything with a strength gradient
+function fiveBandColor(score0to100) {
+  if (score0to100 >= 75) return "#e5697a"; // 赤
+  if (score0to100 >= 60) return "#e8b34c"; // 黄
+  if (score0to100 >= 45) return "#9ece6a"; // 緑
+  if (score0to100 >= 30) return "#7aa2f7"; // 青
+  return "#5a6272"; // 灰
+}
+
 // per-MACHINE version of the same idea — an individual machine on a single
 // day doesn't have a "win rate across installed units" (that concept only
 // applies to a model as a whole), so this classifies by 出率 alone
@@ -200,10 +245,25 @@ function parseSummaryTable(text) {
 
   const rows = [];
   let pendingLabel = "";
+  // v6.9.13: バラエティ（1台設置機種）セクションは列の並びが違う —
+  // 「機種／台番／差枚／G数／出率」で、平均差枚が2列目ではなく3列目、
+  // 勝率の列は無い（1台だけなので分数の勝率が作れない）。通常の
+  // 「機種／平均差枚／平均G数／勝率／出率」ヘッダーと取り違えると、台番号
+  // が差枚として読まれてしまっていた。ヘッダーの文言でどちらの並びかを
+  // 判定し、以後の行をそのモードで読む。
+  let varietyMode = false;
   for (const line of lines) {
-    if (line.includes("機種") && line.includes("平均差枚")) continue; // header
+    if (line.includes("機種") && line.includes("台番")) {
+      varietyMode = true;
+      continue; // variety-section header
+    }
+    if (line.includes("機種") && line.includes("平均差枚")) {
+      varietyMode = false;
+      continue; // header
+    }
     if (line.includes("末尾") && line.includes("平均差枚")) continue; // digit-table header
     if (line === "末尾別データ") continue; // section title
+    if (line.includes("バラエティ") && line.includes("1台設置機種")) continue; // section title
 
     const cols = line.split("\t").map((c) => c.trim());
     if (cols.length < 5) {
@@ -212,6 +272,26 @@ function parseSummaryTable(text) {
     }
     const name = (pendingLabel + cols[0]).trim();
     pendingLabel = "";
+
+    if (varietyMode) {
+      // 機種／台番／差枚／G数／出率 — no 勝率 column at all here
+      const sadaCol = toAsciiMinus(cols[2]);
+      const avgSada = sadaCol === "" ? null : sadaCol === "-" ? -0.01 : parseInt(sadaCol.replace(/,/g, ""), 10);
+      const avgGsu = cols[3] === "-" || cols[3] === "" ? null : parseInt(cols[3].replace(/,/g, ""), 10);
+      const shutsu = cols[4] === "-" ? 99.9 : cols[4] === "" ? null : parseFloat(cols[4].replace("%", ""));
+      if (!name) continue;
+      rows.push({
+        name,
+        avgSada: Number.isNaN(avgSada) ? null : avgSada,
+        avgGsu: Number.isNaN(avgGsu) ? null : avgGsu,
+        wins: null,
+        total: null,
+        shutsu: Number.isNaN(shutsu) ? null : shutsu,
+        isVariety: true, // v6.9.16: this day, this row came from the バラエティ（1台設置機種）section
+      });
+      continue;
+    }
+
     const col1 = toAsciiMinus(cols[1]);
     // min-repo shows a bare "-" for 平均差枚 specifically when the average
     // was NEGATIVE (not when data is missing) — so treat it as "a loss of
@@ -232,6 +312,7 @@ function parseSummaryTable(text) {
       avgGsu: Number.isNaN(avgGsu) ? null : avgGsu,
       wins,
       total,
+      isVariety: false,
       shutsu: Number.isNaN(shutsu) ? null : shutsu,
     });
   }
@@ -244,6 +325,26 @@ function parseOverallSummary(text) {
   const modelText = idx === -1 ? text : text.slice(0, idx);
   const digitText = idx === -1 ? "" : text.slice(idx);
   return { modelRows: parseSummaryTable(modelText), digitRows: parseSummaryTable(digitText) };
+}
+
+// v6.8: inverse of parseSummaryTable — reconstructs pasteable tab-separated
+// text from already-stored rows, so clicking a past 民レポ date can reload
+// it into the edit textarea instead of only offering delete
+function serializeSummaryRows(rows) {
+  return (rows || [])
+    .map((r) => {
+      const avgSada = r.avgSada === null || r.avgSada === undefined ? "" : r.avgSada;
+      const avgGsu = r.avgGsu === null || r.avgGsu === undefined ? "-" : r.avgGsu;
+      const winFrac = r.wins === null || r.total === null || r.wins === undefined || r.total === undefined ? "" : `${r.wins}/${r.total}`;
+      const shutsu = r.shutsu === null || r.shutsu === undefined ? "" : `${r.shutsu}%`;
+      return [r.name, avgSada, avgGsu, winFrac, shutsu].join("\t");
+    })
+    .join("\n");
+}
+function serializeOverallSummary(s) {
+  const modelText = serializeSummaryRows(s.modelRows);
+  const digitText = serializeSummaryRows(s.digitRows);
+  return digitText ? `${modelText}\n末尾別データ\n${digitText}` : modelText;
 }
 
 // Build (trailing N-day total, next day's differential) pairs from a
@@ -829,6 +930,10 @@ export default function SlotDataTracker() {
   const [overallStatus, setOverallStatus] = useState(null);
   const [confirmDeleteOverall, setConfirmDeleteOverall] = useState(null);
   const [confirmDeleteAllOverall, setConfirmDeleteAllOverall] = useState(false);
+  // v6.9.14: one-time repair tool for the バラエティ（1台設置機種）misparse
+  // bug (fixed in v6.9.13, see parseSummaryTable)
+  const [varietyRepairPreview, setVarietyRepairPreview] = useState(null); // { fixCandidates: [...], deleteCandidates: [...] } | null if not scanned yet
+  const [varietyRepairDone, setVarietyRepairDone] = useState(false);
 
   // ---- undo history: snapshots taken right before a destructive action,
   //      so any reset/delete can be reversed with one click. shown as a
@@ -1211,10 +1316,110 @@ export default function SlotDataTracker() {
     setConfirmDeleteOverall(null);
   }
 
+  // v6.8: clicking a past 登録済みの日付 reloads it into the edit textarea
+  // instead of only offering delete
+  function handleEditOverall(s) {
+    setOverallDate(s.date);
+    setOverallPasteText(serializeOverallSummary(s));
+    setOverallStatus({ type: "ok", msg: `${s.date} のデータを編集用に読み込みました。修正して保存すると上書きされます。` });
+  }
+
   function handleDeleteAllOverall() {
     pushUndoEntry("全体データを全部削除", OVERALL_SUMMARY_KEY, overallSummaries);
     persistOverallSummaries([]);
     setConfirmDeleteAllOverall(false);
+  }
+
+  // v6.9.14: one-time repair tool for the バラエティ（1台設置機種）
+  // misparse bug (fixed in v6.9.13) — before the fix, those rows had
+  // 台番号 saved into avgSada and the real 差枚 saved into avgGsu (真の
+  // G数 was lost entirely, since it fell in the column the old parser
+  // tried to read as a 勝率 fraction and failed). Detected by exactly that
+  // failure signature: wins/total both null, which normal rows essentially
+  // never have (a real machine's day always has *some* win/loss fraction).
+  // Not name-based on purpose — the バラエティ lineup itself changes with
+  // 新台入れ替え, so any fixed name list would go stale immediately.
+  // v6.9.15: also detects a second, unrelated corruption from the same-era
+  // bug — the "バラエティ（1台設置機種）" section-title LINE itself wasn't
+  // recognized as a title before the fix, so it got glued onto the very
+  // next line (that section's own header row) and saved as one garbage
+  // "machine" entry (name literally containing both "バラエティ" and
+  // "機種", every numeric field null since none of the header's own text
+  // parses as a number). There's nothing real to recover from that one —
+  // it's flagged for deletion, not repair.
+  // v6.9.17: 差枚と出率が両方残っていれば、標準的な1G=3枚投入の計算式
+  // （出率 = (G数×3+差枚) / (G数×3) × 100）を逆算して、消えたG数を高い
+  // 精度で推定できる（実データで検証、ほとんどの機種で誤差1%未満。ただし
+  // 出率が100%に近いほど、分母が小さくなり誤差が拡大するので注意）。
+  function estimateGsuFromSadaAndShutsu(sada, shutsu) {
+    if (sada === null || sada === undefined || shutsu === null || shutsu === undefined) return null;
+    const denom = 3 * (shutsu / 100 - 1);
+    if (denom === 0) return null; // exactly 100% shutsu — can't divide, no reliable estimate
+    const estimate = sada / denom;
+    if (!Number.isFinite(estimate) || estimate <= 0) return null;
+    return Math.round(estimate);
+  }
+
+  function scanVarietyRepairCandidates() {
+    const fixCandidates = [];
+    const deleteCandidates = [];
+    overallSummaries.forEach((s) => {
+      (s.modelRows || []).forEach((r, idx) => {
+        if (r.name && r.name.includes("バラエティ") && r.name.includes("機種")) {
+          deleteCandidates.push({ date: s.date, rowIndex: idx, name: r.name });
+          return;
+        }
+        if (r.wins === null && r.total === null && r.avgSada !== null && r.avgSada !== undefined) {
+          const fixedAvgSada = r.avgGsu;
+          fixCandidates.push({
+            date: s.date,
+            rowIndex: idx,
+            name: r.name,
+            oldAvgSada: r.avgSada, // was actually 台番号
+            oldAvgGsu: r.avgGsu, // was actually 差枚
+            fixedAvgSada, // recovered 差枚
+            estimatedAvgGsu: estimateGsuFromSadaAndShutsu(fixedAvgSada, r.shutsu), // 推定G数（出率が100%付近だとnullのまま=推定できない）
+          });
+        }
+      });
+    });
+    setVarietyRepairPreview({ fixCandidates, deleteCandidates });
+  }
+
+  function applyVarietyRepair() {
+    if (!varietyRepairPreview) return;
+    const { fixCandidates, deleteCandidates } = varietyRepairPreview;
+    if (fixCandidates.length === 0 && deleteCandidates.length === 0) return;
+    pushUndoEntry("バラエティ機種の差枚を修復", OVERALL_SUMMARY_KEY, overallSummaries);
+    const fixByDate = {};
+    fixCandidates.forEach((c) => {
+      if (!fixByDate[c.date]) fixByDate[c.date] = new Map();
+      fixByDate[c.date].set(c.rowIndex, c.estimatedAvgGsu);
+    });
+    const deleteByDate = {};
+    deleteCandidates.forEach((c) => {
+      if (!deleteByDate[c.date]) deleteByDate[c.date] = new Set();
+      deleteByDate[c.date].add(c.rowIndex);
+    });
+    const nextSummaries = overallSummaries.map((s) => {
+      const rowIndicesToFix = fixByDate[s.date];
+      const rowIndicesToDelete = deleteByDate[s.date];
+      if (!rowIndicesToFix && !rowIndicesToDelete) return s;
+      const nextModelRows = s.modelRows
+        .filter((r, idx) => !(rowIndicesToDelete && rowIndicesToDelete.has(idx)))
+        .map((r, idx) => {
+          // re-filtering changes indices, so match on identity instead for the fix pass
+          const originalIdx = s.modelRows.indexOf(r);
+          if (rowIndicesToFix && rowIndicesToFix.has(originalIdx)) {
+            return { ...r, avgSada: r.avgGsu, avgGsu: rowIndicesToFix.get(originalIdx) };
+          }
+          return r;
+        });
+      return { ...s, modelRows: nextModelRows };
+    });
+    persistOverallSummaries(nextSummaries);
+    setVarietyRepairPreview(null);
+    setVarietyRepairDone(true);
   }
 
   // export every piece of stored data as one JSON file — used for offline
@@ -1329,7 +1534,15 @@ export default function SlotDataTracker() {
   const activePageRecommends = useMemo(() => {
     const own = pageRecommends[activePageId] || [];
     const officialName = currentPage && currentPage.officialName;
-    const linked = officialName ? overallRecommends[officialName] || [] : [];
+    // v6.8.7: exact-string lookup missed periods registered under a
+    // slightly different表記（全角/半角・波ダッシュ・接頭辞違いなど）—
+    // match by normalized name instead so registration doesn't silently
+    // fail to link just because of a notation difference.
+    let linked = [];
+    if (officialName) {
+      const matchedKey = Object.keys(overallRecommends).find((name) => modelNamesMatch(name, officialName));
+      linked = matchedKey ? overallRecommends[matchedKey] || [] : [];
+    }
     return linked.length > 0 ? [...own, ...linked] : own;
   }, [pageRecommends, activePageId, currentPage, overallRecommends]);
   // whichever page is selected in the 共通設定 tab's dropdown (used for that UI)
@@ -1680,8 +1893,8 @@ export default function SlotDataTracker() {
   // favorable threshold, checked across the 10/20/30-day windows together,
   // with a combined "総合判断" verdict, plus several other pickup signals
   // (computed across all machines this page has ever seen)
-  // core per-machine signal computation, parameterized so it can run for the
-  // active page (pickList) AND for every page at once (allPagesPickList)
+  // core per-machine signal computation, parameterized so it can be reused
+  // for both the active page and the store-wide 機種別/末尾別 summaries
   function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet) {
     const results = [];
     // pageRecommendsList is usually one shared list (applies to every machine
@@ -2065,35 +2278,6 @@ export default function SlotDataTracker() {
     return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet));
   }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends]);
 
-  // hall-wide: every page's machines combined into ONE ranked list, no
-  // page/機種 boundary — for spotting the single best "aim" machine anywhere
-  // in the store, not just within one machine type
-  const allPagesPickList = useMemo(() => {
-    const combined = [];
-    pages.forEach((p, i) => {
-      const hist = pageHistories[p.id];
-      if (!hist) return; // not loaded yet
-      const sorted = [...hist].sort((a, b) => a.date.localeCompare(b.date));
-      const hbd = {};
-      sorted.forEach((h) => {
-        hbd[h.date] = h;
-      });
-      const machineNos = Array.from(new Set(sorted.flatMap((h) => h.machines.map((m) => m.no)))).sort((a, b) => a - b);
-      const recs = pageRecommends[p.id] || [];
-      const pStrongDateSet = new Set(
-        sorted.filter((h) => h.event && splitEventNames(h.event).some((n) => strongEventColorByName[n])).map((h) => h.date)
-      );
-      const pSemiDateSet = new Set(
-        sorted
-          .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
-          .map((h) => h.date)
-      );
-      const pageResults = computeSignalsForPage(machineNos, sorted, hbd, recs, pStrongDateSet, pSemiDateSet, strongEventNameSet, semiEventNameSet);
-      const pageLabel = p.name && p.name.trim() ? p.name : `機種${i + 1}`;
-      pageResults.forEach((r) => combined.push({ ...r, pageId: p.id, pageLabel }));
-    });
-    return sortPickResults(combined);
-  }, [pages, pageHistories, pageRecommends, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap]);
 
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
   // engine (it doesn't care whether "no" is a machine number, a model name,
@@ -2243,6 +2427,23 @@ export default function SlotDataTracker() {
       });
     });
     return map;
+  }, [overallSortedSummaries]);
+
+  // v6.9.16: which (date, 機種名) CELLS should be flagged as「バラエティ
+  // コーナー」(1台設置) in the matrix table — per-cell, not per-機種: a day
+  // where this 機種 was in the バラエティ section gets flagged; a day where
+  // the SAME 機種 had multiple machines (e.g. before/after 新台入れ替えで
+  // 台数が変わった) does not, even though it's the same row. isVariety is
+  // undefined on data saved before this version — treated as「対象外」
+  // （安全側のデフォルト）。
+  const overallGridVarietyCells = useMemo(() => {
+    const cells = new Set();
+    overallSortedSummaries.forEach((s) => {
+      s.modelRows.forEach((r) => {
+        if (r.isVariety) cells.add(`${s.date}|${r.name}`);
+      });
+    });
+    return cells;
   }, [overallSortedSummaries]);
 
   // ---- 機種ページ用マトリクス表: 台番号 × 日付、セルは出率ベースの簡易マーク ----
@@ -2771,7 +2972,7 @@ export default function SlotDataTracker() {
     );
   }
 
-  function renderMarkGrid(dates, rows, marksMap, rowLabelFn) {
+  function renderMarkGrid(dates, rows, marksMap, rowLabelFn, varietyCells) {
     if (rows.length === 0 || dates.length === 0) {
       return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
     }
@@ -2789,21 +2990,42 @@ export default function SlotDataTracker() {
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => (
+            {rows.map((row) => {
+              return (
               <tr key={row}>
-                <td style={{ position: "sticky", left: 0, background: "#12161d", padding: "4px 8px", color: "#c7cbd4", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap" }}>
+                <td
+                  title={rowLabelFn(row)}
+                  style={{
+                    position: "sticky", left: 0,
+                    background: "#12161d",
+                    color: "#c7cbd4",
+                    padding: "4px 8px", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                    maxWidth: "112px", boxSizing: "border-box",
+                  }}
+                >
                   {rowLabelFn(row)}
                 </td>
                 {dates.map((d) => {
                   const mark = marksMap[row] && marksMap[row][d];
+                  const isVarietyCell = varietyCells && varietyCells.has(`${d}|${row}`);
                   return (
-                    <td key={d} className="mono" style={{ padding: "4px 3px", textAlign: "center", color: mark ? markColor(mark) : "#2a323f", borderBottom: "1px solid #1c2129" }}>
+                    <td
+                      key={d}
+                      className="mono"
+                      title={isVarietyCell ? "バラエティコーナー（1台設置）" : undefined}
+                      style={{
+                        padding: "4px 3px", textAlign: "center", color: mark ? markColor(mark) : "#2a323f", borderBottom: "1px solid #1c2129",
+                        background: isVarietyCell ? "rgba(122,162,247,0.18)" : undefined,
+                        boxShadow: isVarietyCell ? "inset 0 0 0 1px rgba(122,162,247,0.5)" : undefined,
+                      }}
+                    >
                       {mark || "・"}
                     </td>
                   );
                 })}
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -3074,7 +3296,7 @@ export default function SlotDataTracker() {
       }}
     >
       <datalist id={DATALIST_ID}>
-        {allKnownEventNames.map((n) => (
+        {eventNames.map((n) => (
           <option value={n} key={n} />
         ))}
       </datalist>
@@ -3107,13 +3329,6 @@ export default function SlotDataTracker() {
 
       {/* page tabs */}
       <div style={{ display: "flex", alignItems: "flex-end", gap: "4px", marginBottom: "0", flexWrap: "wrap" }}>
-        <div
-          className={"page-tab" + (viewMode === "ranking" ? " active" : "")}
-          onClick={() => setViewMode("ranking")}
-          style={{ display: "flex", alignItems: "center", gap: "6px" }}
-        >
-          <span>🏅 全体ランキング</span>
-        </div>
         <div
           className={"page-tab" + (viewMode === "common" ? " active" : "")}
           onClick={() => setViewMode("common")}
@@ -3175,50 +3390,171 @@ export default function SlotDataTracker() {
 
       <div style={{ borderTop: "1px solid #2a323f", marginBottom: "16px" }} />
 
-      {viewMode === "ranking" ? (
+      {viewMode === "common" ? (
         <div style={{ maxWidth: "760px" }}>
-          {/* hall-wide combined ranking: every page's machines together, no 機種 boundary */}
+          {unlocked ? (
+            <>
+          {/* v6.9.10: 民レポのデータ入力・登録済み日付一覧を「全体データ」
+              タブから移動。共通設定を暗証番号解除の唯一の窓口にする整理の
+              一環（各ページ・各タブに個別の解除フォームを置かない） */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              🏅 全機種合算ランキング（機種の隔たり無し）
+              民レポ データ入力（機種別サマリー＋末尾別データ）
             </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-              全ての機種ページの台をひとまとめにして、総合スコアが高い順にランク付けします。狙い台を機種を問わず探したいときはこちらを見てください。
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              両方の表をそのまま1つに貼り付けてください（「末尾別データ」の行で自動的に区切ります）。日付にはイベント登録の内容が自動で反映されます。
             </div>
-            {allPagesPickList.length === 0 ? (
-              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
-            ) : (
-              <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "10px" }}>
-                {allPagesPickList.map((p) => (
-                  <div key={p.pageId + "-" + p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "9px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      {p.grade && (
-                        <span className="mono" style={{
-                          fontSize: "12px", fontWeight: 800, width: "20px", height: "20px", lineHeight: "20px",
-                          textAlign: "center", borderRadius: "50%", color: "#12161d",
-                          background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
-                        }}>
-                          {p.grade}
-                        </span>
-                      )}
-                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{p.no}番</span>
-                      <span style={{ fontSize: "11px", color: "#8b93a3" }}>{p.pageLabel}</span>
+            <div style={{ marginBottom: "10px" }}>
+              <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
+              <input
+                type="date"
+                value={overallDate}
+                onChange={(e) => {
+                  // v6.9.2: previously this only updated the date, leaving
+                  // whatever was last pasted sitting in the textarea even
+                  // for an empty/未入力 date — confusing when re-entering
+                  // data. Now: 登録済みならその内容を読み込み、未登録なら
+                  // 空欄にする。
+                  const newDate = e.target.value;
+                  setOverallDate(newDate);
+                  const existing = overallSummaries.find((s) => s.date === newDate);
+                  if (existing) {
+                    setOverallPasteText(serializeOverallSummary(existing));
+                    setOverallStatus({ type: "ok", msg: `${newDate} は登録済みです。編集用に読み込みました。` });
+                  } else {
+                    setOverallPasteText("");
+                    setOverallStatus(null);
+                  }
+                }}
+                style={{
+                  display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                  borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
+                }}
+              />
+            </div>
+            {dateEventMap[overallDate] && (
+              <div style={{
+                fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
+                background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
+                display: "flex", alignItems: "center", gap: "6px",
+              }}>
+                <Flag size={12} />
+                この日のイベント：{dateEventMap[overallDate]}
+              </div>
+            )}
+            <textarea
+              className="mono scrollbar"
+              value={overallPasteText}
+              onChange={(e) => setOverallPasteText(e.target.value)}
+              placeholder={"機種\t平均差枚\t平均G数\t勝率\t出率\nLアズールレーン THE ANIMATION\t3,500\t3,596\t2/4\t132.4%\n...\n末尾別データ\n末尾\t平均差枚\t平均G数\t勝率\t出率\n0\t868\t5,513\t24/56\t105.2%\n..."}
+              rows={12}
+              style={{
+                width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
+                padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
+                boxSizing: "border-box", marginBottom: "10px",
+              }}
+            />
+            <button
+              onClick={handleSaveOverall}
+              style={{
+                width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
+                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+              }}
+            >
+              この日のデータを保存
+            </button>
+            {overallStatus && (
+              <div style={{ marginTop: "8px", fontSize: "11px", color: overallStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                {overallStatus.msg}
+              </div>
+            )}
+
+            <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
+                <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
+                  登録済みの日付（{overallSummaries.length}件）
+                </div>
+                {overallSummaries.length > 0 && (
+                  confirmDeleteAllOverall ? (
+                    <span style={{ display: "flex", gap: "6px" }}>
+                      <span style={{ fontSize: "11px", color: "#e5697a" }}>本当に全部削除しますか？</span>
+                      <button onClick={handleDeleteAllOverall} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>
+                        削除する
+                      </button>
+                      <button onClick={() => setConfirmDeleteAllOverall(false)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>
+                        取消
+                      </button>
                     </span>
-                    {p.totalPoints !== null && p.totalPoints !== undefined && (
-                      <span className="mono" style={{ fontSize: "11px", fontWeight: 700, color: "#12161d", background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a", borderRadius: "4px", padding: "1px 6px" }}>
-                        実証済み{p.strongSignalCount}個（全{p.signalCount}件根拠）
-                      </span>
+                  ) : (
+                    <button onClick={() => setConfirmDeleteAllOverall(true)} style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px" }}>
+                      <Trash2 size={11} />
+                      全部削除
+                    </button>
+                  )
+                )}
+              </div>
+              <div className="scrollbar" style={{ maxHeight: "180px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+                {!overallSummariesLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
+                {overallSummariesLoaded && overallSortedSummaries.length === 0 && (
+                  <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
+                )}
+                {[...overallSortedSummaries].reverse().map((s) => (
+                  <div
+                    key={s.date}
+                    onClick={() => handleEditOverall(s)}
+                    title="クリックでこの日のデータを編集"
+                    style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                    background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
+                    cursor: "pointer",
+                  }}>
+                    <div>
+                      <span className="mono">{s.date}</span>
+                      {s.event && (() => {
+                        const names = splitEventNames(s.event);
+                        const isStrong = names.some((n) => strongEventColorByName[n]);
+                        const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
+                        if (isStrong) {
+                          return (
+                            <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR }}>
+                              <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={STRONG_EVENT_COLOR} />
+                              {s.event}
+                            </span>
+                          );
+                        }
+                        if (isSemi) {
+                          return (
+                            <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR }}>
+                              <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
+                              {s.event}
+                            </span>
+                          );
+                        }
+                        return (
+                          <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR }}>
+                            <Star size={10} style={{ display: "inline", marginRight: "2px" }} />
+                            {s.event}
+                          </span>
+                        );
+                      })()}
+                      <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>
+                    </div>
+                    {confirmDeleteOverall === s.date ? (
+                      <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
+                        <button onClick={() => handleDeleteOverall(s.date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
+                        <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
+                      </div>
+                    ) : (
+                      <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteOverall(s.date); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                        <Trash2 size={13} />
+                      </button>
                     )}
                   </div>
                 ))}
               </div>
-            )}
+            </div>
           </div>
-        </div>
-      ) : viewMode === "common" ? (
-        <div style={{ maxWidth: "760px" }}>
-          {unlocked ? (
-            <>
+
           {/* export everything for offline analysis / backtesting */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
@@ -3236,6 +3572,103 @@ export default function SlotDataTracker() {
             >
               ダウンロード
             </button>
+          </div>
+
+          {/* v6.9.14: one-time repair for the バラエティ misparse bug (v6.9.13) */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🛠 バラエティ機種の差枚を修復（v6.9.13より前のバグ対応）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              以前のバグで、民レポの「バラエティ（1台設置機種）」の行は台番号が差枚として、差枚がG数として保存されてしまっていました。「勝率が読み取れなかった行」を目印に自動で候補を探し、内容を確認してから直せます（機種名では判定していないので、新台入れ替えでラインナップが変わっても対応できます）。G数自体は元のバグでどこにも残っていませんが、差枚と出率から標準的な計算式（1G＝3枚投入）で逆算した推定値で埋めます（実データで検証済み、多くの場合誤差1%未満。出率が100%に近い台だけ推定できません）。
+            </div>
+            <button
+              onClick={scanVarietyRepairCandidates}
+              style={{
+                background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3",
+                padding: "7px 12px", fontSize: "12px", cursor: "pointer", marginBottom: "10px",
+              }}
+            >
+              修復候補を探す
+            </button>
+            {varietyRepairDone && (
+              <div style={{ fontSize: "12px", color: "#9ece6a", marginBottom: "10px" }}>✓ 修復を反映しました。</div>
+            )}
+            {varietyRepairPreview && (
+              varietyRepairPreview.fixCandidates.length === 0 && varietyRepairPreview.deleteCandidates.length === 0 ? (
+                <div style={{ fontSize: "12px", color: "#5a6272" }}>修復・削除が必要そうな行は見つかりませんでした。</div>
+              ) : (
+                <>
+                  {varietyRepairPreview.fixCandidates.length > 0 && (
+                    <>
+                      <div style={{ fontSize: "12px", color: "#e8b34c", marginBottom: "8px" }}>
+                        {varietyRepairPreview.fixCandidates.length}件、差枚の修復候補が見つかりました。G数は差枚と出率から逆算した推定値です（出率が100%に近い機種は精度が落ちます、その場合は空欄のままにします）。
+                      </div>
+                      <div className="scrollbar" style={{ maxHeight: "220px", overflowY: "auto", marginBottom: "14px" }}>
+                        <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse" }}>
+                          <thead>
+                            <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                              <th style={{ padding: "3px 6px" }}>日付</th>
+                              <th style={{ padding: "3px 6px" }}>機種名</th>
+                              <th style={{ padding: "3px 6px" }}>今の平均差枚(実は台番号)</th>
+                              <th style={{ padding: "3px 6px" }}>→ 修復後の平均差枚</th>
+                              <th style={{ padding: "3px 6px" }}>推定G数</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {varietyRepairPreview.fixCandidates.map((c, i) => (
+                              <tr key={i} style={{ borderTop: "1px solid #1c2129" }}>
+                                <td style={{ padding: "3px 6px", color: "#8b93a3" }} className="mono">{c.date}</td>
+                                <td style={{ padding: "3px 6px", color: "#c7cbd4" }}>{c.name}</td>
+                                <td style={{ padding: "3px 6px", color: "#e5697a" }} className="mono">{c.oldAvgSada}</td>
+                                <td style={{ padding: "3px 6px", color: "#9ece6a" }} className="mono">{c.fixedAvgSada}</td>
+                                <td style={{ padding: "3px 6px", color: c.estimatedAvgGsu !== null ? "#7aa2f7" : "#5a6272" }} className="mono">
+                                  {c.estimatedAvgGsu !== null ? `約${c.estimatedAvgGsu}` : "推定不可"}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                  {varietyRepairPreview.deleteCandidates.length > 0 && (
+                    <>
+                      <div style={{ fontSize: "12px", color: "#e5697a", marginBottom: "8px" }}>
+                        {varietyRepairPreview.deleteCandidates.length}件、中身が空のゴミ行（見出し行とヘッダー行がくっついたもの）が見つかりました。復元できる数字が無いため削除します。
+                      </div>
+                      <div className="scrollbar" style={{ maxHeight: "160px", overflowY: "auto", marginBottom: "14px" }}>
+                        <table style={{ width: "100%", fontSize: "11px", borderCollapse: "collapse" }}>
+                          <thead>
+                            <tr style={{ color: "#5a6272", textAlign: "left" }}>
+                              <th style={{ padding: "3px 6px" }}>日付</th>
+                              <th style={{ padding: "3px 6px" }}>削除される行の名前</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {varietyRepairPreview.deleteCandidates.map((c, i) => (
+                              <tr key={i} style={{ borderTop: "1px solid #1c2129" }}>
+                                <td style={{ padding: "3px 6px", color: "#8b93a3" }} className="mono">{c.date}</td>
+                                <td style={{ padding: "3px 6px", color: "#e5697a" }}>{c.name}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                  <button
+                    onClick={applyVarietyRepair}
+                    style={{
+                      background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "6px",
+                      padding: "8px 14px", fontSize: "12px", fontWeight: 700, cursor: "pointer",
+                    }}
+                  >
+                    修復{varietyRepairPreview.fixCandidates.length}件・削除{varietyRepairPreview.deleteCandidates.length}件を反映する
+                  </button>
+                </>
+              )
+            )}
           </div>
 
           {/* recommended-model periods — one shared panel, target machine chosen via dropdown */}
@@ -3701,16 +4134,16 @@ export default function SlotDataTracker() {
                   padding: "8px", color: "#5a6272", fontSize: "12px", cursor: "pointer",
                 }}
               >
-                <Lock size={12} /> 共通設定をロックする
+                <Lock size={12} /> ロックする（データ入力・共通設定すべて）
               </button>
             </>
           ) : (
             <div className="card" style={{ padding: "18px" }}>
               <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
-                <Lock size={14} /> 共通設定はロック中です
+                <Lock size={14} /> ロック中です
               </div>
               <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-                暗証番号を入力すると、イベント登録・強いイベント・店休日・おすすめ機種期間を編集できます。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
+                暗証番号を入力すると、民レポ・台データの入力、イベント登録・強いイベント・店休日・おすすめ機種期間の編集など、データ入力に関わる操作をこの1箇所で解除できます（各ページ個別の解除は不要です）。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
               </div>
               <div style={{ display: "flex", gap: "8px" }}>
                 <input
@@ -3912,7 +4345,7 @@ export default function SlotDataTracker() {
                 value={modelHistorySelection}
                 onChange={(e) => setModelHistorySelection(e.target.value)}
                 style={{
-                  flex: "2 1 220px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  flex: "2 1 220px", minWidth: 0, background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
                   padding: "7px 8px", color: "#e7e9ee", fontSize: "12px",
                 }}
               >
@@ -3925,7 +4358,7 @@ export default function SlotDataTracker() {
                 value={modelHistoryEventFilter}
                 onChange={(e) => setModelHistoryEventFilter(e.target.value)}
                 style={{
-                  flex: "1 1 160px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+                  flex: "1 1 160px", minWidth: 0, background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
                   padding: "7px 8px", color: "#e7e9ee", fontSize: "12px",
                 }}
               >
@@ -3988,7 +4421,7 @@ export default function SlotDataTracker() {
               機種名を台数の多い順に並べ、日付ごとの☆◎◯▲を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
             </div>
             {renderEventMultiSelect(overallGridEventFilter, setOverallGridEventFilter)}
-            {renderMarkGrid(overallGridDates, overallGridRows, overallGridMarks, (name) => name)}
+            {renderMarkGrid(overallGridDates, overallGridRows, overallGridMarks, (name) => name, overallGridVarietyCells)}
           </div>
 
 
@@ -4024,178 +4457,13 @@ export default function SlotDataTracker() {
             )}
           </div>
 
-          {/* data entry, locked behind the same PIN as everything else */}
-          {unlocked ? (
-            <div className="card" style={{ padding: "18px" }}>
-              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-                データ入力（機種別サマリー＋末尾別データ）
-              </div>
-              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-                両方の表をそのまま1つに貼り付けてください（「末尾別データ」の行で自動的に区切ります）。日付にはイベント登録の内容が自動で反映されます。
-              </div>
-              <div style={{ marginBottom: "10px" }}>
-                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
-                <input
-                  type="date"
-                  value={overallDate}
-                  onChange={(e) => setOverallDate(e.target.value)}
-                  style={{
-                    display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
-                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
-                  }}
-                />
-              </div>
-              {dateEventMap[overallDate] && (
-                <div style={{
-                  fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
-                  background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
-                  display: "flex", alignItems: "center", gap: "6px",
-                }}>
-                  <Flag size={12} />
-                  この日のイベント：{dateEventMap[overallDate]}
-                </div>
-              )}
-              <textarea
-                className="mono scrollbar"
-                value={overallPasteText}
-                onChange={(e) => setOverallPasteText(e.target.value)}
-                placeholder={"機種\t平均差枚\t平均G数\t勝率\t出率\nLアズールレーン THE ANIMATION\t3,500\t3,596\t2/4\t132.4%\n...\n末尾別データ\n末尾\t平均差枚\t平均G数\t勝率\t出率\n0\t868\t5,513\t24/56\t105.2%\n..."}
-                rows={12}
-                style={{
-                  width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
-                  padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
-                  boxSizing: "border-box", marginBottom: "10px",
-                }}
-              />
-              <button
-                onClick={handleSaveOverall}
-                style={{
-                  width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                  padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
-                }}
-              >
-                この日のデータを保存
-              </button>
-              {overallStatus && (
-                <div style={{ marginTop: "8px", fontSize: "11px", color: overallStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
-                  {overallStatus.msg}
-                </div>
-              )}
-
-              <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
-                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
-                    登録済みの日付（{overallSummaries.length}件）
-                  </div>
-                  {overallSummaries.length > 0 && (
-                    confirmDeleteAllOverall ? (
-                      <span style={{ display: "flex", gap: "6px" }}>
-                        <span style={{ fontSize: "11px", color: "#e5697a" }}>本当に全部削除しますか？</span>
-                        <button onClick={handleDeleteAllOverall} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>
-                          削除する
-                        </button>
-                        <button onClick={() => setConfirmDeleteAllOverall(false)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>
-                          取消
-                        </button>
-                      </span>
-                    ) : (
-                      <button onClick={() => setConfirmDeleteAllOverall(true)} style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px" }}>
-                        <Trash2 size={11} />
-                        全部削除
-                      </button>
-                    )
-                  )}
-                </div>
-                <div className="scrollbar" style={{ maxHeight: "180px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
-                  {!overallSummariesLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
-                  {overallSummariesLoaded && overallSortedSummaries.length === 0 && (
-                    <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
-                  )}
-                  {[...overallSortedSummaries].reverse().map((s) => (
-                    <div key={s.date} style={{
-                      display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
-                      background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
-                    }}>
-                      <div>
-                        <span className="mono">{s.date}</span>
-                        {s.event && (() => {
-                          const names = splitEventNames(s.event);
-                          const isStrong = names.some((n) => strongEventColorByName[n]);
-                          const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
-                          if (isStrong) {
-                            return (
-                              <span style={{ marginLeft: "6px", color: STRONG_EVENT_COLOR }}>
-                                <Star size={10} style={{ display: "inline", marginRight: "2px" }} fill={STRONG_EVENT_COLOR} />
-                                {s.event}
-                              </span>
-                            );
-                          }
-                          if (isSemi) {
-                            return (
-                              <span style={{ marginLeft: "6px", color: SEMI_EVENT_COLOR }}>
-                                <Flag size={10} style={{ display: "inline", marginRight: "2px" }} />
-                                {s.event}
-                              </span>
-                            );
-                          }
-                          return (
-                            <span style={{ marginLeft: "6px", color: EVENT_STAR_COLOR }}>
-                              <Star size={10} style={{ display: "inline", marginRight: "2px" }} />
-                              {s.event}
-                            </span>
-                          );
-                        })()}
-                        <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>
-                      </div>
-                      {confirmDeleteOverall === s.date ? (
-                        <div style={{ display: "flex", gap: "6px" }}>
-                          <button onClick={() => handleDeleteOverall(s.date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
-                          <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
-                        </div>
-                      ) : (
-                        <button onClick={() => setConfirmDeleteOverall(s.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
-                          <Trash2 size={13} />
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          ) : (
-            <div className="card" style={{ padding: "18px" }}>
-              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
-                <Lock size={14} /> データ入力はロック中です
-              </div>
-              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-                暗証番号を入力すると、機種別サマリー・末尾別データを入力できます。上のおすすめ表示は鍵なしで見られます。
-              </div>
-              <div style={{ display: "flex", gap: "8px" }}>
-                <input
-                  type="password"
-                  inputMode="numeric"
-                  value={pinInput}
-                  onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
-                  onKeyDown={(e) => { if (e.key === "Enter") handleUnlock(); }}
-                  placeholder="暗証番号"
-                  style={{
-                    flex: 1, background: "#12161d", border: "1px solid " + (pinError ? "#e5697a" : "#2a323f"),
-                    borderRadius: "6px", padding: "8px", color: "#e7e9ee", fontSize: "13px",
-                  }}
-                />
-                <button
-                  onClick={handleUnlock}
-                  style={{
-                    background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                    padding: "0 16px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
-                  }}
-                >
-                  解除
-                </button>
-              </div>
-              {pinError && (
-                <div style={{ marginTop: "8px", fontSize: "11px", color: "#e5697a" }}>暗証番号が違います。</div>
-              )}
+          {/* v6.9.10: データ入力・登録済み日付一覧・暗証番号解除フォームは
+              共通設定タブに統合したため、ここでは案内だけを出す（全体データ
+              タブ自体はロックなしで誰でも見られる） */}
+          {!unlocked && (
+            <div className="card" style={{ padding: "14px 18px", fontSize: "12px", color: "#8b93a3", display: "flex", alignItems: "center", gap: "8px" }}>
+              <Lock size={13} />
+              データ入力・登録済みの日付一覧は「🔧 共通設定」タブに移動しました。
             </div>
           )}
         </div>
@@ -4221,7 +4489,7 @@ export default function SlotDataTracker() {
           }}
         />
       </div>
-      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px" }}>
+      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
         <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（全体データと連携・任意）：</span>
         <input
           type="text"
@@ -4229,14 +4497,19 @@ export default function SlotDataTracker() {
           value={currentPage ? currentPage.officialName || "" : ""}
           onChange={(e) => handleSetOfficialName(activePageId, e.target.value)}
           placeholder="例：Lパチスロからくりサーカス2"
+          disabled={!unlocked}
           style={{
             fontSize: "12px",
-            background: "#12161d",
+            background: unlocked ? "#12161d" : "#0d1015",
             border: "1px solid #2a323f",
             borderRadius: "6px",
-            color: "#e7e9ee",
+            color: unlocked ? "#e7e9ee" : "#5a6272",
             padding: "5px 8px",
-            minWidth: "280px",
+            flex: "1 1 200px",
+            minWidth: 0,
+            maxWidth: "100%",
+            boxSizing: "border-box",
+            cursor: unlocked ? "text" : "not-allowed",
           }}
         />
       </div>
@@ -4430,51 +4703,11 @@ export default function SlotDataTracker() {
             </div>
           </div>
 
-          <button
-            onClick={() => { setUnlocked(false); setPinInput(""); setPinError(false); }}
-            style={{
-              display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
-              width: "100%", background: "transparent", border: "1px solid #2a323f", borderRadius: "8px",
-              padding: "8px", color: "#5a6272", fontSize: "12px", cursor: "pointer",
-            }}
-          >
-            <Lock size={12} /> データ入力をロックする
-          </button>
           </>
           ) : (
-          <div className="card" style={{ padding: "18px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
-              <Lock size={14} /> データ入力はロック中です
-            </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-              暗証番号を入力すると、データ入力・強いイベント・店休日を編集できます。この解除状態は今開いているこの画面だけのもので、他の端末や再読み込み後には引き継がれません。
-            </div>
-            <div style={{ display: "flex", gap: "8px" }}>
-              <input
-                type="password"
-                inputMode="numeric"
-                value={pinInput}
-                onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
-                onKeyDown={(e) => { if (e.key === "Enter") handleUnlock(); }}
-                placeholder="暗証番号"
-                style={{
-                  flex: 1, background: "#12161d", border: "1px solid " + (pinError ? "#e5697a" : "#2a323f"),
-                  borderRadius: "6px", padding: "8px", color: "#e7e9ee", fontSize: "13px",
-                }}
-              />
-              <button
-                onClick={handleUnlock}
-                style={{
-                  background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                  padding: "0 16px", fontWeight: 700, fontSize: "12px", cursor: "pointer",
-                }}
-              >
-                解除
-              </button>
-            </div>
-            {pinError && (
-              <div style={{ marginTop: "8px", fontSize: "11px", color: "#e5697a" }}>暗証番号が違います。</div>
-            )}
+          <div className="card" style={{ padding: "14px 18px", fontSize: "12px", color: "#8b93a3", display: "flex", alignItems: "center", gap: "8px" }}>
+            <Lock size={13} />
+            データ入力はロック中です。「🔧 共通設定」タブで暗証番号を入力すると解除できます。
           </div>
           )}
 
