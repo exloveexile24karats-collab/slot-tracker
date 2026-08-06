@@ -53,9 +53,32 @@ function joinEventNames(names) {
 }
 const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1";
 const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,startDate,endDate,label}]}
+// v6.7: アナスロ（店全体・全機種・台番号単位の一括表貼り付け）— 個別データ
+// 入力（台データ入力）を廃止し、これに一本化。1週間（月曜始まり）で1キー
+// にまとめて保存する（雑餉隈スレッドでの検証結果：1日1キーは日数分の
+// リクエストが発生して遅い、1ヶ月1キーはFirestoreの1フィールドあたり
+// 約1MBの上限を超えることがある、週単位が両方のバランスが良かった）。
+// 別途、登録済み日付の索引キーを持たせ、必要な週のキーだけをGETする。
+const RAW_FULLTABLE_KEY_PREFIX = "slot-raw-fulltable-v1:";
+const RAW_FULLTABLE_INDEX_KEY = "slot-raw-fulltable-index-v1"; // JSON array of "YYYY-MM-DD" strings
+// Monday-anchored ISO-ish week start, as a plain "YYYY-MM-DD" string
+function weekStartOf(date) {
+  const d = new Date(`${date}T00:00:00`);
+  const day = d.getDay(); // 0=Sun..6=Sat
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diffToMonday);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+function rawFullTableWeekKey(date) {
+  return `${RAW_FULLTABLE_KEY_PREFIX}week:${weekStartOf(date)}`;
+}
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const DATALIST_ID = "slot-event-name-options";
 const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
+const FULLTABLE_MODEL_NAME_DATALIST_ID = "slot-fulltable-model-name-options";
 
 const PALETTE = [
   "#e8b34c", "#4fd1c5", "#e5697a", "#7aa2f7", "#9ece6a",
@@ -85,9 +108,28 @@ const DIGIT7_COLOR = "#f6a04d";
 //   欄が暗証番号解除なしでも編集できてしまっていたバグを修正、スマホでの
 //   はみ出し対策（flexWrap・minWidth:0）。⑦不要になった全体ランキング用の
 //   重い計算（allPagesPickList）を削除。
+// v6.7: アナスロ（店全体・全機種・台番号単位の一括表貼り付け）を新規実装
+// し、台データ入力（個別ページの表貼り付け）は廃止。
+// ・保存方式：週単位（月曜始まり）1キー＋登録済み日付の索引キー、保存時の
+//   競合状態対策（refをawait前に同期更新＋週キー単位の書き込みキュー、
+//   race_test.mjsで5並列保存でもデータが消えないことを確認済み）。
+// ・parseFullStoreTable/serializeFullStoreRows：機種名・台番号・G数・差枚・
+//   BB・RB・合成確率・BB確率・RB確率の一括表を解析。プラザ本店IIのG数は
+//   総回転数（雑餉隈の通常時回転数と違う）なので、標準の出率計算式
+//   （G数×3枚投入）でそのまま出率を算出でき、既存のclassifyMachineMark
+//   （▲〇マーク）をそのまま使える。設定判別（RB確率の理論値表）は今回
+//   実装しない。
+// ・正式名称との連携：登録・変更のたびにbackfillPageFromRawTableで過去分
+//   を自動反映（バックフィル）、手動での再取込みボタンも追加。
+// ・台データ入力の削除に伴い、各ページのグラフ・ピックアップ・台番号×
+//   日付マトリクスはpageHistories経由のまま（アナスロ保存時に自動で
+//   pageHistoriesへ反映されるので表示ロジック自体の変更は不要）。登録済み
+//   日付一覧・削除・全削除・リセットは引き続き利用可能（編集は不可に）。
+// ・共通設定の登録済み日付一覧を、民レポ・アナスロ両方の日付の和集合表示
+//   に変更（各日付ごとに「民レポ〇/未登録」「アナスロ〇/未登録」を表示）。
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.6";
+const APP_VERSION = "6.7";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -232,6 +274,83 @@ function classifyMachineMark(m) {
   if (m.shutsu >= 110) return "▲";
   if (m.shutsu >= 105) return "◯";
   return null;
+}
+
+// v6.7: アナスロ（店全体・全機種・台番号単位の一括表）の貼り付け解析。
+// 列：機種名／台番号／G数／差枚／BB／RB／合成確率／BB確率／RB確率。
+// 注意：プラザ本店II（プラザ2）のG数は「総回転数」（雑餉隈の元実装は
+// 「通常時回転数」だったため出率を計算していなかったが、プラザ2は総回転数
+// なので標準の出率計算式がそのまま正しく使える）。
+function parseFullStoreTable(text) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const rows = [];
+  for (const line of lines) {
+    if (line.startsWith("機種名") && line.includes("台番号")) continue; // header row
+    const cols = line.split("\t").map((c) => c.trim());
+    if (cols.length < 7) continue;
+    const [modelName, noStr, gsuStr, sadaStr, bbStr, rbStr, gouseiStr, bbRateStr, rbRateStr] = cols;
+    const no = parseInt(String(noStr).replace(/,/g, ""), 10);
+    if (Number.isNaN(no) || !modelName) continue;
+    const gsu = parseInt(toAsciiMinus(gsuStr).replace(/,/g, ""), 10);
+    const sada = parseInt(toAsciiMinus(sadaStr).replace(/,/g, ""), 10);
+    const bb = bbStr === "-" || bbStr === undefined ? null : parseInt(toAsciiMinus(bbStr), 10);
+    const rb = rbStr === "-" || rbStr === undefined ? null : parseInt(toAsciiMinus(rbStr), 10);
+    const gouseiMatch = gouseiStr ? gouseiStr.match(/1\s*\/\s*([\d.]+)/) : null;
+    const gousei = gouseiMatch ? parseFloat(gouseiMatch[1]) : null;
+    const validGsu = Number.isNaN(gsu) ? null : gsu;
+    const validSada = Number.isNaN(sada) ? null : sada;
+    // 出率 = (総投入枚数 + 差枚) / 総投入枚数 × 100、総投入枚数 = G数 × 3枚
+    const shutsu = validGsu && validGsu > 0 && validSada !== null ? ((validGsu * 3 + validSada) / (validGsu * 3)) * 100 : null;
+    rows.push({
+      modelName: modelName.trim(),
+      no,
+      gsu: validGsu,
+      sada: validSada,
+      shutsu,
+      bb: bb !== null && Number.isNaN(bb) ? null : bb,
+      rb: rb !== null && Number.isNaN(rb) ? null : rb,
+      gousei,
+      bbRateStr: bbRateStr ?? "-",
+      rbRateStr: rbRateStr ?? "-",
+    });
+  }
+  return rows;
+}
+
+// v6.7: inverse of parseFullStoreTable — reconstructs the pasteable
+// tab-separated text for a date already saved in rawFullTable, so picking
+// an existing date can show what's there instead of an empty box
+function serializeFullStoreRows(rows) {
+  return (rows || [])
+    .map((r) => {
+      const gousei = r.gousei === null || r.gousei === undefined ? "-" : `1/${r.gousei}`;
+      return [
+        r.modelName,
+        r.no,
+        r.gsu === null || r.gsu === undefined ? "" : r.gsu,
+        r.sada === null || r.sada === undefined ? "" : r.sada,
+        r.bb === null || r.bb === undefined ? "-" : r.bb,
+        r.rb === null || r.rb === undefined ? "-" : r.rb,
+        gousei,
+        r.bbRateStr || "-",
+        r.rbRateStr || "-",
+      ].join("\t");
+    })
+    .join("\n");
+}
+
+// v6.7: a stable fingerprint of a day's worth of アナスロ rows, used to
+// catch an accidental copy-paste of the wrong day's data. Sorted by 台番号
+// so row order in the paste doesn't matter.
+function fingerprintFullTableRows(rows) {
+  return [...(rows || [])]
+    .sort((a, b) => a.no - b.no)
+    .map((r) => `${r.no}:${r.sada}:${r.gsu}:${r.bb}:${r.rb}`)
+    .join("|");
 }
 
 // parse a store-wide summary table: 機種名(or 末尾)\t平均差枚\t平均G数\t勝率(x/y)\t出率
@@ -943,11 +1062,31 @@ export default function SlotDataTracker() {
   const [undoPanelOpen, setUndoPanelOpen] = useState(false);
 
   // ---- per-page form / view state ----
-  const [pasteText, setPasteText] = useState("");
-  const [entryDate, setEntryDate] = useState(todayStr());
+  // v6.7: 台データ入力（表貼り付け形式）を廃止（アナスロに一本化）に伴い、
+  // pasteText/entryDate は削除。以下 status/selectedMachines/range 等は
+  // 登録済み日付一覧の削除・リセット操作やグラフ表示に引き続き使うので残す
   const [status, setStatus] = useState(null);
   const [selectedMachines, setSelectedMachines] = useState([]);
   const [range, setRange] = useState(30);
+
+  // ---- アナスロ（店全体・全機種・台番号単位の一括表）----
+  const [rawFullTable, setRawFullTable] = useState({}); // { [date]: [{modelName,no,gsu,sada,shutsu,bb,rb,gousei,bbRateStr,rbRateStr}] }
+  // v6.7: kept in lockstep with rawFullTable so handleSaveFullTable can read
+  // the up-to-the-millisecond merged state even when saving several dates
+  // back-to-back faster than React re-renders — reading from the ref
+  // instead of the closed-over state is what avoids a lost-update bug
+  // where the middle date of several rapid saves disappears.
+  const rawFullTableRef = useRef({});
+  const rawFullTableWeekWriteQueueRef = useRef({}); // weekKey -> queue promise, so two saves for the same week never race
+  const rawFullTableIndexRef = useRef([]); // current known list of dates, kept in lockstep with storage
+  const rawFullTableIndexWriteQueueRef = useRef(Promise.resolve()); // single queue, since there's only one index key
+  const [rawFullTableLoaded, setRawFullTableLoaded] = useState(false);
+  const [rawFullTableStatus, setRawFullTableStatus] = useState(null);
+  const [fullTableDate, setFullTableDate] = useState(todayStr());
+  const [fullTablePasteText, setFullTablePasteText] = useState("");
+  const [fullTableStatus, setFullTableStatus] = useState(null);
+  const [fullTableDuplicateWarning, setFullTableDuplicateWarning] = useState(null); // { conflictingDate } | null
+  const [fullTableDuplicateCheckResults, setFullTableDuplicateCheckResults] = useState(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteDate, setConfirmDeleteDate] = useState(null);
   const [dateListOpen, setDateListOpen] = useState(true);
@@ -1057,6 +1196,54 @@ export default function SlotDataTracker() {
       } finally {
         setOverallSummariesLoaded(true);
       }
+      // v6.7: アナスロ — read the index first (list of dates that have
+      // data), compute which WEEK keys those dates fall into, then fetch
+      // only those weeks (far fewer requests than one per date)
+      try {
+        let knownDates = [];
+        try {
+          const idx = await storage.get(RAW_FULLTABLE_INDEX_KEY, false);
+          if (idx && idx.value) {
+            const parsed = JSON.parse(idx.value);
+            if (Array.isArray(parsed)) knownDates = parsed;
+          }
+        } catch (e) {
+          setRawFullTableStatus({ type: "error", msg: `アナスロの索引の読み込みに失敗しました：${e && e.message ? e.message : "不明なエラー"}` });
+        }
+        const next = {};
+        if (knownDates.length > 0) {
+          const weekKeys = Array.from(new Set(knownDates.map((d) => rawFullTableWeekKey(d))));
+          const results = await Promise.all(
+            weekKeys.map(async (key) => {
+              try {
+                const r = await storage.get(key, false);
+                if (!r || !r.value) return { key, ok: true, data: null };
+                return { key, ok: true, data: JSON.parse(r.value) };
+              } catch (e) {
+                return { key, ok: false };
+              }
+            })
+          );
+          const failedKeys = [];
+          results.forEach((r) => {
+            if (!r.ok) {
+              failedKeys.push(r.key);
+              return;
+            }
+            if (r.data && typeof r.data === "object") Object.assign(next, r.data);
+          });
+          if (failedKeys.length > 0) {
+            setRawFullTableStatus({ type: "error", msg: `アナスロの一部データ（${failedKeys.join(", ")}）の読み込みに失敗しました。ページを再読み込みしてみてください。` });
+          }
+        }
+        rawFullTableIndexRef.current = Object.keys(next).sort();
+        rawFullTableRef.current = next;
+        setRawFullTable(next);
+      } catch (e) {
+        setRawFullTableStatus({ type: "error", msg: `アナスロの生データ読み込み中に予期しないエラーが発生しました：${e && e.message ? e.message : "不明なエラー"}` });
+      } finally {
+        setRawFullTableLoaded(true);
+      }
       try {
         const r7 = await storage.get(UNDO_HISTORY_KEY, false);
         if (r7 && r7.value) {
@@ -1129,11 +1316,8 @@ export default function SlotDataTracker() {
   }, [pages, recommendTargetPageId]);
 
   // ---- reset ephemeral per-page UI state when switching pages ----
-  // note: event text is no longer part of this per-page form state at all —
-  // it's pulled live from the shared dateEventMap registry at save time.
   useEffect(() => {
     setSelectedMachines([]);
-    setPasteText("");
     setStatus(null);
     setConfirmDeleteDate(null);
   }, [activePageId]);
@@ -1155,6 +1339,116 @@ export default function SlotDataTracker() {
     } catch (e) {
       setStatus({ type: "error", msg: "保存中にエラーが発生しました。" });
     }
+  }, []);
+
+  // v6.7: 新しいページ登録・正式名称の設定/変更のたびに呼ばれ、アナスロに
+  // すでに貯まっている過去日について、その正式名称に一致する機種名の行を
+  // このページの pageHistories に反映する（既存エントリは上書きしない）。
+  // これで台データ入力を廃止しても、各ページのグラフ・ピックアップ・
+  // マトリクス表は今まで通り pageHistories を見るだけで動く。
+  const backfillPageFromRawTable = useCallback(
+    async (pageId, officialName) => {
+      if (!officialName) return;
+      const dates = Object.keys(rawFullTableRef.current).sort();
+      if (dates.length === 0) return;
+      const existingHistory = pageHistories[pageId] || [];
+      const byDate = new Map(existingHistory.map((h) => [h.date, h]));
+      let changed = false;
+      dates.forEach((date) => {
+        if (byDate.has(date)) return; // never overwrite an existing entry for this page
+        const rows = rawFullTableRef.current[date] || [];
+        const matched = rows.filter((r) => modelNamesMatch(r.modelName, officialName));
+        if (matched.length === 0) return;
+        const machines = matched.map((r) => ({
+          no: r.no,
+          sada: r.sada,
+          gsu: r.gsu,
+          shutsu: r.shutsu,
+          bb: r.bb,
+          rb: r.rb,
+          gousei: r.gousei,
+          bbRateStr: r.bbRateStr,
+          rbRateStr: r.rbRateStr,
+        }));
+        const autoEvent = (dateEventMap[date] || "").trim();
+        byDate.set(date, { date, event: autoEvent, machines });
+        changed = true;
+      });
+      if (!changed) return;
+      const next = Array.from(byDate.values()).sort((a, b) => (a.date < b.date ? -1 : 1));
+      await persistPageHistory(pageId, next);
+    },
+    [pageHistories, dateEventMap, persistPageHistory]
+  );
+
+  async function handleDeleteFullTableDate(date) {
+    const nextRaw = { ...rawFullTableRef.current };
+    delete nextRaw[date];
+    rawFullTableRef.current = nextRaw;
+    setRawFullTable(nextRaw);
+    const weekKey = rawFullTableWeekKey(date);
+    const previousWeekWrite = rawFullTableWeekWriteQueueRef.current[weekKey] || Promise.resolve();
+    const thisWeekWrite = previousWeekWrite.then(async () => {
+      const weekStart = weekStartOf(date);
+      const bucket = {};
+      Object.keys(rawFullTableRef.current).forEach((d) => {
+        if (weekStartOf(d) === weekStart) bucket[d] = rawFullTableRef.current[d];
+      });
+      if (Object.keys(bucket).length === 0) {
+        return storage.delete(weekKey, false);
+      }
+      return storage.set(weekKey, JSON.stringify(bucket), false);
+    });
+    rawFullTableWeekWriteQueueRef.current[weekKey] = thisWeekWrite.catch(() => null);
+    try {
+      await thisWeekWrite;
+    } catch (e) {
+      // storage write failing isn't fatal here — the in-memory state above
+      // already reflects the removal; next full reload will just re-fetch
+      // whatever's actually still in storage
+    }
+    rawFullTableIndexRef.current = rawFullTableIndexRef.current.filter((d) => d !== date);
+    try {
+      await storage.set(RAW_FULLTABLE_INDEX_KEY, JSON.stringify(rawFullTableIndexRef.current), false);
+    } catch (e) {
+      // if this fails, next load's reconciliation will self-correct
+    }
+    setConfirmDeleteOverall(null);
+  }
+
+  // clicking an already-registered date reloads it into the paste box so a
+  // typo can be fixed and re-saved; also used by the 民レポ date list so
+  // clicking a date jumps アナスロ's own panel to it too
+  const loadFullTableForDate = useCallback(
+    (date) => {
+      setFullTableDate(date);
+      const existing = rawFullTable[date];
+      if (existing && existing.length > 0) {
+        setFullTablePasteText(serializeFullStoreRows(existing));
+        setFullTableStatus({ type: "ok", msg: `${date} は登録済み（${existing.length}台分）です。編集用に読み込みました。` });
+      } else {
+        setFullTablePasteText("");
+        setFullTableStatus(null);
+      }
+    },
+    [rawFullTable]
+  );
+
+  // scans every currently-known アナスロ date against every other one and
+  // reports any pairs whose content is identical — a retroactive version of
+  // the same accidental-copy-paste check done on every new save
+  const handleCheckFullTableDuplicates = useCallback(() => {
+    const entries = Object.entries(rawFullTableRef.current);
+    const fingerprints = entries.map(([date, rows]) => [date, fingerprintFullTableRows(rows)]);
+    const pairs = [];
+    for (let i = 0; i < fingerprints.length; i++) {
+      for (let j = i + 1; j < fingerprints.length; j++) {
+        if (fingerprints[i][1] === fingerprints[j][1]) {
+          pairs.push([fingerprints[i][0], fingerprints[j][0]].sort());
+        }
+      }
+    }
+    setFullTableDuplicateCheckResults(pairs);
   }, []);
 
   const persistPageRecommends = useCallback(async (pageId, next) => {
@@ -1436,6 +1730,7 @@ export default function SlotDataTracker() {
       semiEvents,
       closedDays,
       overallSummaries,
+      rawFullTable,
       eventNames,
     };
     const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: "application/json" });
@@ -1514,6 +1809,9 @@ export default function SlotDataTracker() {
 
   function handleSetOfficialName(pageId, officialName) {
     persistPages(pages.map((p) => (p.id === pageId ? { ...p, officialName } : p)));
+    // v6.7: registering/renaming a page's 正式名称 immediately replays any
+    // already-collected アナスロ data for that model into this page
+    if (officialName) backfillPageFromRawTable(pageId, officialName);
   }
 
   function handleDeletePage(pageId) {
@@ -1596,9 +1894,116 @@ export default function SlotDataTracker() {
     return map;
   }, [currentHistory]);
 
-  const entryDateHasExisting = !!historyByDate[entryDate];
-
   const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
+
+  // v6.7: アナスロの保存本体。1週間1キーへの複数日連続保存で途中の日付が
+  // 消える競合状態対策として、①ref をawaitの前に同期更新する、②同じ週
+  // キーへの書き込みは必ずキューで順番待ちさせる、の両方を行う（雑餉隈で
+  // 実際にこれでデータを消失した事故があったための対策）。
+  const handleSaveFullTable = useCallback(async (options) => {
+    const force = options && options.force;
+    if (closedDateSet.has(fullTableDate)) {
+      setFullTableStatus({ type: "error", msg: `${fullTableDate} は店休日として登録されているため、データを保存できません。` });
+      return;
+    }
+    const rows = parseFullStoreTable(fullTablePasteText);
+    if (rows.length === 0) {
+      setFullTableStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
+      return;
+    }
+    // catch an accidental copy-paste of a DIFFERENT day's table
+    if (!force) {
+      const thisFingerprint = fingerprintFullTableRows(rows);
+      const conflictingDate = Object.entries(rawFullTableRef.current).find(
+        ([date, existingRows]) => date !== fullTableDate && fingerprintFullTableRows(existingRows) === thisFingerprint
+      );
+      if (conflictingDate) {
+        setFullTableDuplicateWarning({ conflictingDate: conflictingDate[0] });
+        return;
+      }
+    }
+    setFullTableDuplicateWarning(null);
+
+    const previousRaw = rawFullTableRef.current;
+    const nextRaw = { ...previousRaw, [fullTableDate]: rows };
+    // update SYNCHRONOUSLY, before any await — this is what lets a rapid
+    // second save (same week) see this date already merged in, regardless
+    // of whether this save's own network round-trip has finished yet.
+    // Reverted below if this save ultimately fails.
+    rawFullTableRef.current = nextRaw;
+    const weekKey = rawFullTableWeekKey(fullTableDate);
+    const previousWeekWrite = rawFullTableWeekWriteQueueRef.current[weekKey] || Promise.resolve();
+    const thisWeekWrite = previousWeekWrite.then(() => {
+      const weekStart = weekStartOf(fullTableDate);
+      const bucket = {};
+      Object.keys(rawFullTableRef.current).forEach((d) => {
+        if (weekStartOf(d) === weekStart) bucket[d] = rawFullTableRef.current[d];
+      });
+      bucket[fullTableDate] = rows; // ensure this date is in the bucket even if the ref hasn't caught up yet
+      return storage.set(weekKey, JSON.stringify(bucket), false);
+    });
+    rawFullTableWeekWriteQueueRef.current[weekKey] = thisWeekWrite.catch(() => null);
+    try {
+      const res = await thisWeekWrite;
+      if (!res) {
+        rawFullTableRef.current = previousRaw; // don't let a failed save poison a later same-week save's bucket
+        setFullTableStatus({ type: "error", msg: "生データの保存に失敗しました（storage.setがfalsyな結果を返しました）。もう一度お試しください。" });
+        return;
+      }
+    } catch (e) {
+      rawFullTableRef.current = previousRaw;
+      setFullTableStatus({ type: "error", msg: `生データの保存中にエラーが発生しました：${e && e.message ? e.message : "詳細不明"}` });
+      return;
+    }
+    setRawFullTable(nextRaw); // only reflect success in the visible UI state once the write is confirmed
+
+    // update the shared INDEX key — same lesson: chain through a single
+    // queue, and always build the written value from the current ref.
+    const previousIndexWrite = rawFullTableIndexWriteQueueRef.current;
+    const thisIndexWrite = previousIndexWrite.then(async () => {
+      if (!rawFullTableIndexRef.current.includes(fullTableDate)) {
+        rawFullTableIndexRef.current = [...rawFullTableIndexRef.current, fullTableDate].sort();
+      }
+      return storage.set(RAW_FULLTABLE_INDEX_KEY, JSON.stringify(rawFullTableIndexRef.current), false);
+    });
+    rawFullTableIndexWriteQueueRef.current = thisIndexWrite.catch(() => null);
+    const indexRes = await thisIndexWrite.catch((e) => {
+      setFullTableStatus({ type: "error", msg: `この日のデータ自体は保存できましたが、索引の更新に失敗しました：${e && e.message ? e.message : "詳細不明"}。次回起動時に自動で見つからない可能性があります。` });
+      return null;
+    });
+    if (indexRes === null) return; // date data is safely saved either way — just flag the index concern above and stop here
+
+    // fan out into every page whose 正式名称 matches a 機種名 in this paste
+    const autoEvent = (dateEventMap[fullTableDate] || "").trim();
+    let updatedPageCount = 0;
+    for (const page of pages) {
+      if (!page.officialName) continue;
+      const matched = rows.filter((r) => modelNamesMatch(r.modelName, page.officialName));
+      if (matched.length === 0) continue;
+      const machines = matched.map((r) => ({
+        no: r.no,
+        sada: r.sada,
+        gsu: r.gsu,
+        shutsu: r.shutsu,
+        bb: r.bb,
+        rb: r.rb,
+        gousei: r.gousei,
+        bbRateStr: r.bbRateStr,
+        rbRateStr: r.rbRateStr,
+      }));
+      const existingHistory = pageHistories[page.id] || [];
+      const nextHistory = [...existingHistory.filter((h) => h.date !== fullTableDate), { date: fullTableDate, event: autoEvent, machines }];
+      await persistPageHistory(page.id, nextHistory);
+      updatedPageCount += 1;
+    }
+
+    setFullTableStatus({
+      type: "ok",
+      msg: `${fullTableDate} のデータを保存しました（全${rows.length}台分、うち${updatedPageCount}ページに反映）。`,
+    });
+    setFullTablePasteText("");
+    setFullTableDate(addDays(fullTableDate, -1));
+  }, [fullTablePasteText, fullTableDate, pages, pageHistories, dateEventMap, closedDateSet, persistPageHistory]);
 
   // this PAGE's own recommend periods, for its own machines' predictions
   const recommendDateSet = useMemo(() => {
@@ -1610,29 +2015,6 @@ export default function SlotDataTracker() {
   }, [activePageRecommends]);
 
   // whichever page the 共通設定 dropdown has selected, for the registration UI
-
-  // warn if the date being entered was already registered as a closed (店休日) day
-  const entryDateIsClosed = closedDateSet.has(entryDate);
-
-  // warn if there's a gap between the last recorded date (for this page) and
-  // the date being entered, with days in between that are neither recorded
-  // nor registered as closed
-  const dateGapWarning = useMemo(() => {
-    if (!entryDate || sortedHistory.length === 0) return null;
-    const priorDates = sortedHistory.map((h) => h.date).filter((d) => d < entryDate);
-    if (priorDates.length === 0) return null;
-    const lastDate = priorDates[priorDates.length - 1];
-    const missing = [];
-    let cursor = addDays(lastDate, 1);
-    let guard = 0;
-    while (cursor < entryDate && guard < 400) {
-      if (!historyByDate[cursor] && !closedDateSet.has(cursor)) missing.push(cursor);
-      cursor = addDays(cursor, 1);
-      guard += 1;
-    }
-    if (missing.length === 0) return null;
-    return { lastDate, missing };
-  }, [entryDate, sortedHistory, historyByDate, closedDateSet]);
 
   // merge in closed days (within the recorded date range) so they appear on the axis
   const timelineDates = useMemo(() => {
@@ -2295,6 +2677,12 @@ export default function SlotDataTracker() {
     [overallSummaries]
   );
 
+  // v6.7: アナスロに登場した機種名の一覧（正式名称欄のオートコンプリート用）
+  const allKnownModelNamesFromFullTable = useMemo(
+    () => Array.from(new Set(Object.values(rawFullTable).flatMap((rows) => rows.map((r) => r.modelName)))).sort(),
+    [rawFullTable]
+  );
+
   // actual realized performance for each registered おすすめ機種期間 (machine
   // name based, 全体データ用) — pools every 機種別サマリー day within range
   // for that specific model name
@@ -2587,62 +2975,9 @@ export default function SlotDataTracker() {
     return results.slice(0, 20);
   }, [allMachineNumbers, sortedHistory]);
 
-  function handleSave() {
-    if (!activePageId) return;
-    if (closedDateSet.has(entryDate)) {
-      setStatus({ type: "error", msg: `${entryDate} は店休日として登録されているため、データを保存できません。` });
-      return;
-    }
-    const parsedMachines = parseTable(pasteText);
-    if (parsedMachines.length === 0) {
-      setStatus({ type: "error", msg: "データを読み取れませんでした。表をそのまま貼り付けてください。" });
-      return;
-    }
-    if (!entryDate) {
-      setStatus({ type: "error", msg: "日付を入力してください。" });
-      return;
-    }
-    // event text is no longer typed here — it's pulled automatically from
-    // the shared date→event registry (managed in the "イベント登録" panel),
-    // so every page always stays in sync with zero extra steps
-    const autoEvent = (dateEventMap[entryDate] || "").trim();
-    const next = [
-      ...currentHistory.filter((h) => h.date !== entryDate),
-      { date: entryDate, event: autoEvent, machines: parsedMachines },
-    ];
-    persistPageHistory(activePageId, next);
-    setStatus({
-      type: "ok",
-      msg: `${entryDate} のデータを保存しました（${parsedMachines.length}台分）。`,
-    });
-    setPasteText("");
-    setEntryDate(addDays(entryDate, -1));
-  }
-
   function handleDeleteDate(date) {
     persistPageHistory(activePageId, currentHistory.filter((h) => h.date !== date));
     setConfirmDeleteDate(null);
-  }
-
-  // reload an already-saved day's data into the form so a typo can be fixed and re-saved
-  function handleEditDate(h) {
-    const header = "台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率";
-    const rows = h.machines.map((m) =>
-      [
-        m.no,
-        m.sada === null ? "" : m.sada,
-        m.gsu === null ? "" : m.gsu,
-        (m.shutsu === null ? "" : m.shutsu.toFixed(1)) + "%",
-        m.bb === null ? "-" : m.bb,
-        m.rb === null ? "-" : m.rb,
-        m.gousei === null ? "-" : "1/" + m.gousei,
-        m.bbRateStr || "-",
-        m.rbRateStr || "-",
-      ].join("\t")
-    );
-    setPasteText([header, ...rows].join("\n"));
-    setEntryDate(h.date);
-    setStatus({ type: "ok", msg: `${h.date} のデータを編集用に読み込みました。修正して保存すると上書きされます。` });
   }
 
   function handleResetAll() {
@@ -3469,10 +3804,111 @@ export default function SlotDataTracker() {
               </div>
             )}
 
+            <div style={{ marginTop: "20px", borderTop: "1px solid #2a323f", paddingTop: "14px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+                🗂 アナスロ
+              </div>
+              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+                機種名・台番号・G数・差枚・BB・RB・合成確率・BB確率・RB確率の一覧表を、店全体分まとめて貼り付けます。正式名称が一致するページ全部に自動反映されます（機種ごとの個別入力は廃止しました）。出率（☆◎◯▲マーク）は差枚とG数から自動で計算されます。
+              </div>
+              <div style={{ marginBottom: "10px" }}>
+                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
+                <input
+                  type="date"
+                  value={fullTableDate}
+                  onChange={(e) => loadFullTableForDate(e.target.value)}
+                  style={{
+                    display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
+                  }}
+                />
+                <div style={{ marginTop: "4px", fontSize: "11px", color: rawFullTable[fullTableDate] ? "#9ece6a" : "#5a6272" }}>
+                  {rawFullTable[fullTableDate] ? `この日は登録済み（${rawFullTable[fullTableDate].length}台分）` : "この日はまだ未登録です"}
+                </div>
+              </div>
+              <textarea
+                className="mono scrollbar"
+                value={fullTablePasteText}
+                onChange={(e) => setFullTablePasteText(e.target.value)}
+                placeholder={"機種名\t台番号\tG数\t差枚\tBB\tRB\t合成確率\tBB確率\tRB確率\nモンキーターンV\t185\t4,318\t169\t40\t15\t1/78.5\t1/108.0\t1/287.9\n..."}
+                rows={10}
+                style={{
+                  width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
+                  padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
+                  boxSizing: "border-box", marginBottom: "10px",
+                }}
+              />
+              <button
+                onClick={() => handleSaveFullTable()}
+                style={{
+                  width: "100%", background: "#4fd1c5", color: "#0b1f1c", border: "none", borderRadius: "8px",
+                  padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                }}
+              >
+                この日の一括データを保存
+              </button>
+              {fullTableDuplicateWarning && (
+                <div style={{
+                  marginTop: "8px", padding: "10px", borderRadius: "6px", fontSize: "12px",
+                  background: "#2a1418", border: "1px solid #7a3038", color: "#e5697a",
+                }}>
+                  ⚠ この内容は {fullTableDuplicateWarning.conflictingDate} と完全に同じデータです。日付を間違えて同じ表を貼り付けていませんか？
+                  <div style={{ marginTop: "8px", display: "flex", gap: "8px" }}>
+                    <button
+                      onClick={() => handleSaveFullTable({ force: true })}
+                      style={{ fontSize: "11px", background: "none", border: "1px solid #7a3038", borderRadius: "6px", color: "#e5697a", padding: "5px 8px", cursor: "pointer" }}
+                    >
+                      同じで間違いない・無視して保存
+                    </button>
+                    <button
+                      onClick={() => setFullTableDuplicateWarning(null)}
+                      style={{ fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "5px 8px", cursor: "pointer" }}
+                    >
+                      取消（貼り直す）
+                    </button>
+                  </div>
+                </div>
+              )}
+              {fullTableStatus && (
+                <div style={{ marginTop: "8px", fontSize: "11px", color: fullTableStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                  {fullTableStatus.msg}
+                </div>
+              )}
+              <div style={{ marginTop: "10px" }}>
+                <button
+                  onClick={handleCheckFullTableDuplicates}
+                  style={{ fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "6px 10px", cursor: "pointer" }}
+                >
+                  🔍 登録済み日付を重複チェック
+                </button>
+                {fullTableDuplicateCheckResults && (
+                  <div style={{ marginTop: "8px", fontSize: "11px" }}>
+                    {fullTableDuplicateCheckResults.length === 0 ? (
+                      <span style={{ color: "#9ece6a" }}>重複は見つかりませんでした。</span>
+                    ) : (
+                      <div style={{ color: "#e5697a" }}>
+                        {fullTableDuplicateCheckResults.length}件の重複ペアが見つかりました：
+                        <ul style={{ margin: "4px 0 0", paddingLeft: "18px" }}>
+                          {fullTableDuplicateCheckResults.map(([a, b]) => (
+                            <li key={`${a}-${b}`}>{a} ⇔ {b}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+              {rawFullTableStatus && (
+                <div style={{ marginTop: "8px", fontSize: "11px", color: rawFullTableStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                  {rawFullTableStatus.msg}
+                </div>
+              )}
+            </div>
+
             <div style={{ marginTop: "16px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
                 <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4" }}>
-                  登録済みの日付（{overallSummaries.length}件）
+                  登録済みの日付（{new Set([...overallSummaries.map((s) => s.date), ...Object.keys(rawFullTable)]).size}件）
                 </div>
                 {overallSummaries.length > 0 && (
                   confirmDeleteAllOverall ? (
@@ -3488,29 +3924,38 @@ export default function SlotDataTracker() {
                   ) : (
                     <button onClick={() => setConfirmDeleteAllOverall(true)} style={{ fontSize: "11px", color: "#5a6272", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px" }}>
                       <Trash2 size={11} />
-                      全部削除
+                      民レポを全部削除
                     </button>
                   )
                 )}
               </div>
-              <div className="scrollbar" style={{ maxHeight: "180px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
-                {!overallSummariesLoaded && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
-                {overallSummariesLoaded && overallSortedSummaries.length === 0 && (
+              <div className="scrollbar" style={{ maxHeight: "220px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+                {(!overallSummariesLoaded || !rawFullTableLoaded) && <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>}
+                {overallSummariesLoaded && rawFullTableLoaded && overallSortedSummaries.length === 0 && Object.keys(rawFullTable).length === 0 && (
                   <div style={{ fontSize: "12px", color: "#5a6272" }}>まだデータがありません。</div>
                 )}
-                {[...overallSortedSummaries].reverse().map((s) => (
+                {(() => {
+                  const overallByDate = {};
+                  overallSortedSummaries.forEach((s) => { overallByDate[s.date] = s; });
+                  // v6.7: 民レポ・アナスロ両方の日付の和集合 — 片方しか登録
+                  // されていない日も一覧に出す
+                  const allDates = Array.from(new Set([...overallSortedSummaries.map((s) => s.date), ...Object.keys(rawFullTable)])).sort();
+                  return [...allDates].reverse().map((date) => {
+                    const s = overallByDate[date] || null;
+                    const hasFullTable = !!rawFullTable[date];
+                    return (
                   <div
-                    key={s.date}
-                    onClick={() => handleEditOverall(s)}
+                    key={date}
+                    onClick={() => (s ? handleEditOverall(s) : (setOverallDate(date), setOverallPasteText(""), setOverallStatus(null), loadFullTableForDate(date)))}
                     title="クリックでこの日のデータを編集"
                     style={{
-                    display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
-                    background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
-                    cursor: "pointer",
-                  }}>
+                      display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                      background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px",
+                      cursor: "pointer",
+                    }}>
                     <div>
-                      <span className="mono">{s.date}</span>
-                      {s.event && (() => {
+                      <span className="mono">{date}</span>
+                      {s && s.event && (() => {
                         const names = splitEventNames(s.event);
                         const isStrong = names.some((n) => strongEventColorByName[n]);
                         const isSemi = !isStrong && names.some((n) => semiEventColorByName[n]);
@@ -3537,20 +3982,35 @@ export default function SlotDataTracker() {
                           </span>
                         );
                       })()}
-                      <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>
+                      {s && <span style={{ marginLeft: "6px", color: "#5a6272" }}>機種{s.modelRows.length}・末尾{s.digitRows.length}</span>}
+                      <span style={{ marginLeft: "6px", color: s ? "#9ece6a" : "#e5697a" }}>
+                        民レポ{s ? "〇" : "未登録"}
+                      </span>
+                      <span style={{ marginLeft: "6px", color: hasFullTable ? "#9ece6a" : "#e5697a" }}>
+                        アナスロ{hasFullTable ? "〇" : "未登録"}
+                      </span>
                     </div>
-                    {confirmDeleteOverall === s.date ? (
-                      <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
-                        <button onClick={() => handleDeleteOverall(s.date)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}>削除する</button>
-                        <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
-                      </div>
-                    ) : (
-                      <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteOverall(s.date); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
-                        <Trash2 size={13} />
-                      </button>
-                    )}
+                    {s || hasFullTable ? (
+                      confirmDeleteOverall === date ? (
+                        <div style={{ display: "flex", gap: "6px" }} onClick={(e) => e.stopPropagation()}>
+                          <button
+                            onClick={() => (s ? handleDeleteOverall(date) : handleDeleteFullTableDate(date))}
+                            style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer" }}
+                          >
+                            削除する
+                          </button>
+                          <button onClick={() => setConfirmDeleteOverall(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>取消</button>
+                        </div>
+                      ) : (
+                        <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteOverall(date); }} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                          <Trash2 size={13} />
+                        </button>
+                      )
+                    ) : null}
                   </div>
-                ))}
+                    );
+                  });
+                })()}
               </div>
             </div>
           </div>
@@ -4490,10 +4950,10 @@ export default function SlotDataTracker() {
         />
       </div>
       <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（全体データと連携・任意）：</span>
+        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（アナスロ・全体データと連携・任意）：</span>
         <input
           type="text"
-          list={MODEL_NAME_DATALIST_ID}
+          list={FULLTABLE_MODEL_NAME_DATALIST_ID}
           value={currentPage ? currentPage.officialName || "" : ""}
           onChange={(e) => handleSetOfficialName(activePageId, e.target.value)}
           placeholder="例：Lパチスロからくりサーカス2"
@@ -4512,6 +4972,19 @@ export default function SlotDataTracker() {
             cursor: unlocked ? "text" : "not-allowed",
           }}
         />
+        <button
+          onClick={() => currentPage && currentPage.officialName && backfillPageFromRawTable(activePageId, currentPage.officialName)}
+          disabled={!unlocked || !currentPage || !currentPage.officialName}
+          title={unlocked ? "アナスロに貯まっている過去分を、今の正式名称でもう一度取り込み直す（読み込みタイミングの問題などで最初に取り込めなかった場合用）" : "暗証番号を解除すると使えます"}
+          style={{
+            fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px",
+            color: unlocked && currentPage && currentPage.officialName ? "#8b93a3" : "#3a3f4a",
+            padding: "5px 8px", cursor: unlocked && currentPage && currentPage.officialName ? "pointer" : "not-allowed",
+            whiteSpace: "nowrap", flexShrink: 0,
+          }}
+        >
+          アナスロを再取込み
+        </button>
       </div>
 
       <div
@@ -4528,86 +5001,16 @@ export default function SlotDataTracker() {
           {unlocked ? (
           <>
           <div className="card" style={{ padding: "18px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "12px", color: "#c7cbd4" }}>
-              データ入力
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "8px", color: "#c7cbd4" }}>
+              このページのデータ
             </div>
-
-            <div style={{ display: "flex", gap: "10px", marginBottom: "10px" }}>
-              <div style={{ flex: 1 }}>
-                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
-                <input
-                  type="date"
-                  value={entryDate}
-                  onChange={(e) => setEntryDate(e.target.value)}
-                  style={{
-                    width: "100%", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
-                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", boxSizing: "border-box",
-                  }}
-                />
-              </div>
+            {/* v6.7: 台データ入力（表貼り付け形式）は廃止。今後はアナスロ
+                （共通設定タブ）に一括で貼り付けると、正式名称が一致する
+                ページへ自動反映される。ここには蓄積された過去データの
+                一覧・削除・全削除のみ残す。 */}
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              データの入力は「🔧 共通設定」タブのアナスロから行います。正式名称が一致すると、ここには自動で反映されます。
             </div>
-            {entryDateHasExisting && (
-              <div style={{ fontSize: "11px", color: "#e8b34c", marginBottom: "8px", marginTop: "-4px" }}>
-                この日付はすでにデータがあります。保存すると上書きされます。
-              </div>
-            )}
-            {entryDateIsClosed && (
-              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
-                ⚠ この日付は店休日として登録されているため、データは保存できません。
-              </div>
-            )}
-            {dateGapWarning && (
-              <div style={{ fontSize: "11px", color: "#e5697a", marginBottom: "8px" }}>
-                ⚠ 前回の記録（{dateGapWarning.lastDate}）からこの日付までに、{dateGapWarning.missing.length}日分データがありません（
-                {dateGapWarning.missing.join("、")}）。店休日であれば登録しておくとこの警告は出なくなります。
-              </div>
-            )}
-
-            {dateEventMap[entryDate] && (
-              <div style={{
-                fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
-                background: "rgba(232,179,76,0.08)", border: "1px solid #2a323f", borderRadius: "6px",
-                display: "flex", alignItems: "center", gap: "6px",
-              }}>
-                <Flag size={12} />
-                この日のイベント：{dateEventMap[entryDate]}（「📅 イベント登録」で変更できます）
-              </div>
-            )}
-
-            <div style={{ marginBottom: "10px" }}>
-              <label style={{ fontSize: "11px", color: "#8b93a3" }}>
-                表を貼り付け（台番／差枚／G数／出率／BB／RB／合成／BB率／RB率）
-              </label>
-              <textarea
-                className="mono scrollbar"
-                value={pasteText}
-                onChange={(e) => setPasteText(e.target.value)}
-                placeholder={"台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n351\t1,581\t6,432\t108.2%\t0\t16\t1/402\t-\t1/402"}
-                rows={10}
-                style={{
-                  width: "100%", marginTop: "4px", background: "#0e1218", border: "1px solid #2a323f",
-                  borderRadius: "6px", padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5,
-                  resize: "vertical", boxSizing: "border-box",
-                }}
-              />
-            </div>
-
-            <button
-              onClick={handleSave}
-              disabled={entryDateIsClosed}
-              style={{
-                width: "100%",
-                background: entryDateIsClosed ? "#3a3f4a" : "#e8b34c",
-                color: entryDateIsClosed ? "#8b93a3" : "#1b1508",
-                border: "none", borderRadius: "8px",
-                padding: "10px", fontWeight: 700, fontSize: "13px",
-                cursor: entryDateIsClosed ? "not-allowed" : "pointer",
-                display: "flex", alignItems: "center", justifyContent: "center", gap: "6px",
-              }}
-            >
-              <Save size={15} />
-              {entryDateIsClosed ? "店休日のため保存できません" : "この日のデータを保存"}
-            </button>
 
             {status && (
               <div style={{
@@ -4671,9 +5074,6 @@ export default function SlotDataTracker() {
                       </div>
                     ) : (
                       <div style={{ display: "flex", gap: "10px" }}>
-                        <button onClick={() => handleEditDate(h)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この日のデータを編集">
-                          <Pencil size={13} />
-                        </button>
                         <button onClick={() => setConfirmDeleteDate(h.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この日のデータを削除">
                           <Trash2 size={13} />
                         </button>
@@ -5189,6 +5589,11 @@ export default function SlotDataTracker() {
           tabs (共通設定, 機種ページ) reference this same datalist by id */}
       <datalist id={MODEL_NAME_DATALIST_ID}>
         {allKnownModelNames.map((n) => (
+          <option value={n} key={n} />
+        ))}
+      </datalist>
+      <datalist id={FULLTABLE_MODEL_NAME_DATALIST_ID}>
+        {allKnownModelNamesFromFullTable.map((n) => (
           <option value={n} key={n} />
         ))}
       </datalist>
