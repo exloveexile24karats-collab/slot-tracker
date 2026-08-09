@@ -25,6 +25,7 @@ import {
   ChevronDown,
   ChevronRight,
   Lock,
+  X,
 } from "lucide-react";
 import { storage } from "./storage";
 
@@ -152,7 +153,12 @@ const DIGIT7_COLOR = "#f6a04d";
 //   を付加（machineLabel関数）：グラフ凡例・台選択チップ・ピックアップ
 //   カード・台番号×日付マトリクスの行ラベルが、複数機種ページでは
 //   「サンダーV 101番」のように機種名付きで表示される。
-const APP_VERSION = "6.8";
+// v6.8.1: 正式名称欄を「、」区切りの1本のテキスト欄から、1つずつ追加する
+// チップ入力に変更。テキスト欄の中身を直接「サンダーV、アレックスV」の
+// ように複合文字列で編集させると、2個目以降を入力中の文字列がdatalistの
+// どの候補とも一致せず、ブラウザの補完が効かなくなっていた問題の対策
+// （入力欄は常に機種名1個だけを打つ形になるので、補完が正しく効く）。
+const APP_VERSION = "6.8.1";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1090,6 +1096,7 @@ export default function SlotDataTracker() {
   // 登録済み日付一覧の削除・リセット操作やグラフ表示に引き続き使うので残す
   const [status, setStatus] = useState(null);
   const [selectedMachines, setSelectedMachines] = useState([]);
+  const [officialNameInput, setOfficialNameInput] = useState(""); // v6.8.1: text currently being typed to add a new bundled 機種名
   const [range, setRange] = useState(30);
 
   // ---- アナスロ（店全体・全機種・台番号単位の一括表）----
@@ -1343,6 +1350,7 @@ export default function SlotDataTracker() {
     setSelectedMachines([]);
     setStatus(null);
     setConfirmDeleteDate(null);
+    setOfficialNameInput("");
   }, [activePageId]);
 
   const persistPages = useCallback(async (next) => {
@@ -1838,6 +1846,28 @@ export default function SlotDataTracker() {
     // v6.7: registering/renaming a page's 正式名称 immediately replays any
     // already-collected アナスロ data for that model into this page
     if (officialName) backfillPageFromRawTable(pageId, officialName);
+  }
+
+  // v6.8.1: 正式名称欄を「1つずつ追加するチップ入力」に変更（1回の入力が
+  // 常に機種名1個だけになるので、ブラウザのdatalist補完がそのまま効く。
+  // 「、」区切りのテキストを直接編集させると、2個目以降を入力中の文字列が
+  // 「サンダーV、アレ」のような複合文字列になり、候補と一致しなくなって
+  // 補完が効かなくなっていた問題の対策）
+  function addOfficialNameToPage(pageId, nameToAdd) {
+    const page = pages.find((p) => p.id === pageId);
+    if (!page) return;
+    const trimmed = (nameToAdd || "").trim();
+    if (!trimmed) return;
+    const current = splitModelNameList(page.officialName || "");
+    if (current.some((n) => modelNamesMatch(n, trimmed))) return; // already there
+    handleSetOfficialName(pageId, joinEventNames([...current, trimmed]));
+  }
+  function removeOfficialNameFromPage(pageId, nameToRemove) {
+    const page = pages.find((p) => p.id === pageId);
+    if (!page) return;
+    const current = splitModelNameList(page.officialName || "");
+    const next = current.filter((n) => n !== nameToRemove);
+    handleSetOfficialName(pageId, joinEventNames(next));
   }
 
   function handleDeletePage(pageId) {
@@ -5004,42 +5034,92 @@ export default function SlotDataTracker() {
           }}
         />
       </div>
-      <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（アナスロ・全体データと連携・任意・複数機種は「、」区切り）：</span>
-        <input
-          type="text"
-          list={FULLTABLE_MODEL_NAME_DATALIST_ID}
-          value={currentPage ? currentPage.officialName || "" : ""}
-          onChange={(e) => handleSetOfficialName(activePageId, e.target.value)}
-          placeholder="例：Lパチスロからくりサーカス2　複数機種なら：サンダーV、アレックスV、クレアA"
-          disabled={!unlocked}
-          style={{
-            fontSize: "12px",
-            background: unlocked ? "#12161d" : "#0d1015",
-            border: "1px solid #2a323f",
-            borderRadius: "6px",
-            color: unlocked ? "#e7e9ee" : "#5a6272",
-            padding: "5px 8px",
-            flex: "1 1 200px",
-            minWidth: 0,
-            maxWidth: "100%",
-            boxSizing: "border-box",
-            cursor: unlocked ? "text" : "not-allowed",
-          }}
-        />
-        <button
-          onClick={() => currentPage && currentPage.officialName && backfillPageFromRawTable(activePageId, currentPage.officialName)}
-          disabled={!unlocked || !currentPage || !currentPage.officialName}
-          title={unlocked ? "アナスロに貯まっている過去分を、今の正式名称でもう一度取り込み直す（読み込みタイミングの問題などで最初に取り込めなかった場合用）" : "暗証番号を解除すると使えます"}
-          style={{
-            fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px",
-            color: unlocked && currentPage && currentPage.officialName ? "#8b93a3" : "#3a3f4a",
-            padding: "5px 8px", cursor: unlocked && currentPage && currentPage.officialName ? "pointer" : "not-allowed",
-            whiteSpace: "nowrap", flexShrink: 0,
-          }}
-        >
-          アナスロを再取込み
-        </button>
+      <div style={{ marginBottom: "18px" }}>
+        <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "6px" }}>
+          正式名称（アナスロ・全体データと連携・任意・複数機種を束ねる場合は1つずつ追加）：
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
+          {splitModelNameList(currentPage ? currentPage.officialName || "" : "").map((name) => (
+            <span
+              key={name}
+              className="mono"
+              style={{
+                display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "12px",
+                background: "rgba(122,162,247,0.12)", border: "1px solid #2a323f", borderRadius: "999px",
+                padding: "3px 6px 3px 10px", color: "#c7cbd4",
+              }}
+            >
+              {name}
+              {unlocked && (
+                <button
+                  onClick={() => removeOfficialNameFromPage(activePageId, name)}
+                  title={`「${name}」を外す`}
+                  style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272", display: "flex", padding: 0 }}
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </span>
+          ))}
+          {splitModelNameList(currentPage ? currentPage.officialName || "" : "").length === 0 && (
+            <span style={{ fontSize: "11px", color: "#5a6272" }}>未設定です。下の欄から機種名を追加してください。</span>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+          <input
+            type="text"
+            list={FULLTABLE_MODEL_NAME_DATALIST_ID}
+            value={officialNameInput}
+            onChange={(e) => setOfficialNameInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addOfficialNameToPage(activePageId, officialNameInput);
+                setOfficialNameInput("");
+              }
+            }}
+            placeholder="機種名を入力してEnter（例：サンダーV）"
+            disabled={!unlocked}
+            style={{
+              fontSize: "12px",
+              background: unlocked ? "#12161d" : "#0d1015",
+              border: "1px solid #2a323f",
+              borderRadius: "6px",
+              color: unlocked ? "#e7e9ee" : "#5a6272",
+              padding: "5px 8px",
+              flex: "1 1 200px",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              cursor: unlocked ? "text" : "not-allowed",
+            }}
+          />
+          <button
+            onClick={() => { addOfficialNameToPage(activePageId, officialNameInput); setOfficialNameInput(""); }}
+            disabled={!unlocked || !officialNameInput.trim()}
+            style={{
+              fontSize: "12px", background: "none", border: "1px solid #2a323f", borderRadius: "6px",
+              color: unlocked && officialNameInput.trim() ? "#8b93a3" : "#3a3f4a",
+              padding: "5px 10px", cursor: unlocked && officialNameInput.trim() ? "pointer" : "not-allowed",
+              whiteSpace: "nowrap", flexShrink: 0,
+            }}
+          >
+            追加
+          </button>
+          <button
+            onClick={() => currentPage && currentPage.officialName && backfillPageFromRawTable(activePageId, currentPage.officialName)}
+            disabled={!unlocked || !currentPage || !currentPage.officialName}
+            title={unlocked ? "アナスロに貯まっている過去分を、今の正式名称でもう一度取り込み直す（読み込みタイミングの問題などで最初に取り込めなかった場合用）" : "暗証番号を解除すると使えます"}
+            style={{
+              fontSize: "11px", background: "none", border: "1px solid #2a323f", borderRadius: "6px",
+              color: unlocked && currentPage && currentPage.officialName ? "#8b93a3" : "#3a3f4a",
+              padding: "5px 8px", cursor: unlocked && currentPage && currentPage.officialName ? "pointer" : "not-allowed",
+              whiteSpace: "nowrap", flexShrink: 0,
+            }}
+          >
+            アナスロを再取込み
+          </button>
+        </div>
       </div>
 
       <div
