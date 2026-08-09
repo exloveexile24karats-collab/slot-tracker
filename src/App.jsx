@@ -51,6 +51,14 @@ function splitEventNames(compositeStr) {
 function joinEventNames(names) {
   return names.filter(Boolean).join(EVENT_DELIMITER);
 }
+// v6.8: page.officialName は今まで通り1つの文字列のまま保存するが、
+// イベント名と同じ「、」区切りで複数の機種名を束ねられるようにする
+// （例：「サンダーV、アレックスV、クレアA」を1ページで一括管理する
+// 「理由Aタイプ」ページ向け）。既存の単一機種ページ（区切り文字なし）は
+// 無改修でそのまま動く。
+function splitModelNameList(officialName) {
+  return splitEventNames(officialName); // same delimiter/behavior, reused as-is
+}
 const OVERALL_SUMMARY_KEY = "slot-overall-summary-v1";
 const OVERALL_RECOMMEND_KEY = "slot-overall-recommend-v1"; // {modelName: [{id,startDate,endDate,label}]}
 // v6.7: アナスロ（店全体・全機種・台番号単位の一括表貼り付け）— 個別データ
@@ -129,7 +137,22 @@ const DIGIT7_COLOR = "#f6a04d";
 //   に変更（各日付ごとに「民レポ〇/未登録」「アナスロ〇/未登録」を表示）。
 // bump this on every change shipped, so the person can glance at the header
 // and confirm whether a deploy actually took effect
-const APP_VERSION = "6.7";
+// v6.8: 1ページで複数機種を束ねられるように（「理由Aタイプ」ページ向け：
+// サンダー・アレックス・クレア等の単独設置機種をまとめて1ページで管理）。
+// ・page.officialNameは今まで通り1つの文字列のまま保存し、イベント名と
+//   同じ「、」区切りで複数機種名を指定できるようにした
+//   （splitModelNameList、EVENT_DELIMITERを再利用）。区切り文字が無い
+//   既存の単一機種ページは無改修でそのまま動く。
+// ・アナスロ保存時の各ページへの反映（backfillPageFromRawTable・
+//   handleSaveFullTableのファンアウト）、おすすめ機種期間の連携
+//   （activePageRecommends）を、束ねた機種名のどれかに一致すれば反映する
+//   ように変更。
+// ・台番号はホール内で機種をまたいで一意なので、ピックアップ・チャート・
+//   マトリクス表の「no」ベースの既存ロジックは変更不要。表示面だけ機種名
+//   を付加（machineLabel関数）：グラフ凡例・台選択チップ・ピックアップ
+//   カード・台番号×日付マトリクスの行ラベルが、複数機種ページでは
+//   「サンダーV 101番」のように機種名付きで表示される。
+const APP_VERSION = "6.8";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1349,6 +1372,8 @@ export default function SlotDataTracker() {
   const backfillPageFromRawTable = useCallback(
     async (pageId, officialName) => {
       if (!officialName) return;
+      const nameList = splitModelNameList(officialName); // v6.8: supports "サンダーV、アレックスV、..." bundles
+      if (nameList.length === 0) return;
       const dates = Object.keys(rawFullTableRef.current).sort();
       if (dates.length === 0) return;
       const existingHistory = pageHistories[pageId] || [];
@@ -1357,10 +1382,11 @@ export default function SlotDataTracker() {
       dates.forEach((date) => {
         if (byDate.has(date)) return; // never overwrite an existing entry for this page
         const rows = rawFullTableRef.current[date] || [];
-        const matched = rows.filter((r) => modelNamesMatch(r.modelName, officialName));
+        const matched = rows.filter((r) => nameList.some((n) => modelNamesMatch(r.modelName, n)));
         if (matched.length === 0) return;
         const machines = matched.map((r) => ({
           no: r.no,
+          modelName: r.modelName, // v6.8: kept so multi-機種ページ can show which model each 台番号 belongs to
           sada: r.sada,
           gsu: r.gsu,
           shutsu: r.shutsu,
@@ -1836,10 +1862,16 @@ export default function SlotDataTracker() {
     // slightly different表記（全角/半角・波ダッシュ・接頭辞違いなど）—
     // match by normalized name instead so registration doesn't silently
     // fail to link just because of a notation difference.
+    // v6.8: officialName can now be a "、"区切り bundle of several model
+    // names（理由Aタイプページ）— pool every matching model's periods.
     let linked = [];
     if (officialName) {
-      const matchedKey = Object.keys(overallRecommends).find((name) => modelNamesMatch(name, officialName));
-      linked = matchedKey ? overallRecommends[matchedKey] || [] : [];
+      const nameList = splitModelNameList(officialName);
+      Object.keys(overallRecommends).forEach((name) => {
+        if (nameList.some((n) => modelNamesMatch(name, n))) {
+          linked = linked.concat(overallRecommends[name] || []);
+        }
+      });
     }
     return linked.length > 0 ? [...own, ...linked] : own;
   }, [pageRecommends, activePageId, currentPage, overallRecommends]);
@@ -1885,6 +1917,27 @@ export default function SlotDataTracker() {
     () => [...currentHistory].sort((a, b) => a.date.localeCompare(b.date)),
     [currentHistory]
   );
+
+  // v6.8: 台番号 -> 機種名（このページが複数機種を束ねている「理由Aタイプ」
+  // ページの場合、台番号だけでは機種がわからないので表示に使う。最新の
+  // 記録を優先。ホール内の台番号は機種をまたいで一意なので、"no"だけを
+  // キーにしたピックアップ・チャート・マトリクスの既存ロジックは変更不要。
+  const noToModelName = useMemo(() => {
+    const map = {};
+    sortedHistory.forEach((h) => {
+      h.machines.forEach((m) => {
+        if (m.modelName) map[m.no] = m.modelName;
+      });
+    });
+    return map;
+  }, [sortedHistory]);
+  const isMultiModelPage = useMemo(
+    () => !!(currentPage && splitModelNameList(currentPage.officialName || "").length > 1),
+    [currentPage]
+  );
+  function machineLabel(no) {
+    return isMultiModelPage && noToModelName[no] ? `${noToModelName[no]} ${no}番` : `${no}番`;
+  }
 
   const historyByDate = useMemo(() => {
     const map = {};
@@ -1978,10 +2031,12 @@ export default function SlotDataTracker() {
     let updatedPageCount = 0;
     for (const page of pages) {
       if (!page.officialName) continue;
-      const matched = rows.filter((r) => modelNamesMatch(r.modelName, page.officialName));
+      const nameList = splitModelNameList(page.officialName);
+      const matched = rows.filter((r) => nameList.some((n) => modelNamesMatch(r.modelName, n)));
       if (matched.length === 0) continue;
       const machines = matched.map((r) => ({
         no: r.no,
+        modelName: r.modelName,
         sada: r.sada,
         gsu: r.gsu,
         shutsu: r.shutsu,
@@ -4950,13 +5005,13 @@ export default function SlotDataTracker() {
         />
       </div>
       <div style={{ marginBottom: "18px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（アナスロ・全体データと連携・任意）：</span>
+        <span style={{ fontSize: "11px", color: "#5a6272", flexShrink: 0 }}>正式名称（アナスロ・全体データと連携・任意・複数機種は「、」区切り）：</span>
         <input
           type="text"
           list={FULLTABLE_MODEL_NAME_DATALIST_ID}
           value={currentPage ? currentPage.officialName || "" : ""}
           onChange={(e) => handleSetOfficialName(activePageId, e.target.value)}
-          placeholder="例：Lパチスロからくりサーカス2"
+          placeholder="例：Lパチスロからくりサーカス2　複数機種なら：サンダーV、アレックスV、クレアA"
           disabled={!unlocked}
           style={{
             fontSize: "12px",
@@ -5120,7 +5175,7 @@ export default function SlotDataTracker() {
               このページの台番号ごとに、日付ごとの出率ベースの簡易マーク（▲＝出率110%以上・◯＝出率105%以上）を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
             </div>
             {renderEventMultiSelect(pageGridEventFilter, setPageGridEventFilter)}
-            {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => `${no}番`)}
+            {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => machineLabel(no))}
           </div>
         </div>
 
@@ -5225,7 +5280,7 @@ export default function SlotDataTracker() {
                       label={{ value: "☆", position: "top", fill: EVENT_STAR_COLOR, fontSize: 11 }} />
                   ))}
                   {selectedMachines.map((no, i) => (
-                    <Line key={no} type="monotone" dataKey={String(no)} name={`${no}番`}
+                    <Line key={no} type="monotone" dataKey={String(no)} name={machineLabel(no)}
                       stroke={PALETTE[i % PALETTE.length]} strokeWidth={2} dot={{ r: 2 }} connectNulls />
                   ))}
                 </LineChart>
@@ -5261,7 +5316,7 @@ export default function SlotDataTracker() {
                     fontSize: "12px", padding: "5px 9px", borderRadius: "6px", border: "1px solid " + color,
                     background: active ? color + "22" : "transparent", color: active ? color : "#5a6272",
                   }}>
-                    {no}
+                    {isMultiModelPage && noToModelName[no] ? `${noToModelName[no]} ${no}` : no}
                   </button>
                 );
               })}
@@ -5492,7 +5547,7 @@ export default function SlotDataTracker() {
               <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
             ) : (
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
-                {pickList.map((p) => renderPickCard(p))}
+                {pickList.map((p) => renderPickCard(p, isMultiModelPage ? (pp) => machineLabel(pp.no) : undefined))}
               </div>
             )}
           </div>
