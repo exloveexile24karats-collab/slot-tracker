@@ -158,7 +158,14 @@ const DIGIT7_COLOR = "#f6a04d";
 // ように複合文字列で編集させると、2個目以降を入力中の文字列がdatalistの
 // どの候補とも一致せず、ブラウザの補完が効かなくなっていた問題の対策
 // （入力欄は常に機種名1個だけを打つ形になるので、補完が正しく効く）。
-const APP_VERSION = "6.8.1";
+// v6.8.2: 【重要なバグ修正】すでに何十日分もデータが溜まっている単一機種
+// ページに、あとから理由Aタイプとして別の機種名を追加しても、既存の日付
+// には新しい機種のデータが一切反映されないバグを修正。backfillPageFrom
+// RawTableが「その日付がpageHistoriesに既にある＝何もしない」という判定
+// をしていたのが原因（新しく束ねた機種の分もその日にはもう存在すると
+// 誤判定していた）。「その日にまだ無い台（機種）だけを追加マージする」に
+// 修正し、race_test相当の単体テストで既存日付への正しいマージを確認済み。
+const APP_VERSION = "6.8.2";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1374,7 +1381,13 @@ export default function SlotDataTracker() {
 
   // v6.7: 新しいページ登録・正式名称の設定/変更のたびに呼ばれ、アナスロに
   // すでに貯まっている過去日について、その正式名称に一致する機種名の行を
-  // このページの pageHistories に反映する（既存エントリは上書きしない）。
+  // このページの pageHistories に反映する。
+  // v6.8.2: 「日付がすでにある＝何もしない」ではなく、「その日にまだ入って
+  // いない台（機種）だけを追加マージする」に修正。以前の実装だと、単一
+  // 機種ページとしてすでに何十日分もデータが溜まっている状態で、あとから
+  // 正式名称に別の機種を追加しても（理由Aタイプへの束ね直し）、既存の
+  // 日付には新しく追加した機種のデータが一切反映されないバグがあった
+  // （byDate.has(date)で即returnしていたため）。
   // これで台データ入力を廃止しても、各ページのグラフ・ピックアップ・
   // マトリクス表は今まで通り pageHistories を見るだけで動く。
   const backfillPageFromRawTable = useCallback(
@@ -1388,24 +1401,32 @@ export default function SlotDataTracker() {
       const byDate = new Map(existingHistory.map((h) => [h.date, h]));
       let changed = false;
       dates.forEach((date) => {
-        if (byDate.has(date)) return; // never overwrite an existing entry for this page
         const rows = rawFullTableRef.current[date] || [];
         const matched = rows.filter((r) => nameList.some((n) => modelNamesMatch(r.modelName, n)));
         if (matched.length === 0) return;
-        const machines = matched.map((r) => ({
-          no: r.no,
-          modelName: r.modelName, // v6.8: kept so multi-機種ページ can show which model each 台番号 belongs to
-          sada: r.sada,
-          gsu: r.gsu,
-          shutsu: r.shutsu,
-          bb: r.bb,
-          rb: r.rb,
-          gousei: r.gousei,
-          bbRateStr: r.bbRateStr,
-          rbRateStr: r.rbRateStr,
-        }));
-        const autoEvent = (dateEventMap[date] || "").trim();
-        byDate.set(date, { date, event: autoEvent, machines });
+        const existingEntry = byDate.get(date);
+        const existingNos = existingEntry ? new Set(existingEntry.machines.map((m) => m.no)) : new Set();
+        const newMachines = matched
+          .filter((r) => !existingNos.has(r.no)) // don't touch machines already present for this date
+          .map((r) => ({
+            no: r.no,
+            modelName: r.modelName, // v6.8: kept so multi-機種ページ can show which model each 台番号 belongs to
+            sada: r.sada,
+            gsu: r.gsu,
+            shutsu: r.shutsu,
+            bb: r.bb,
+            rb: r.rb,
+            gousei: r.gousei,
+            bbRateStr: r.bbRateStr,
+            rbRateStr: r.rbRateStr,
+          }));
+        if (newMachines.length === 0) return; // this date already has everything that matches
+        if (existingEntry) {
+          byDate.set(date, { ...existingEntry, machines: [...existingEntry.machines, ...newMachines] });
+        } else {
+          const autoEvent = (dateEventMap[date] || "").trim();
+          byDate.set(date, { date, event: autoEvent, machines: newMachines });
+        }
         changed = true;
       });
       if (!changed) return;
