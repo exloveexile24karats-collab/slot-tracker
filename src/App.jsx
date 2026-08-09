@@ -186,7 +186,29 @@ const DIGIT7_COLOR = "#f6a04d";
 // プール）とcomputePageMateTroubleStats/computeTrailingGsuLevelStats
 // （ページ内全台プール、ページ単位で1回だけ計算）に修正し、実データで
 // 再検証してPython側の検証結果と近い数値になることを確認済み。
-const APP_VERSION = "6.9.1";
+// v6.10: 「設定期待度」（実験的機能）を新規追加。雑餉隈スレッドの「数値」
+// （初当たり＋出玉を合成した連続値）を参考に、プラザ本店IIでは通常時
+// 回転数ベースのRB確率が使えないため、代わりに合成確率（BB+RB合算、
+// 総回転数で計算可）と出率をページ内z-score合成したX（設定期待度スコア）
+// を新設。実データ検証で、台番号固定の実績・日付末尾・イベント・前日の
+// 他の台の不調・前日のG数水準——▲マークで効いていたのと同じ条件が、X
+// でも同じ方向に効くことを確認済み（詳細は会話履歴のPython検証参照）。
+// 【重要】Xは「翌日、差枚がプラスになるか」とは綺麗に相関しないことも
+// 検証済み（設定は基本的に毎日変わるため）。そのため▲・差枚ベースの
+// 既存のS〜Eグレード（本日のピックアップ）とは完全に別枠の「🎰 設定期待度
+// （実験的）」カードとして表示し、合算はしない。
+// v6.11: マイジャグラーV専用に、理論値表＋ポアソン尤度による本格的な
+// 設定判別を追加（SETTING_PROFILES）。マイジャグラーVはAT/BT状態を持た
+// ない純粋なAタイプで、G数＝総回転数＝通常時回転数が完全一致するため、
+// 通常時回転数ベースの理論値表がそのまま使える唯一のケース（データ出典：
+// スロベース 2026年4月時点の解析値）。最新日のBB/RB/G数から設定1〜6の
+// 事後確率を計算し、「設定5+の確率」として表示。実データでの動作確認済み
+// （REG回数がBIGを上回る珍しいケースで、正しく設定6の確率90%超と判定
+// するなど、マイジャグラーVの既知の判別ポイントと整合）。
+// A-typeページ側の束ね機種（A-SLOT+異世界かるてっと等）はBT（ボーナス
+// トリガー）を持つ機種が混ざっており、G数の意味が曖昧になるため対象外
+// のまま（引き続き設定期待度Xを使用）。
+const APP_VERSION = "6.11";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -985,8 +1007,121 @@ function evaluateVolumeMismatch(seriesWithGsu) {
 // boosted on event days doesn't get mistaken for one machine being popular.
 // 'good': played a lot relative to peers, and didn't lose much (people kept feeding it)
 // 'low': played little relative to peers despite being ahead (people gave up early)
+// v6.10: 「設定期待度」（X）— 合成確率（BB+RB合算）と出率を、ページ内で
+// z-score化して0.4:0.6で合成した連続値。RB確率だけを使う設定判別（通常時
+// 回転数が必要）はプラザ本店IIでは組めないため、代わりに総回転数でも
+// 計算できる合成確率＋出率の組み合わせで「その日、設定が良さそうだった
+// か」を数値化した。実データ検証で、台番号固定の実績・日付末尾・イベン
+// ト・前日の他の台の不調・前日のG数水準など、▲マークで効いていたのと
+// 同じ条件がXでも同じ方向に効くことを確認済み（±0.15前後の効果）。
+// 【重要】Xは「設定が良さそうか」の目安であり、「差枚がプラスになるか」
+// とは別物 — 検証でも綺麗な相関は出なかった（設定は日替わりなので当然）。
+// そのため▲ベースのS〜Eグレードとは完全に別枠の「設定期待度」表示として
+// 使う（合算しない）。
+function computeGouseiFromMachine(m) {
+  const totalHits = (m.bb || 0) + (m.rb || 0);
+  return m.gsu && totalHits > 0 ? m.gsu / totalHits : null; // "1/X" の X 部分。小さいほど良い
+}
+// z-score a set of values (object: key -> value), returns key -> zscore
+function zScoreMap(valuesByKey) {
+  const vals = Object.values(valuesByKey).filter((v) => v !== null && v !== undefined);
+  if (vals.length < 5) {
+    const out = {};
+    Object.keys(valuesByKey).forEach((k) => { out[k] = null; });
+    return out;
+  }
+  const mean = vals.reduce((a, v) => a + v, 0) / vals.length;
+  const variance = vals.reduce((a, v) => a + (v - mean) ** 2, 0) / vals.length;
+  const std = Math.sqrt(variance) || 1;
+  const out = {};
+  Object.keys(valuesByKey).forEach((k) => {
+    const v = valuesByKey[k];
+    out[k] = v !== null && v !== undefined ? (v - mean) / std : null;
+  });
+  return out;
+}
+const X_GOUSEI_WEIGHT = 0.4; // 実データ検証で試した中で無難だった重み（0.3〜0.6の間で大差なし）
+// v6.10: ページ全体（全台・全日）をプールしてXを計算する（1台だけでは
+// z-score化に必要なサンプルが足りない日が多いため）。返り値は
+// {date: {no: X}} — pageSortedHistory一式に対して1回だけ呼ぶ。
+function computeXForPage(pageSortedHistory) {
+  const gouseiByKey = {};
+  const shutsuByKey = {};
+  const keys = [];
+  pageSortedHistory.forEach((h) => {
+    h.machines.forEach((m) => {
+      const key = `${h.date}|${m.no}`;
+      gouseiByKey[key] = computeGouseiFromMachine(m);
+      shutsuByKey[key] = m.shutsu !== null && m.shutsu !== undefined ? m.shutsu : null;
+      keys.push(key);
+    });
+  });
+  const gouseiZ = zScoreMap(gouseiByKey);
+  const shutsuZ = zScoreMap(shutsuByKey);
+  const xByDate = {};
+  keys.forEach((key) => {
+    const [date, noStr] = key.split("|");
+    const no = parseInt(noStr, 10);
+    const gz = gouseiZ[key];
+    const sz = shutsuZ[key];
+    const x = gz !== null && sz !== null ? X_GOUSEI_WEIGHT * -gz + (1 - X_GOUSEI_WEIGHT) * sz : null;
+    if (!xByDate[date]) xByDate[date] = {};
+    xByDate[date][no] = x;
+  });
+  return xByDate;
+}
+
 // v6.9: shared "hit" definition for the new ▲-mark-based signals below —
 // matches classifyMachineMark's own ▲ threshold (出率110%以上)
+// v6.11: 本格的な設定判別（理論値表＋ポアソン尤度）。マイジャグラーVは
+// 純粋なAタイプ（AT/BT状態なし）で、G数＝総回転数＝通常時回転数が完全に
+// 一致するため、通常時回転数ベースの理論値表がそのまま使える（プラザ2の
+// アナスロが総回転数である問題が発生しない唯一のケース）。
+// A-typeページの束ね機種（A-SLOT+異世界かるてっと等）は、BT（ボーナス
+// トリガー）という連チャン状態を持つ機種が混ざっており、G数の意味が
+// 曖昧になる恐れがあるため対象外（Xシステムのまま）。
+// データ出典：スロベース (https://slobase.jp/machines/myjuggler5) 2026年
+// 4月時点の解析値。BIG/REG確率（1/X の X の値、大きいほど当たりにくい）。
+const SETTING_PROFILES = {
+  "マイジャグラーV": {
+    settings: [1, 2, 3, 4, 5, 6],
+    big: [273.1, 270.8, 266.4, 254.0, 240.1, 229.1],
+    reg: [409.6, 385.5, 336.1, 290.0, 268.6, 229.1],
+  },
+};
+
+// ポアソン確率質量関数: P(観測回数=k | 期待値λ)。javascriptには階乗の
+// 組み込みが無いので対数空間で計算し（大きいkでもオーバーフローしない）、
+// 最後にexpで戻す。
+function poissonLogPmf(k, lambda) {
+  if (lambda <= 0) return k === 0 ? 0 : -Infinity;
+  // log(P) = -λ + k*log(λ) - log(k!)、log(k!)はスターリング近似ではなく
+  // 素直にΣlog(i)で計算（このアプリの規模のkなら十分速い）
+  let logFactorialK = 0;
+  for (let i = 2; i <= k; i++) logFactorialK += Math.log(i);
+  return -lambda + k * Math.log(lambda) - logFactorialK;
+}
+
+// v6.11: 1日分のBB/RB回数とG数から、設定1〜6それぞれの「もっともらしさ」
+// を計算し、事後確率（合計100%になるよう正規化）を返す。事前分布は一様
+// （どの設定も同じ確率であり得る）と仮定 — 実際のホールの設定配分に
+// 偏りがあっても、そこまでは分からないため中立に扱う。
+function evaluateSettingLikelihood(profile, bb, rb, gsu) {
+  if (!profile || !gsu || gsu <= 0 || bb === null || bb === undefined || rb === null || rb === undefined) return null;
+  const logLikelihoods = profile.settings.map((_, i) => {
+    const bigLambda = gsu / profile.big[i];
+    const regLambda = gsu / profile.reg[i];
+    return poissonLogPmf(bb, bigLambda) + poissonLogPmf(rb, regLambda);
+  });
+  const maxLog = Math.max(...logLikelihoods);
+  const rel = logLikelihoods.map((l) => Math.exp(l - maxLog)); // avoid underflow: shift by max before exponentiating
+  const sum = rel.reduce((a, v) => a + v, 0);
+  const posterior = rel.map((v) => v / sum);
+  const bySetting = {};
+  profile.settings.forEach((s, i) => { bySetting[s] = posterior[i]; });
+  return bySetting;
+}
+
 function isHitA(shutsu) {
   return shutsu !== null && shutsu !== undefined && shutsu >= 110;
 }
@@ -1092,6 +1227,131 @@ function checkTrailingGsuLevelToday(gsuLevelStats, seriesWithShutsu, pageGsuPerc
   if (lastGsu >= p66 && gsuLevelStats.高) return { level: "大量回転", ...gsuLevelStats.高 };
   if (lastGsu <= p33 && gsuLevelStats.低) return { level: "低調", ...gsuLevelStats.低 };
   return null;
+}
+
+// v6.10: 設定期待度（predicted X）予想エンジン。実データ検証で確認した
+// 5つの条件（台番号固定の実績・日付末尾・イベント・前日の他の台の不調・
+// 前日のG数水準）を使い、翌日のXがどれくらい高くなりそうかを予想する。
+// ▲ベースのcomputeSignalsForPageとは完全に別系統・別スコア（合算しない）。
+function computeSettingExpectationForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, dateEventMapParam) {
+  const xByDate = computeXForPage(pageSortedHistory);
+  // page全体のXの平均（このページの基準値）
+  let allXCount = 0, allXSum = 0;
+  Object.values(xByDate).forEach((dayMap) => {
+    Object.values(dayMap).forEach((x) => { if (x !== null) { allXCount += 1; allXSum += x; } });
+  });
+  const pageBaseX = allXCount > 0 ? allXSum / allXCount : 0;
+  const referenceDate = pageSortedHistory.length > 0 ? pageSortedHistory[pageSortedHistory.length - 1].date : null;
+  if (!referenceDate) return [];
+  const tomorrowDate = addDays(referenceDate, 1);
+
+  // 前日のページ全体の様子（他の台のXの平均）は全台共通なので1回だけ計算
+  const lastDayMap = xByDate[referenceDate] || {};
+  const lastDayXVals = Object.values(lastDayMap).filter((v) => v !== null);
+  const lastDayXAvg = lastDayXVals.length >= 2 ? lastDayXVals.reduce((a, v) => a + v, 0) / lastDayXVals.length : null;
+
+  // 前日のG数パーセンタイル（ページ全体）
+  const gsuVals = [];
+  pageSortedHistory.forEach((h) => h.machines.forEach((m) => { if (m.gsu !== null && m.gsu !== undefined) gsuVals.push(m.gsu); }));
+  gsuVals.sort((a, b) => a - b);
+  const p33 = gsuVals.length >= 10 ? gsuVals[Math.floor(gsuVals.length / 3)] : null;
+  const p66 = gsuVals.length >= 10 ? gsuVals[Math.floor((2 * gsuVals.length) / 3)] : null;
+
+  const results = [];
+  machineNumbers.forEach((no) => {
+    // この台のX系列（日付順）
+    const xSeries = pageSortedHistory
+      .map((h) => ({ date: h.date, x: (xByDate[h.date] || {})[no] ?? null, gsu: (h.machines.find((m) => m.no === no) || {}).gsu ?? null }))
+      .filter((r) => r.x !== null);
+    if (xSeries.length === 0) return;
+
+    const items = []; // { label, diff, sampleSize } — diffはXの単位（baseとの差）
+
+    // ①台番号固定の実績（own trailing X average, リーク無し）
+    if (xSeries.length >= 10) {
+      const ownAvg = xSeries.reduce((a, r) => a + r.x, 0) / xSeries.length;
+      items.push({ label: "台番号固定の実績", diff: ownAvg - pageBaseX, sampleSize: xSeries.length });
+    }
+
+    // ②日付末尾（この台の過去、翌日と同じ末尾の日のXが高い/低いか）
+    const tomorrowDigit = parseInt(tomorrowDate.slice(-2), 10) % 10;
+    const digitVals = xSeries.filter((r) => parseInt(r.date.slice(-2), 10) % 10 === tomorrowDigit).map((r) => r.x);
+    if (digitVals.length >= 5) {
+      const digitAvg = digitVals.reduce((a, v) => a + v, 0) / digitVals.length;
+      items.push({ label: `日付末尾=${tomorrowDigit}`, diff: digitAvg - pageBaseX, sampleSize: digitVals.length });
+    }
+
+    // ③イベント（明日登録されているイベント名の、過去のX平均）
+    const tomorrowEventNames = splitEventNames(dateEventMapParam[tomorrowDate] || "");
+    tomorrowEventNames.forEach((name) => {
+      const matchVals = pageSortedHistory
+        .filter((h) => h.event && splitEventNames(h.event).includes(name))
+        .map((h) => (xByDate[h.date] || {})[no])
+        .filter((v) => v !== null && v !== undefined);
+      if (matchVals.length >= 5) {
+        const avg = matchVals.reduce((a, v) => a + v, 0) / matchVals.length;
+        items.push({ label: `イベント「${name}」`, diff: avg - pageBaseX, sampleSize: matchVals.length });
+      }
+    });
+
+    // ④前日、同じページの他の台のXが低かった
+    if (lastDayXAvg !== null && lastDayXAvg <= -0.3) {
+      // このページの過去実績から「他の台のXが低かった翌日」のこの台のX平均を集計
+      const followVals = [];
+      pageSortedHistory.forEach((h, i) => {
+        if (i === 0) return;
+        const prevDate = pageSortedHistory[i - 1].date;
+        const prevDayMap = xByDate[prevDate] || {};
+        const mateVals = Object.entries(prevDayMap).filter(([n]) => parseInt(n, 10) !== no).map(([, v]) => v).filter((v) => v !== null);
+        if (mateVals.length < 2) return;
+        const mateAvg = mateVals.reduce((a, v) => a + v, 0) / mateVals.length;
+        if (mateAvg > -0.3) return;
+        const myX = (xByDate[h.date] || {})[no];
+        if (myX !== null && myX !== undefined) followVals.push(myX);
+      });
+      if (followVals.length >= 15) {
+        const avg = followVals.reduce((a, v) => a + v, 0) / followVals.length;
+        items.push({ label: "前日、他の台が不調", diff: avg - pageBaseX, sampleSize: followVals.length });
+      }
+    }
+
+    // ⑤前日のG数水準（大量回転/低調）
+    if (p33 !== null && p66 !== null) {
+      const lastGsu = xSeries.length > 0 ? xSeries[xSeries.length - 1].gsu : null;
+      if (lastGsu !== null) {
+        const level = lastGsu >= p66 ? "high" : lastGsu <= p33 ? "low" : null;
+        if (level) {
+          const followVals = [];
+          for (let i = 1; i < pageSortedHistory.length; i++) {
+            const prevGsu = (pageSortedHistory[i - 1].machines.find((m) => m.no === no) || {}).gsu;
+            if (prevGsu === null || prevGsu === undefined) continue;
+            const prevLevel = prevGsu >= p66 ? "high" : prevGsu <= p33 ? "low" : null;
+            if (prevLevel !== level) continue;
+            const myX = (xByDate[pageSortedHistory[i].date] || {})[no];
+            if (myX !== null && myX !== undefined) followVals.push(myX);
+          }
+          if (followVals.length >= 15) {
+            const avg = followVals.reduce((a, v) => a + v, 0) / followVals.length;
+            items.push({ label: `前日のG数水準（${level === "high" ? "大量回転" : "低調"}）`, diff: avg - pageBaseX, sampleSize: followVals.length });
+          }
+        }
+      }
+    }
+
+    if (items.length === 0) return;
+
+    // 各項目のdiffをサンプル数で重み付けして全部足し合わせる（複数の
+    // 条件が同時に当てはまるほど期待度が上がる、既存のtieBreaker方式と
+    // 同じ考え方）
+    const totalDelta = items.reduce((a, it) => a + it.diff * sampleWeight(it.sampleSize), 0);
+    const finalPredictedX = pageBaseX + totalDelta;
+    const label = finalPredictedX >= pageBaseX + 0.1 ? "高" : finalPredictedX <= pageBaseX - 0.1 ? "低" : "中";
+
+    results.push({ no, predictedX: finalPredictedX, label, items, matchCount: items.length });
+  });
+
+  results.sort((a, b) => b.predictedX - a.predictedX);
+  return results;
 }
 
 function computeDailySettingFlags(pageSortedHistory) {
@@ -2975,6 +3235,36 @@ export default function SlotDataTracker() {
   const pickList = useMemo(() => {
     return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
   }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA]);
+
+  // v6.10: 設定期待度（X予想）— ▲ベースのpickListとは別枠、合算しない
+  const settingExpectationList = useMemo(() => {
+    if (sortedHistory.length < 15) return [];
+    return computeSettingExpectationForPage(allMachineNumbers, sortedHistory, historyByDate, dateEventMap);
+  }, [allMachineNumbers, sortedHistory, historyByDate, dateEventMap]);
+
+  // v6.11: 本格的な設定判別（理論値表＋ポアソン尤度）— SETTING_PROFILESに
+  // 登録されている機種（現状マイジャグラーVのみ）の正式名称と一致する
+  // ページでだけ有効。最新日の各台のBB/RB/G数から、設定1〜6の事後確率を
+  // 計算する。
+  const settingProfile = useMemo(() => {
+    if (!currentPage || !currentPage.officialName) return null;
+    const nameList = splitModelNameList(currentPage.officialName);
+    const matchedKey = Object.keys(SETTING_PROFILES).find((profileName) => nameList.some((n) => modelNamesMatch(profileName, n)));
+    return matchedKey ? SETTING_PROFILES[matchedKey] : null;
+  }, [currentPage]);
+  const settingLikelihoodList = useMemo(() => {
+    if (!settingProfile || sortedHistory.length === 0) return [];
+    const lastDay = sortedHistory[sortedHistory.length - 1];
+    const results = [];
+    lastDay.machines.forEach((m) => {
+      const posterior = evaluateSettingLikelihood(settingProfile, m.bb, m.rb, m.gsu);
+      if (!posterior) return;
+      const highProb = (posterior[5] || 0) + (posterior[6] || 0);
+      results.push({ no: m.no, posterior, highProb, date: lastDay.date });
+    });
+    results.sort((a, b) => b.highProb - a.highProb);
+    return results;
+  }, [settingProfile, sortedHistory]);
 
 
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
@@ -5862,6 +6152,107 @@ export default function SlotDataTracker() {
               </div>
             )}
           </div>
+
+          {/* v6.10: 設定期待度（X予想）— 上のピックアップ（▲・差枚ベース）とは
+              別枠。合成確率と出率を合成した連続値Xを使い、翌日「設定が
+              良さそうか」を予想する。差枚のプラス/マイナスとは別物なので
+              あえて分けて表示（設定は毎日変わるため、当てにしすぎない） */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🎰 設定期待度（実験的）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              合成確率（BB+RB合算）と出率を組み合わせた指数（X）で、「設定が良さそうだったか」を数値化し、台番号固定の実績・日付末尾・イベント・前日の他の台の不調・前日のG数水準から、翌日のXを予想します。<span style={{ color: "#e8b34c" }}>設定は基本的に毎日変わるので、上のピックアップ（差枚・出率ベース）とは別物として参考程度に見てください。</span>
+            </div>
+            {settingExpectationList.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>
+                {sortedHistory.length < 15 ? "データが15日分たまると表示されます。" : "現時点で予想できる台がありません。"}
+              </div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "320px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
+                {settingExpectationList.map((p) => (
+                  <div key={p.no} style={{
+                    display: "flex", alignItems: "center", justifyContent: "space-between",
+                    background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "9px 12px",
+                  }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <span
+                        className="mono"
+                        title={p.items.map((it) => `${it.label}: ${it.diff >= 0 ? "+" : ""}${it.diff.toFixed(2)} (n=${it.sampleSize})`).join("\n")}
+                        style={{
+                          fontSize: "11px", fontWeight: 800, padding: "2px 8px", borderRadius: "999px",
+                          color: p.label === "高" ? "#12161d" : p.label === "低" ? "#e7e9ee" : "#c7cbd4",
+                          background: p.label === "高" ? "#9ece6a" : p.label === "低" ? "#e5697a" : "#2a323f",
+                          cursor: "help",
+                        }}
+                      >
+                        {p.label}
+                      </span>
+                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>
+                        {isMultiModelPage ? machineLabel(p.no) : `${p.no}番`}
+                      </span>
+                      <span style={{ fontSize: "10px", color: "#5a6272" }}>根拠{p.matchCount}件</span>
+                    </span>
+                    <span className="mono" style={{ fontSize: "11px", color: "#5a6272" }}>
+                      X予想 {p.predictedX >= 0 ? "+" : ""}{p.predictedX.toFixed(2)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* v6.11: 設定判別（理論値表＋ポアソン尤度）— SETTING_PROFILESに
+              登録されている機種の正式名称と一致するページでのみ表示。
+              マイジャグラーVはG数=総回転数=通常時回転数が完全一致する
+              純粋なAタイプなので、通常時回転数ベースの理論値表がそのまま
+              使える。他の機種（AT/BT状態を持つもの）はG数の意味が曖昧な
+              ため対象外（設定期待度Xの方を参照）。 */}
+          {settingProfile && (
+            <div className="card" style={{ padding: "18px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+                🎯 設定判別（{currentPage.officialName}・理論値表ベース）
+              </div>
+              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+                最新日（{settingLikelihoodList[0] ? settingLikelihoodList[0].date : "-"}）のBB・RB回数とG数から、設定1〜6それぞれの事後確率をポアソン尤度で計算しています（事前分布は一様と仮定）。あくまで1日分のデータからの推定なので、サンプルが少ない台は幅を持って見てください。
+              </div>
+              {settingLikelihoodList.length === 0 ? (
+                <div style={{ fontSize: "12px", color: "#5a6272" }}>この日のBB/RB/G数データがまだありません。</div>
+              ) : (
+                <div className="scrollbar" style={{ maxHeight: "360px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
+                  {settingLikelihoodList.map((r) => (
+                    <div key={r.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "9px 12px" }}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
+                        <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{r.no}番</span>
+                        <span className="mono" style={{ fontSize: "12px", fontWeight: 700, color: r.highProb >= 0.4 ? "#9ece6a" : r.highProb >= 0.2 ? "#e8b34c" : "#5a6272" }}>
+                          設定5+ {Math.round(r.highProb * 100)}%
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", gap: "3px" }}>
+                        {settingProfile.settings.map((s) => {
+                          const p = r.posterior[s] || 0;
+                          return (
+                            <div key={s} title={`設定${s}: ${Math.round(p * 100)}%`} style={{ flex: 1, textAlign: "center" }}>
+                              <div style={{
+                                height: "28px", borderRadius: "3px", background: "#1c2129",
+                                display: "flex", alignItems: "flex-end", overflow: "hidden",
+                              }}>
+                                <div style={{
+                                  width: "100%", height: `${Math.max(2, p * 100)}%`,
+                                  background: s >= 5 ? "#9ece6a" : s >= 3 ? "#e8b34c" : "#5a6272",
+                                }} />
+                              </div>
+                              <div className="mono" style={{ fontSize: "9px", color: "#5a6272", marginTop: "2px" }}>{s}</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* machine-to-machine correlation */}
           <div className="card" style={{ padding: "18px" }}>
