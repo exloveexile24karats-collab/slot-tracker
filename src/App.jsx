@@ -165,7 +165,28 @@ const DIGIT7_COLOR = "#f6a04d";
 // をしていたのが原因（新しく束ねた機種の分もその日にはもう存在すると
 // 誤判定していた）。「その日にまだ無い台（機種）だけを追加マージする」に
 // 修正し、race_test相当の単体テストで既存日付への正しいマージを確認済み。
-const APP_VERSION = "6.8.2";
+// v6.9: 実データ（81日/7,459台日、▲マーク基準）を使い、指示書⑤の実測
+// パターンエンジンの考え方でピックアップの点数付けを見直し。13候補
+// ファミリーを総当たりで検証し、実証済みの強い基準として3つを新規採用：
+// ①台番号固定の実績（この台自身のトレイリング▲率、n≈2000、±17〜18pt）
+// ②前日、同じページの他の台が不調（n≈1822、-15.7pt）
+// ③前日の自分自身のG数水準・大量回転/低調（n≈2400、±9〜11pt）。
+// いずれも既存のSTRONG_SIGNAL_LABELS/SIGNAL_WEIGHTSの仕組みにそのまま
+// 追加。個別イベント効果（爆撮・ぞろ目等）は既存のplannedEventMatch
+// （イベント登録連動）が汎用的に拾うのでタイブレーカーとして機能済み、
+// 追加実装不要。検証で不採用にした候補（連続4日以上=n=22で過学習
+// リスク大、相対ローテーション、イベント直前トレンド、曜日傾向、凹み
+// 上げ、強いイベント間トレンド）は見送り。グレード判定はS(350+)/
+// A(250+)/B(150+)/C(50+)/D(-20+)/E方式を踏襲。
+// v6.9.1: 【重要な設計修正】3つの新基準の「ベースレート」「証拠となる
+// サンプル」は、実データ検証と同じくページ内の全台をプールして計算する
+// 必要があった。最初の実装は台ごと・ページごとに個別計算していたため、
+// 特に「前日、他の台が不調」「前日のG数水準」で検証結果と数値が大きく
+// 乖離（サンプル不足で実質機能しない状態）。globalBaseRateA（全ページ
+// プール）とcomputePageMateTroubleStats/computeTrailingGsuLevelStats
+// （ページ内全台プール、ページ単位で1回だけ計算）に修正し、実データで
+// 再検証してPython側の検証結果と近い数値になることを確認済み。
+const APP_VERSION = "6.9.1";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -585,7 +606,17 @@ function scoreToGrade(score) {
 // backtesting (real hall data, walk-forward) showed these specific signals
 // have a genuine, repeatable edge; everything else is kept as a smaller
 // tie-breaker rather than being dropped, since it still carries some signal
-const STRONG_SIGNAL_LABELS = new Set(["強いイベント間トレンド", "相対ローテーション（設定良さそう）", "イベント登録連動", "イベント直前10日トレンド"]);
+const STRONG_SIGNAL_LABELS = new Set([
+  "強いイベント間トレンド",
+  "相対ローテーション（設定良さそう）",
+  "イベント登録連動",
+  "イベント直前10日トレンド",
+  // v6.9: 実データ検証（81日/7,459台日、▲マーク基準）で確認した新しい
+  // 強い基準。台番号固定の実績はn=1993で+18.1、前日のG数水準（大量回転）
+  // はn=2388で+10.6と、いずれも大サンプル・方向一貫で確認済み
+  "台番号固定の実績",
+  "前日のG数水準",
+]);
 function isStrongSignalLabel(label) {
   const baseLabel = label.replace(/[（(].*[）)]/g, "").trim();
   return STRONG_SIGNAL_LABELS.has(baseLabel) || baseLabel.startsWith("日付末尾");
@@ -657,6 +688,10 @@ const SIGNAL_WEIGHTS = {
   strongInterEventTrend: 0.9, // 強いイベント同士の間のトレンド — strongest tier
   semiInterEventTrend: 0.4, // 準イベント同士の間のトレンド — weakest tier
   preEventTrend: 1.5, // イベント直前10日トレンド — backtested strong for 2のつく日(13pt)/7のつく日(7pt)
+  // v6.9: 3 new signals, calibrated from the 81日/7,459台日 実データ検証
+  fixedNo: 1.5, // 台番号固定の実績 — largest, most robust finding of the batch (n≈2000, ±17〜18pt)
+  pageMateTrouble: 1.3, // 前日、他の台が不調 — strong caution signal (n=1822, -15.7pt)
+  gsuLevel: 1.2, // 前日のG数水準（大量回転/低調） — solid n but smaller magnitude than the two above
 };
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -950,6 +985,115 @@ function evaluateVolumeMismatch(seriesWithGsu) {
 // boosted on event days doesn't get mistaken for one machine being popular.
 // 'good': played a lot relative to peers, and didn't lose much (people kept feeding it)
 // 'low': played little relative to peers despite being ahead (people gave up early)
+// v6.9: shared "hit" definition for the new ▲-mark-based signals below —
+// matches classifyMachineMark's own ▲ threshold (出率110%以上)
+function isHitA(shutsu) {
+  return shutsu !== null && shutsu !== undefined && shutsu >= 110;
+}
+
+// v6.9: page-wide ▲ base rate — the baseline every one of the 3 new
+// signals below is compared against (実データ検証で使ったのと同じ基準）
+function computePageBaseRateA(pageSortedHistory) {
+  let n = 0, hits = 0;
+  pageSortedHistory.forEach((h) => {
+    h.machines.forEach((m) => {
+      if (m.shutsu === null || m.shutsu === undefined) return;
+      n += 1;
+      if (isHitA(m.shutsu)) hits += 1;
+    });
+  });
+  return n > 0 ? hits / n : 0.21; // 0.21 ≈ observed baseline as a fallback for a brand-new page with no data yet
+}
+
+// v6.9: page-wide G数 33rd/66th percentile — used to bucket a day's own G数
+// into 低調/普通/大量回転, the same way computeDailySettingFlags already
+// does it for its own (different) purpose
+function computePageGsuPercentiles(pageSortedHistory) {
+  const vals = [];
+  pageSortedHistory.forEach((h) => h.machines.forEach((m) => { if (m.gsu !== null && m.gsu !== undefined) vals.push(m.gsu); }));
+  if (vals.length < 10) return null;
+  vals.sort((a, b) => a - b);
+  return { p33: vals[Math.floor(vals.length / 3)], p66: vals[Math.floor((2 * vals.length) / 3)] };
+}
+
+// v6.9: 【実証済み・強い基準】「前日、同じページの他の台の当たり(▲)率が低
+// かった」→ 今日この台が当たるか。実データ検証で n=1822, 的中率15.9%
+// （ベース21.1%比 -5.2pt）と明確な負の効果が確認できた（店全体が渋い日は
+// 翌日も渋い傾向、という解釈が自然）。「他の台が好調だった」側は効果が
+// 弱かったので、不調側だけを本采用する。
+// v6.9.1: 証拠（勝率の元になるサンプル）は「その台自身の過去」だけに限定
+// せず、ページ内の全台をプールして集計する（実データ検証もそうしていた
+// ため）。1台だけの実績に限定すると、80日程度のデータでは「前日ページが
+// 不調だった」という状況自体が数回しか起きず、十分なサンプルが集まらない。
+// この関数はページ単位で1回だけ呼び、結果をどの台にも共通で使う。
+function computePageMateTroubleStats(pageSortedHistory) {
+  let n = 0, hits = 0;
+  for (let i = 1; i < pageSortedHistory.length; i++) {
+    const prevDay = pageSortedHistory[i - 1];
+    const curDay = pageSortedHistory[i];
+    const prevValid = prevDay.machines.filter((m) => m.shutsu !== null && m.shutsu !== undefined);
+    if (prevValid.length < 2) continue;
+    const prevHitRate = prevValid.filter((m) => isHitA(m.shutsu)).length / prevValid.length;
+    if (prevHitRate > 0.1) continue; // only the "bad page day" bucket
+    curDay.machines.forEach((m) => {
+      if (m.shutsu === null || m.shutsu === undefined) return;
+      n += 1;
+      if (isHitA(m.shutsu)) hits += 1;
+    });
+  }
+  return n >= 15 ? { winRate: hits / n, sampleSize: n } : null;
+}
+// per-machine check: was YESTERDAY (for this machine's page-mates,
+// excluding itself) a "bad page day"? if so, the page-wide stats apply today
+function checkPageMateTroubleToday(pageMateTroubleStats, pageHistoryByDate, lastDate, no) {
+  if (!pageMateTroubleStats) return null;
+  const lastDayRec = pageHistoryByDate[lastDate];
+  if (!lastDayRec) return null;
+  const lastMates = lastDayRec.machines.filter((m) => m.no !== no && m.shutsu !== null && m.shutsu !== undefined);
+  if (lastMates.length < 2) return null;
+  const lastMateHitRate = lastMates.filter((m) => isHitA(m.shutsu)).length / lastMates.length;
+  if (lastMateHitRate > 0.1) return null;
+  return pageMateTroubleStats;
+}
+
+// v6.9: 【実証済み・強い基準】前日の自分自身のG数水準（大量回転/低調）→
+// 翌日当たるか。実データ検証：前日大量回転→翌日24.6%(+3.5pt)、前日低調→
+// 翌日18.1%(-3.0pt)。当日のG数で判定すると強い相関が出るが、それは終わって
+// みないとわからない値なのでリーク（使えない）。必ず前日のG数で判定する。
+// v6.9.1: pageMateTroubleと同じ理由で、証拠はページ内の全台をプールして
+// 集計する（1台の実績だけに限定するとサンプルが少なすぎる）。
+function computeTrailingGsuLevelStats(pageSortedHistory, pageGsuPercentiles) {
+  if (!pageGsuPercentiles) return null;
+  const { p33, p66 } = pageGsuPercentiles;
+  let highN = 0, highHits = 0, lowN = 0, lowHits = 0;
+  for (let i = 1; i < pageSortedHistory.length; i++) {
+    const prevDay = pageSortedHistory[i - 1];
+    const curDay = pageSortedHistory[i];
+    const prevByNo = new Map(prevDay.machines.map((m) => [m.no, m.gsu]));
+    curDay.machines.forEach((m) => {
+      const prevGsu = prevByNo.get(m.no);
+      if (prevGsu === null || prevGsu === undefined || m.shutsu === null || m.shutsu === undefined) return;
+      if (prevGsu >= p66) { highN += 1; if (isHitA(m.shutsu)) highHits += 1; }
+      else if (prevGsu <= p33) { lowN += 1; if (isHitA(m.shutsu)) lowHits += 1; }
+    });
+  }
+  return {
+    高: highN >= 15 ? { winRate: highHits / highN, sampleSize: highN } : null,
+    低: lowN >= 15 ? { winRate: lowHits / lowN, sampleSize: lowN } : null,
+  };
+}
+// per-machine check: was MY OWN yesterday's G数 high or low? if so, the
+// page-wide bucket stats apply today
+function checkTrailingGsuLevelToday(gsuLevelStats, seriesWithShutsu, pageGsuPercentiles) {
+  if (!gsuLevelStats || !pageGsuPercentiles) return null;
+  const lastGsu = seriesWithShutsu[seriesWithShutsu.length - 1].gsu;
+  if (lastGsu === null || lastGsu === undefined) return null;
+  const { p33, p66 } = pageGsuPercentiles;
+  if (lastGsu >= p66 && gsuLevelStats.高) return { level: "大量回転", ...gsuLevelStats.高 };
+  if (lastGsu <= p33 && gsuLevelStats.低) return { level: "低調", ...gsuLevelStats.低 };
+  return null;
+}
+
 function computeDailySettingFlags(pageSortedHistory) {
   const perDateFlags = {};
   pageSortedHistory.forEach((h) => {
@@ -1951,6 +2095,25 @@ export default function SlotDataTracker() {
     return stats;
   }, [pageHistories, recommendTargetPageId, recommendTargetList]);
 
+  // v6.9: グローバル（全ページ共通）の▲ベースレート — 実データ検証は全
+  // ページを1つのプールとして計算していたので、ページごとに計算し直すと
+  // 数値が変わってしまう（各ページ自身の平均を基準にすると、そのページの
+  // 中での差が小さく見えてしまうため）。必ずこの値を computeSignalsForPage
+  // に渡す。
+  const globalBaseRateA = useMemo(() => {
+    let n = 0, hits = 0;
+    Object.values(pageHistories).forEach((hist) => {
+      (hist || []).forEach((h) => {
+        h.machines.forEach((m) => {
+          if (m.shutsu === null || m.shutsu === undefined) return;
+          n += 1;
+          if (m.shutsu >= 110) hits += 1;
+        });
+      });
+    });
+    return n > 0 ? hits / n : 0.21;
+  }, [pageHistories]);
+
   const allMachineNumbers = useMemo(() => {
     const set = new Set();
     currentHistory.forEach((h) => h.machines.forEach((m) => set.add(m.no)));
@@ -2383,7 +2546,7 @@ export default function SlotDataTracker() {
   // (computed across all machines this page has ever seen)
   // core per-machine signal computation, parameterized so it can be reused
   // for both the active page and the store-wide 機種別/末尾別 summaries
-  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet) {
+  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam) {
     const results = [];
     // pageRecommendsList is usually one shared list (applies to every machine
     // on this page) — but for the overall 機種別 list, each "no" is a
@@ -2395,6 +2558,14 @@ export default function SlotDataTracker() {
       return pageRecommendsList[no] || [];
     }
     const dailySettingFlags = computeDailySettingFlags(pageSortedHistory);
+    // v6.9: precomputed once per page (not per machine) for the 3 new
+    // ▲-mark-based signals below
+    const pageBaseRateA = globalBaseRateAParam !== undefined && globalBaseRateAParam !== null ? globalBaseRateAParam : computePageBaseRateA(pageSortedHistory);
+    const pageGsuPercentiles = computePageGsuPercentiles(pageSortedHistory);
+    // v6.9.1: pooled once per page (across every machine's data), not
+    // per-machine — see computePageMateTroubleStats/computeTrailingGsuLevelStats
+    const pageMateTroubleStats = computePageMateTroubleStats(pageSortedHistory);
+    const gsuLevelStats = computeTrailingGsuLevelStats(pageSortedHistory, pageGsuPercentiles);
     // "tomorrow" must mean the same date for every machine/model/digit on this
     // page — anchored to the page's own most recent entered date, NOT each
     // item's own last non-"-" date (otherwise an item that happened to show
@@ -2405,7 +2576,7 @@ export default function SlotDataTracker() {
       const seriesFull = pageSortedHistory
         .map((h) => {
           const m = h.machines.find((mm) => mm.no === no);
-          return m && m.sada !== null ? { date: h.date, sada: m.sada, gsu: m.gsu, event: h.event } : null;
+          return m && m.sada !== null ? { date: h.date, sada: m.sada, gsu: m.gsu, shutsu: m.shutsu, event: h.event } : null;
         })
         .filter(Boolean);
       if (seriesFull.length === 0) return;
@@ -2417,6 +2588,25 @@ export default function SlotDataTracker() {
       // different sizes/volatility
       const machineAvgSada = series.reduce((a, s) => a + s.sada, 0) / series.length;
       const machineTypicalMagnitude = series.reduce((a, s) => a + Math.abs(s.sada), 0) / series.length || 1;
+
+      // v6.9: 【実証済み・強い基準①】台番号固定の実績（トレイリング）——
+      // この台自身の▲率が、ページ全体の▲率と比べて高いか低いか。実データ
+      // 検証：自身の実績が平均+5pt以上のグループはn=1993で的中27.1%
+      // （+6.0pt）、-5pt以下のグループはn=2200で15.5%（-5.6pt）と、方向
+      // 両方で明確かつ大サンプルの効果を確認済み。未来のデータを含めない
+      // よう、必ずこの台の「今日までの」全実績（トレイリング）で計算する。
+      const shutsuValsForThisMachine = seriesFull.map((s) => s.shutsu).filter((v) => v !== null && v !== undefined);
+      let fixedNoMatch = null;
+      if (shutsuValsForThisMachine.length >= 10) {
+        const hits = shutsuValsForThisMachine.filter((v) => isHitA(v)).length;
+        fixedNoMatch = { winRate: hits / shutsuValsForThisMachine.length, sampleSize: shutsuValsForThisMachine.length };
+      }
+
+      // v6.9: 【実証済み・強い基準②】前日、同じページの他の台が不調
+      const pageMateTroubleMatch = checkPageMateTroubleToday(pageMateTroubleStats, pageHistoryByDate, lastDate, no);
+
+      // v6.9: 【実証済み・強い基準③】前日の自分自身のG数水準（大量回転/低調）
+      const gsuLevelMatch = checkTrailingGsuLevelToday(gsuLevelStats, seriesFull, pageGsuPercentiles);
 
       const windows = [10, 20, 30].map((w) => ({ windowSize: w, result: evaluateWindow(series, w, baseRate) }));
       const matchedWindows = windows.filter((w) => w.result && w.result.reasons.length > 0);
@@ -2614,7 +2804,10 @@ export default function SlotDataTracker() {
         interEventTrendMatch ||
         strongInterEventTrendMatch ||
         semiInterEventTrendMatch ||
-        preEventTrendMatch;
+        preEventTrendMatch ||
+        fixedNoMatch ||
+        pageMateTroubleMatch ||
+        gsuLevelMatch;
       if (!hasAnySignal) return;
 
       // ---- additive/subtractive scoring: every signal (favorable OR
@@ -2707,6 +2900,23 @@ export default function SlotDataTracker() {
         const evPts = computeEvPoints(volumeMismatch.nextDayStats.avg, machineAvgSada, machineTypicalMagnitude, volumeMismatch.nextDayStats.sampleSize);
         scoreItems.push({ label: "大量回転・低調", points: (winPts + evPts) * SIGNAL_WEIGHTS.volumeMismatch });
       }
+      // v6.9: 3 new signals validated on real アナスロ data (81日/7,459台日,
+      // ▲マーク基準) — see conversation history for the full walk-forward
+      // scan across 13 candidate families. these use shutsu(▲)-based hit
+      // rates rather than sada>0 like the older signals above, since ▲〇は
+      // このアプリの実際の「良い/悪い」判定そのものだから
+      if (fixedNoMatch) {
+        const winPts = computePoints(fixedNoMatch.winRate, pageBaseRateA, fixedNoMatch.sampleSize);
+        scoreItems.push({ label: "台番号固定の実績", points: winPts * SIGNAL_WEIGHTS.fixedNo });
+      }
+      if (pageMateTroubleMatch) {
+        const winPts = computePoints(pageMateTroubleMatch.winRate, pageBaseRateA, pageMateTroubleMatch.sampleSize);
+        scoreItems.push({ label: "前日、他の台が不調", points: winPts * SIGNAL_WEIGHTS.pageMateTrouble });
+      }
+      if (gsuLevelMatch) {
+        const winPts = computePoints(gsuLevelMatch.winRate, pageBaseRateA, gsuLevelMatch.sampleSize);
+        scoreItems.push({ label: `前日のG数水準（${gsuLevelMatch.level}）`, points: winPts * SIGNAL_WEIGHTS.gsuLevel });
+      }
 
       let strongSignalCount = 0;
       let tieBreakerPoints = 0;
@@ -2763,8 +2973,8 @@ export default function SlotDataTracker() {
   }
 
   const pickList = useMemo(() => {
-    return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet));
-  }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends]);
+    return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
+  }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA]);
 
 
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
@@ -2974,7 +3184,7 @@ export default function SlotDataTracker() {
     const sortedH = overallSortedSummaries.map((s) => ({
       date: s.date,
       event: s.event,
-      machines: s.modelRows.map((r) => ({ no: r.name, sada: r.avgSada, gsu: r.avgGsu })),
+      machines: s.modelRows.map((r) => ({ no: r.name, sada: r.avgSada, gsu: r.avgGsu, shutsu: r.shutsu })),
     }));
     const hbd = {};
     sortedH.forEach((h) => {
@@ -2989,14 +3199,14 @@ export default function SlotDataTracker() {
         .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
         .map((h) => h.date)
     );
-    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, overallRecommends, oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet));
-  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap, overallRecommends]);
+    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, overallRecommends, oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
+  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap, overallRecommends, globalBaseRateA]);
 
   const overallDigitPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
       date: s.date,
       event: s.event,
-      machines: s.digitRows.map((r) => ({ no: r.name, sada: r.avgSada, gsu: r.avgGsu })),
+      machines: s.digitRows.map((r) => ({ no: r.name, sada: r.avgSada, gsu: r.avgGsu, shutsu: r.shutsu })),
     }));
     const hbd = {};
     sortedH.forEach((h) => {
@@ -3011,8 +3221,8 @@ export default function SlotDataTracker() {
         .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
         .map((h) => h.date)
     );
-    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, [], oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet));
-  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap]);
+    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, [], oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
+  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap, globalBaseRateA]);
 
   // system-wide reference accuracy: aggregates every 10/20/30-day threshold
   // rule found across every machine on this page, weighted by sample size.
