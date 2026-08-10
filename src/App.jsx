@@ -208,7 +208,14 @@ const DIGIT7_COLOR = "#f6a04d";
 // A-typeページ側の束ね機種（A-SLOT+異世界かるてっと等）はBT（ボーナス
 // トリガー）を持つ機種が混ざっており、G数の意味が曖昧になるため対象外
 // のまま（引き続き設定期待度Xを使用）。
-const APP_VERSION = "6.11";
+// v6.12: 台番号×日付のXマトリクス表を追加（雑餉隈の「数値」表示・
+// 台番号×日付、色付き数値と同じ見た目）。以前実装した「翌日のXを予想
+// するカード」だけでは、過去のXの値そのもの（台番号固定・日付末尾・
+// イベント等の条件が本当に効いているか）を目視確認できなかったための
+// 追加。renderXGrid関数で、Xをページ内パーセンタイル（0〜100）に変換し、
+// fiveBandColor（赤＞黄＞緑＞青＞灰）で色分け表示。既存の▲〇マトリクス
+// 表とは別枠のカードとして追加、日付・イベント絞り込みは共有。
+const APP_VERSION = "6.12";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1069,6 +1076,37 @@ function computeXForPage(pageSortedHistory) {
     xByDate[date][no] = x;
   });
   return xByDate;
+}
+
+// v6.12: Xの生値（だいたい-2〜+2くらいのz-score合成値）は数値として直感
+// 的でないので、表示用にページ内でのパーセンタイル順位（0〜100）へ変換
+// する。雑餉隈の「数値」表示（台番号×日付、色付き数値）と同じ見た目に
+// するため。
+function computeXPercentiles(xByDate) {
+  const allVals = [];
+  Object.values(xByDate).forEach((dayMap) => {
+    Object.values(dayMap).forEach((x) => { if (x !== null && x !== undefined) allVals.push(x); });
+  });
+  allVals.sort((a, b) => a - b);
+  const n = allVals.length;
+  function percentileOf(x) {
+    if (n === 0) return null;
+    // binary search for insertion point
+    let lo = 0, hi = n;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (allVals[mid] < x) lo = mid + 1; else hi = mid;
+    }
+    return Math.round((lo / n) * 100);
+  }
+  const pctByDate = {};
+  Object.entries(xByDate).forEach(([date, dayMap]) => {
+    pctByDate[date] = {};
+    Object.entries(dayMap).forEach(([no, x]) => {
+      pctByDate[date][no] = x !== null && x !== undefined ? percentileOf(x) : null;
+    });
+  });
+  return pctByDate;
 }
 
 // v6.9: shared "hit" definition for the new ▲-mark-based signals below —
@@ -3470,6 +3508,22 @@ export default function SlotDataTracker() {
     return map;
   }, [sortedHistory]);
 
+  // v6.12: 台番号×日付のXマトリクス表用データ（設定期待度・数値表示）
+  const pageGridXPercentiles = useMemo(() => {
+    if (sortedHistory.length < 15) return {};
+    const xByDate = computeXForPage(sortedHistory);
+    const pctByDate = computeXPercentiles(xByDate);
+    const map = {};
+    Object.entries(pctByDate).forEach(([date, dayMap]) => {
+      Object.entries(dayMap).forEach(([noStr, pct]) => {
+        const no = parseInt(noStr, 10);
+        if (!map[no]) map[no] = {};
+        map[no][date] = pct;
+      });
+    });
+    return map;
+  }, [sortedHistory]);
+
   const overallModelPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
       date: s.date,
@@ -3967,6 +4021,61 @@ export default function SlotDataTracker() {
               </tr>
               );
             })}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  // v6.12: 台番号×日付のXマトリクス表（雑餉隈の「数値」表示と同じ見た目：
+  // 色付きの数値をそのまま並べる）。valuesMap は {no: {date: 0-100の
+  // パーセンタイル}}。
+  function renderXGrid(dates, rows, valuesMap, rowLabelFn) {
+    if (rows.length === 0 || dates.length === 0) {
+      return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
+    }
+    return (
+      <div className="scrollbar" style={{ overflowX: "auto", maxWidth: "100%", width: "100%", WebkitOverflowScrolling: "touch", overscrollBehaviorX: "contain" }}>
+        <table style={{ borderCollapse: "collapse", fontSize: "11px" }}>
+          <thead>
+            <tr>
+              <th style={{ position: "sticky", left: 0, zIndex: 2, background: "#12161d", padding: "4px 8px", textAlign: "left", borderBottom: "1px solid #2a323f" }} />
+              {dates.map((d) => (
+                <th key={d} className="mono" style={{ background: "#12161d", padding: "4px 3px", color: "#5a6272", borderBottom: "1px solid #2a323f", fontSize: "9px", whiteSpace: "nowrap" }}>
+                  {d.slice(5)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row}>
+                <td
+                  title={rowLabelFn(row)}
+                  style={{
+                    position: "sticky", left: 0,
+                    background: "#12161d",
+                    color: "#c7cbd4",
+                    padding: "4px 8px", borderBottom: "1px solid #1c2129", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                    maxWidth: "112px", boxSizing: "border-box",
+                  }}
+                >
+                  {rowLabelFn(row)}
+                </td>
+                {dates.map((d) => {
+                  const v = valuesMap[row] && valuesMap[row][d];
+                  return (
+                    <td
+                      key={d}
+                      className="mono"
+                      style={{ padding: "4px 3px", textAlign: "center", color: v !== null && v !== undefined ? fiveBandColor(v) : "#2a323f", borderBottom: "1px solid #1c2129" }}
+                    >
+                      {v !== null && v !== undefined ? v : "・"}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
@@ -5777,6 +5886,24 @@ export default function SlotDataTracker() {
             </div>
             {renderEventMultiSelect(pageGridEventFilter, setPageGridEventFilter)}
             {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => machineLabel(no))}
+          </div>
+
+          {/* v6.12: 台番号×日付のXマトリクス表（設定期待度・雑餉隈の「数値」
+              表示と同じ見た目）。▲〇マトリクスと日付・イベント絞り込みを
+              共有（pageGridDates）。パーセンタイル自体は絞り込みに関係なく
+              全期間データから計算するので、表示だけ絞り込まれる。 */}
+          <div className="card" style={{ padding: "18px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🎰 設定期待度マトリクス表（X・実験的）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              合成確率と出率を合成したX（設定期待度スコア）を、このページ内での順位（0〜100、高いほど良い）に変換して表示します。<span style={{ color: "#e8b34c" }}>差枚のプラス/マイナスとは別物です（設定は基本的に毎日変わるため）。</span>台番号固定の実績・日付末尾・イベント等、条件を目視で確認するのに使ってください。
+            </div>
+            {sortedHistory.length < 15 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>データが15日分たまると表示されます。</div>
+            ) : (
+              renderXGrid(pageGridDates, pageGridRows, pageGridXPercentiles, (no) => machineLabel(no))
+            )}
           </div>
         </div>
 
