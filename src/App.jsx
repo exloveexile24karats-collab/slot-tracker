@@ -215,7 +215,28 @@ const DIGIT7_COLOR = "#f6a04d";
 // 追加。renderXGrid関数で、Xをページ内パーセンタイル（0〜100）に変換し、
 // fiveBandColor（赤＞黄＞緑＞青＞灰）で色分け表示。既存の▲〇マトリクス
 // 表とは別枠のカードとして追加、日付・イベント絞り込みは共有。
-const APP_VERSION = "6.12";
+// v6.13: 「設定期待度（X）」をメイン表示に変更（「実験的」表記を外し、
+// 「本日のピックアップ（差枚・出率ベース）」より上に配置）。目的の再確認
+// ：最終ゴールは「差枚がプラスになる確率」ではなく「良い設定を掴むこと」
+// —設定が良さそうでも差枚がマイナスの日、その逆もあるため、両者は別の
+// 質問に答える指標として扱う（点数は合算しない、あくまで並び順と表記の
+// 変更のみ）。本日のピックアップの各カードにも、設定期待度のバッジ
+// （高/中/低）を追加表示（renderPickCardに第3引数xLabelLookupを追加）。
+// v6.14: スマホで重い・初回に「データがありません」と出る、の2点に対応。
+// ①読み込み中の表示漏れ：設定期待度・設定判別・Xマトリクス・本日の
+// ピックアップの4箇所が、データ読み込み中（historyLoading）でも「データ
+// がありません」系のメッセージを出していた（読み込み前は配列が空になる
+// ため）。全箇所に「読み込み中...」の分岐を追加。
+// ②パフォーマンス：Xの計算（computeXForPage）が同じページで2回（Xグリッド
+// 用・設定期待度予想用）別々に走っていたのを、1回計算して使い回す方式に
+// 変更。また、computeSettingExpectationForPage内の「前日、他の台が不調」
+// 「前日のG数水準」の集計が、台番号ごとに他の台の一覧をfind/filterし直す
+// O(台数²×日数)の重い作りになっていたのを、日付ごとのルックアップ表を
+// 先に1回だけ作る方式に直しO(台数×日数)へ改善。実データで計測したところ、
+// 一番重いカバネリページ（41台・81日）でcomputeSignalsForPageが約41ms/回
+// （スマホではこの数倍かかっている可能性が高い）。根本的な軽量化には、
+// 画面外のセクションを開くまで計算しない等の遅延計算が今後の候補。
+const APP_VERSION = "6.14";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1271,8 +1292,10 @@ function checkTrailingGsuLevelToday(gsuLevelStats, seriesWithShutsu, pageGsuPerc
 // 5つの条件（台番号固定の実績・日付末尾・イベント・前日の他の台の不調・
 // 前日のG数水準）を使い、翌日のXがどれくらい高くなりそうかを予想する。
 // ▲ベースのcomputeSignalsForPageとは完全に別系統・別スコア（合算しない）。
-function computeSettingExpectationForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, dateEventMapParam) {
-  const xByDate = computeXForPage(pageSortedHistory);
+function computeSettingExpectationForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, dateEventMapParam, xByDateParam) {
+  // v6.14: xByDateはページ単位で1回計算すれば十分（Xグリッド表示と
+  // ここで別々に計算していたのが無駄だったため、呼び出し側で共有する）
+  const xByDate = xByDateParam || computeXForPage(pageSortedHistory);
   // page全体のXの平均（このページの基準値）
   let allXCount = 0, allXSum = 0;
   Object.values(xByDate).forEach((dayMap) => {
@@ -1282,6 +1305,22 @@ function computeSettingExpectationForPage(machineNumbers, pageSortedHistory, pag
   const referenceDate = pageSortedHistory.length > 0 ? pageSortedHistory[pageSortedHistory.length - 1].date : null;
   if (!referenceDate) return [];
   const tomorrowDate = addDays(referenceDate, 1);
+
+  // v6.14: 台番号ごとの.find()呼び出しを毎回繰り返すと機種数×日数の
+  // 二乗オーダーになって重い（スマホでの動作が重いという指摘への対策）。
+  // 日付ごとのgsuルックアップ・Xの合計/件数を先に1回だけ作っておく。
+  const gsuByDateNo = {}; // {date: {no: gsu}}
+  const xSumByDate = {}; // {date: {sum, count}}
+  pageSortedHistory.forEach((h) => {
+    gsuByDateNo[h.date] = {};
+    let sum = 0, count = 0;
+    h.machines.forEach((m) => {
+      gsuByDateNo[h.date][m.no] = m.gsu ?? null;
+      const x = (xByDate[h.date] || {})[m.no];
+      if (x !== null && x !== undefined) { sum += x; count += 1; }
+    });
+    xSumByDate[h.date] = { sum, count };
+  });
 
   // 前日のページ全体の様子（他の台のXの平均）は全台共通なので1回だけ計算
   const lastDayMap = xByDate[referenceDate] || {};
@@ -1297,9 +1336,9 @@ function computeSettingExpectationForPage(machineNumbers, pageSortedHistory, pag
 
   const results = [];
   machineNumbers.forEach((no) => {
-    // この台のX系列（日付順）
+    // この台のX系列（日付順）— gsuByDateNoのルックアップ表を使うので.find()不要
     const xSeries = pageSortedHistory
-      .map((h) => ({ date: h.date, x: (xByDate[h.date] || {})[no] ?? null, gsu: (h.machines.find((m) => m.no === no) || {}).gsu ?? null }))
+      .map((h) => ({ date: h.date, x: (xByDate[h.date] || {})[no] ?? null, gsu: gsuByDateNo[h.date][no] ?? null }))
       .filter((r) => r.x !== null);
     if (xSeries.length === 0) return;
 
@@ -1332,28 +1371,29 @@ function computeSettingExpectationForPage(machineNumbers, pageSortedHistory, pag
       }
     });
 
-    // ④前日、同じページの他の台のXが低かった
+    // ④前日、同じページの他の台のXが低かった — xSumByDateのO(1)ルックアップ
+    // で「他の台の平均」を出す（Object.entries+filterを毎台繰り返さない）
     if (lastDayXAvg !== null && lastDayXAvg <= -0.3) {
-      // このページの過去実績から「他の台のXが低かった翌日」のこの台のX平均を集計
       const followVals = [];
-      pageSortedHistory.forEach((h, i) => {
-        if (i === 0) return;
+      for (let i = 1; i < pageSortedHistory.length; i++) {
         const prevDate = pageSortedHistory[i - 1].date;
-        const prevDayMap = xByDate[prevDate] || {};
-        const mateVals = Object.entries(prevDayMap).filter(([n]) => parseInt(n, 10) !== no).map(([, v]) => v).filter((v) => v !== null);
-        if (mateVals.length < 2) return;
-        const mateAvg = mateVals.reduce((a, v) => a + v, 0) / mateVals.length;
-        if (mateAvg > -0.3) return;
-        const myX = (xByDate[h.date] || {})[no];
+        const daySum = xSumByDate[prevDate];
+        const myPrevX = (xByDate[prevDate] || {})[no];
+        if (!daySum || myPrevX === null || myPrevX === undefined) continue;
+        const mateCount = daySum.count - 1;
+        if (mateCount < 2) continue;
+        const mateAvg = (daySum.sum - myPrevX) / mateCount;
+        if (mateAvg > -0.3) continue;
+        const myX = (xByDate[pageSortedHistory[i].date] || {})[no];
         if (myX !== null && myX !== undefined) followVals.push(myX);
-      });
+      }
       if (followVals.length >= 15) {
         const avg = followVals.reduce((a, v) => a + v, 0) / followVals.length;
         items.push({ label: "前日、他の台が不調", diff: avg - pageBaseX, sampleSize: followVals.length });
       }
     }
 
-    // ⑤前日のG数水準（大量回転/低調）
+    // ⑤前日のG数水準（大量回転/低調）— gsuByDateNoのルックアップ表を使う
     if (p33 !== null && p66 !== null) {
       const lastGsu = xSeries.length > 0 ? xSeries[xSeries.length - 1].gsu : null;
       if (lastGsu !== null) {
@@ -1361,7 +1401,7 @@ function computeSettingExpectationForPage(machineNumbers, pageSortedHistory, pag
         if (level) {
           const followVals = [];
           for (let i = 1; i < pageSortedHistory.length; i++) {
-            const prevGsu = (pageSortedHistory[i - 1].machines.find((m) => m.no === no) || {}).gsu;
+            const prevGsu = gsuByDateNo[pageSortedHistory[i - 1].date][no];
             if (prevGsu === null || prevGsu === undefined) continue;
             const prevLevel = prevGsu >= p66 ? "high" : prevGsu <= p33 ? "low" : null;
             if (prevLevel !== level) continue;
@@ -3275,10 +3315,25 @@ export default function SlotDataTracker() {
   }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA]);
 
   // v6.10: 設定期待度（X予想）— ▲ベースのpickListとは別枠、合算しない
+  // v6.14: Xの生値はページ単位で1回だけ計算し、設定期待度予想とXグリッド
+  // 表示の両方で使い回す（以前は2箇所で別々に計算していて無駄だった —
+  // スマホでの動作が重いという指摘への対策の一つ）
+  const pageXByDate = useMemo(() => {
+    if (sortedHistory.length < 15) return null;
+    return computeXForPage(sortedHistory);
+  }, [sortedHistory]);
+
   const settingExpectationList = useMemo(() => {
-    if (sortedHistory.length < 15) return [];
-    return computeSettingExpectationForPage(allMachineNumbers, sortedHistory, historyByDate, dateEventMap);
-  }, [allMachineNumbers, sortedHistory, historyByDate, dateEventMap]);
+    if (sortedHistory.length < 15 || !pageXByDate) return [];
+    return computeSettingExpectationForPage(allMachineNumbers, sortedHistory, historyByDate, dateEventMap, pageXByDate);
+  }, [allMachineNumbers, sortedHistory, historyByDate, dateEventMap, pageXByDate]);
+  // v6.13: 台番号 -> 設定期待度、本日のピックアップのカードにバッジで
+  // 添えるためのルックアップ（点数の合算はしない、表示だけ）
+  const settingExpectationByNo = useMemo(() => {
+    const map = {};
+    settingExpectationList.forEach((p) => { map[p.no] = p; });
+    return map;
+  }, [settingExpectationList]);
 
   // v6.11: 本格的な設定判別（理論値表＋ポアソン尤度）— SETTING_PROFILESに
   // 登録されている機種（現状マイジャグラーVのみ）の正式名称と一致する
@@ -3510,9 +3565,8 @@ export default function SlotDataTracker() {
 
   // v6.12: 台番号×日付のXマトリクス表用データ（設定期待度・数値表示）
   const pageGridXPercentiles = useMemo(() => {
-    if (sortedHistory.length < 15) return {};
-    const xByDate = computeXForPage(sortedHistory);
-    const pctByDate = computeXPercentiles(xByDate);
+    if (!pageXByDate) return {};
+    const pctByDate = computeXPercentiles(pageXByDate);
     const map = {};
     Object.entries(pctByDate).forEach(([date, dayMap]) => {
       Object.entries(dayMap).forEach(([noStr, pct]) => {
@@ -3522,7 +3576,7 @@ export default function SlotDataTracker() {
       });
     });
     return map;
-  }, [sortedHistory]);
+  }, [pageXByDate]);
 
   const overallModelPickList = useMemo(() => {
     const sortedH = overallSortedSummaries.map((s) => ({
@@ -4082,7 +4136,8 @@ export default function SlotDataTracker() {
     );
   }
 
-  function renderPickCard(p, labelOverride) {
+  function renderPickCard(p, labelOverride, xLabelLookup) {
+    const xInfo = xLabelLookup ? xLabelLookup(p.no) : null;
 
     return (
       <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
@@ -4096,6 +4151,20 @@ export default function SlotDataTracker() {
                 background: { S: "#f2d24b", A: "#9ece6a", B: "#4fd1c5", C: "#7aa2f7", D: "#c7cbd4", E: "#f6a04d", F: "#e5697a", G: "#e5484d" }[p.grade],
               }}>
                 {p.grade}
+              </span>
+            )}
+            {xInfo && (
+              <span
+                className="mono"
+                title={`設定期待度: ${xInfo.label}（X予想 ${xInfo.predictedX >= 0 ? "+" : ""}${xInfo.predictedX.toFixed(2)}）`}
+                style={{
+                  fontSize: "10px", fontWeight: 800, padding: "1px 6px", borderRadius: "999px",
+                  color: xInfo.label === "高" ? "#12161d" : xInfo.label === "低" ? "#e7e9ee" : "#c7cbd4",
+                  background: xInfo.label === "高" ? "#9ece6a" : xInfo.label === "低" ? "#e5697a" : "#2a323f",
+                  cursor: "help",
+                }}
+              >
+                設定{xInfo.label}
               </span>
             )}
             {p.totalPoints !== null && p.totalPoints !== undefined && (
@@ -5899,7 +5968,9 @@ export default function SlotDataTracker() {
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
               合成確率と出率を合成したX（設定期待度スコア）を、このページ内での順位（0〜100、高いほど良い）に変換して表示します。<span style={{ color: "#e8b34c" }}>差枚のプラス/マイナスとは別物です（設定は基本的に毎日変わるため）。</span>台番号固定の実績・日付末尾・イベント等、条件を目視で確認するのに使ってください。
             </div>
-            {sortedHistory.length < 15 ? (
+            {historyLoading ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>
+            ) : sortedHistory.length < 15 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>データが15日分たまると表示されます。</div>
             ) : (
               renderXGrid(pageGridDates, pageGridRows, pageGridXPercentiles, (no) => machineLabel(no))
@@ -6253,47 +6324,22 @@ export default function SlotDataTracker() {
             )}
           </div>
 
-          {/* pick-up: machines currently matching a historically favorable pattern */}
+          {/* v6.13: 設定期待度（X予想）をメイン表示に変更。目的は「差枚が
+              プラスになる確率」ではなく「設定が入っていたか」の確認 —
+              設定が良さそうでも差枚がマイナスの日はある（逆もある）ため、
+              差枚ベースのピックアップとは別の質問に答える指標として、
+              あえて上に配置している。合成確率と出率を合成した連続値Xを
+              使い、翌日「設定が良さそうか」を予想する。 */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              本日のピックアップ（10日足・20日足・30日足）
+              🎰 設定期待度（メイン）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台を「総合スコア」が高い順（同スコアなら根拠の件数が多い順）にリストアップします（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。
-            </div>
-            {overallBacktestStats && (
-              <div style={{
-                fontSize: "11px", color: "#8b93a3", marginBottom: "12px", padding: "8px 10px",
-                background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
-              }}>
-                参考：総差枚しきい値ルールの過去的中率（全台・10/20/30日足 合算） 約
-                <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(overallBacktestStats.winRate * 100)}%</span>
-                （{overallBacktestStats.totalSamples}件） ※ルールを作った同じ過去データで検証した参考値です。将来を保証するものではありません。
-              </div>
-            )}
-            {pickList.length === 0 ? (
-              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる台はありません。</div>
-            ) : (
-              <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
-                {pickList.map((p) => renderPickCard(p, isMultiModelPage ? (pp) => machineLabel(pp.no) : undefined))}
-              </div>
-            )}
-          </div>
-
-          {/* v6.10: 設定期待度（X予想）— 上のピックアップ（▲・差枚ベース）とは
-              別枠。合成確率と出率を合成した連続値Xを使い、翌日「設定が
-              良さそうか」を予想する。差枚のプラス/マイナスとは別物なので
-              あえて分けて表示（設定は毎日変わるため、当てにしすぎない） */}
-          <div className="card" style={{ padding: "18px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              🎰 設定期待度（実験的）
-            </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              合成確率（BB+RB合算）と出率を組み合わせた指数（X）で、「設定が良さそうだったか」を数値化し、台番号固定の実績・日付末尾・イベント・前日の他の台の不調・前日のG数水準から、翌日のXを予想します。<span style={{ color: "#e8b34c" }}>設定は基本的に毎日変わるので、上のピックアップ（差枚・出率ベース）とは別物として参考程度に見てください。</span>
+              合成確率（BB+RB合算）と出率を組み合わせた指数（X）で、「設定が良さそうだったか」を数値化し、台番号固定の実績・日付末尾・イベント・前日の他の台の不調・前日のG数水準から、翌日のXを予想します。<span style={{ color: "#e8b34c" }}>「差枚がプラスになるか」ではなく「設定が入っていたか」を見る指標です（設定が良くても差枚がマイナスの日、その逆もあります）。実際の差枚は下の「本日のピックアップ」で確認してください。</span>
             </div>
             {settingExpectationList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>
-                {sortedHistory.length < 15 ? "データが15日分たまると表示されます。" : "現時点で予想できる台がありません。"}
+                {historyLoading ? "読み込み中..." : sortedHistory.length < 15 ? "データが15日分たまると表示されます。" : "現時点で予想できる台がありません。"}
               </div>
             ) : (
               <div className="scrollbar" style={{ maxHeight: "320px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -6344,7 +6390,7 @@ export default function SlotDataTracker() {
                 最新日（{settingLikelihoodList[0] ? settingLikelihoodList[0].date : "-"}）のBB・RB回数とG数から、設定1〜6それぞれの事後確率をポアソン尤度で計算しています（事前分布は一様と仮定）。あくまで1日分のデータからの推定なので、サンプルが少ない台は幅を持って見てください。
               </div>
               {settingLikelihoodList.length === 0 ? (
-                <div style={{ fontSize: "12px", color: "#5a6272" }}>この日のBB/RB/G数データがまだありません。</div>
+                <div style={{ fontSize: "12px", color: "#5a6272" }}>{historyLoading ? "読み込み中..." : "この日のBB/RB/G数データがまだありません。"}</div>
               ) : (
                 <div className="scrollbar" style={{ maxHeight: "360px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
                   {settingLikelihoodList.map((r) => (
@@ -6380,6 +6426,36 @@ export default function SlotDataTracker() {
               )}
             </div>
           )}
+
+
+          {/* v6.13: 差枚・出率ベースのピックアップ。設定期待度Xとは別の
+              質問（「儲かりそうか」）に答えるための補助的な指標として、
+              設定期待度の下に配置している。 */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              本日のピックアップ（差枚・出率ベース、10日足・20日足・30日足）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台を「総合スコア」が高い順（同スコアなら根拠の件数が多い順）にリストアップします（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。
+            </div>
+            {overallBacktestStats && (
+              <div style={{
+                fontSize: "11px", color: "#8b93a3", marginBottom: "12px", padding: "8px 10px",
+                background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+              }}>
+                参考：総差枚しきい値ルールの過去的中率（全台・10/20/30日足 合算） 約
+                <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(overallBacktestStats.winRate * 100)}%</span>
+                （{overallBacktestStats.totalSamples}件） ※ルールを作った同じ過去データで検証した参考値です。将来を保証するものではありません。
+              </div>
+            )}
+            {pickList.length === 0 ? (
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>{historyLoading ? "読み込み中..." : "現時点で条件に当てはまる台はありません。"}</div>
+            ) : (
+              <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
+                {pickList.map((p) => renderPickCard(p, isMultiModelPage ? (pp) => machineLabel(pp.no) : undefined, (no) => settingExpectationByNo[no] || null))}
+              </div>
+            )}
+          </div>
 
           {/* machine-to-machine correlation */}
           <div className="card" style={{ padding: "18px" }}>
