@@ -281,7 +281,36 @@ const DIGIT7_COLOR = "#f6a04d";
 // 他の台のtrailing average X、この台自身は除外）をcomputeSignalsForPage
 // に統合。ウォークフォワード検証で、Xベースの法則は5752回発火し、統合後
 // もA〜Eの単調な分離を維持（A25.9%→B23.5%→C18.9%→D17.6%→E14.1%）。
-const APP_VERSION = "6.18";
+// v6.19: ユーコーラッキー太宰府VVVのバックテスト資料（考え方のみ参考、
+// 数値は使用せず自店データで再集計）をきっかけに、指示書に記載の全項目
+// を実データで再検証。①マイナス連続日数→翌日反発、②直近7日重み付き
+// スコア、③台番号隣接（周辺台の代用）、④純粋谷間、⑤曜日、⑥複合条件
+// （差枚×連続日数）は、いずれも効果が弱いかノイズレベルで不採用。
+// ⑦前日の細かい結果段階（大勝ち等）はやや効果ありだが既存の台番号固定の
+// 実績と重複が大きく見送り。⑧「島内の高設定台数」だけは有効な発見：
+// 前日、他の台の▲率を段階別に見ると0〜50%+まで連続的にほぼ単調増加
+// しており、特に50%以上（n=138）で+8.6ptの明確な正の効果を確認。既存の
+// 「前日、他の台が不調」（-5.2pt側のみ採用済み）の対になる正の信号
+// 「前日、他の台が好調」として新規採用（computePageMateGoodStats/
+// checkPageMateGoodToday）。ウォークフォワード検証で統合後もA〜Eの単調な
+// 分離を維持（A25.3%→B23.8%→C18.8%→D17.6%→E14.1%、S24.1%まで改善）。
+// v6.20: 【大きな設計変更】予想対象を「▲・差枚が当たるか」から「翌日、
+// 設定期待度Xの値が高くなるか」に統一（何度もの確認の末、ようやく正しい
+// 理解に至った）。古い▲・差枚ベースの判定材料（10/20/30日足・連続日数・
+// 曜日・強いイベント翌日・イベント登録連動(旧)・おすすめ機種期間・相対
+// ローテーション・大量回転低調・イベント間トレンド・イベント直前トレンド）
+// は全部削除。実データ検証で全部Xの予想材料としても機能することを確認
+// 済みの6つ（台番号固有のXの法則・機種全体のXの法則・前日他の台が好調・
+// 前日のG数水準・日付末尾・イベント名）だけに絞り、computeEvPointsで統一
+// スコア化。ウォークフォワード検証で綺麗な単調減少を確認：
+// S(n=22)=0.126 > A(n=368)=0.075 > B(n=1518)=0.027 > C(n=2220)=0.015 >
+// D(n=1234)=-0.039（以前悩まされていたSがAより低い逆転現象も解消）。
+// 【副作用】民レポ（機種別サマリー・末尾別データ）にはBB・RB回数が無く
+// Xが計算できないため、「全体データ」タブの機種別/末尾別ピックアップは
+// 現在無効（該当UIにその旨を明記）。renderPickCardも新しいデータ構造
+// （windows/streakMatch/digitDayMatch等の個別フィールドを廃止、
+// scoreItemsのみ）に合わせて全面書き換え。
+const APP_VERSION = "6.20";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -701,28 +730,25 @@ function scoreToGrade(score) {
 // backtesting (real hall data, walk-forward) showed these specific signals
 // have a genuine, repeatable edge; everything else is kept as a smaller
 // tie-breaker rather than being dropped, since it still carries some signal
+// v6.20: 「翌日、Xの値が高くなるところを予想する」に統一。実データ検証で
+// 全部Xの予想材料としても機能することを確認済みの6つの判定材料だけに
+// 絞った（古い▲・差枚ベースの判定材料は全部削除）。
 const STRONG_SIGNAL_LABELS = new Set([
-  "強いイベント間トレンド",
-  "相対ローテーション（設定良さそう）",
-  "イベント登録連動",
-  "イベント直前10日トレンド",
-  // v6.9: 実データ検証（81日/7,459台日、▲マーク基準）で確認した新しい
-  // 強い基準。台番号固定の実績はn=1993で+18.1、前日のG数水準（大量回転）
-  // はn=2388で+10.6と、いずれも大サンプル・方向一貫で確認済み
-  "台番号固定の実績",
-  "前日のG数水準",
-  // v6.17: 機種全体の法則 — 台番号固定の実績とは独立した情報量があると
-  // 実データで確認済み（n=6324、自分の実績の高低どちらでも機種全体の
-  // 好不調で+8〜9ptの差）
-  "機種全体の法則",
-  // v6.18: X（設定期待度）ベースの2法則。従来の▲・差枚ベースのランクと
-  // 完全合体（別カードにしない）。
+  // v6.9→v6.20: 台番号固有のXの法則。実データ検証：上位1/3でbase比+0.045、
+  // 下位1/3で-0.020と、方向一貫かつ大サンプル(各n=2101)で確認済み
   "台番号固有のXの法則",
+  // v6.17→v6.20: 機種全体のXの法則。台番号固有の実績とは独立した情報量
+  // がある。実データ検証：上位1/3でbase比+0.031、下位1/3で-0.035
   "機種全体のXの法則",
+  // v6.19→v6.20: 前日、他の台が好調（▲率50%+）。実データ検証：+0.058
+  "前日、他の台が好調",
+  // v6.9→v6.20: 前日のG数水準（大量回転/低調）。実データ検証：大量回転
+  // +0.023、低調-0.025
+  "前日のG数水準",
 ]);
 function isStrongSignalLabel(label) {
   const baseLabel = label.replace(/[（(].*[）)]/g, "").trim();
-  return STRONG_SIGNAL_LABELS.has(baseLabel) || baseLabel.startsWith("日付末尾");
+  return STRONG_SIGNAL_LABELS.has(baseLabel) || baseLabel.startsWith("日付末尾") || baseLabel.startsWith("イベント「");
 }
 
 // grade bands for the hybrid score: count-of-proven-signals * 100, plus a
@@ -776,33 +802,19 @@ function computeEvPoints(signalAvg, baselineAvg, typicalMagnitude, sampleSize) {
 // real hall data (see conversation history) — signals that turned out to
 // have little/no real predictive edge are dialed down rather than removed
 // outright, in case future data tells a different story
+// v6.20: 「翌日、Xの値が高くなるところを予想する」に統一したため、古い
+// ▲・差枚ベースの判定材料（streak/weekday/strongFollow/semiFollow/
+// interEventTrend系/preEventTrend/recommend/settingGood-Low/
+// volumeMismatch/古いplannedEvent/fixedNo/pageMateTrouble/modelWide）は
+// 全部削除。実データ検証でXの予想材料としても機能することを確認した
+// 6つの判定材料の重みだけ残す。
 const SIGNAL_WEIGHTS = {
-  streak: 0.3, // 連続日数 — backtested near/below baseline
-  weekday: 0.3, // 曜日傾向 — backtested near baseline
-  strongFollow: 1,
-  semiFollow: 0.5, // 準イベント翌日 — weaker tier than 強いイベント
-  plannedEvent: 1.5, // イベント登録連動 — backtested clearly above baseline
-  recommend: 1,
-  settingGood: 1.5, // 相対ローテーション（設定良さそう）— backtested clearly above baseline
-  settingLow: 1,
-  volumeMismatch: 0.3, // 大量回転・低調 — backtested ~no edge
-  digitDay: 1, // any 日付末尾, generalized (not just 2/7) — backtested strong for "2", strong AGAINST for "0"
-  interEventTrend: 0.7, // new: modest but consistent edge in backtest
-  strongInterEventTrend: 0.9, // 強いイベント同士の間のトレンド — strongest tier
-  semiInterEventTrend: 0.4, // 準イベント同士の間のトレンド — weakest tier
-  preEventTrend: 1.5, // イベント直前10日トレンド — backtested strong for 2のつく日(13pt)/7のつく日(7pt)
-  // v6.9: 3 new signals, calibrated from the 81日/7,459台日 実データ検証
-  fixedNo: 1.5, // 台番号固定の実績 — largest, most robust finding of the batch (n≈2000, ±17〜18pt)
-  pageMateTrouble: 1.3, // 前日、他の台が不調 — strong caution signal (n=1822, -15.7pt)
-  gsuLevel: 1.2, // 前日のG数水準（大量回転/低調） — solid n but smaller magnitude than the two above
-  // v6.17: 機種全体の法則 — n=6324, controlling for fixedNo still shows
-  // +8〜9pt independently, comparable in strength to fixedNo itself
-  modelWide: 1.5,
-  // v6.18: X（設定期待度）ベースの2法則。▲ベースと違う情報源（合成確率＋
-  // 出率の複合値）なので、まずは中程度の重みから開始し、今後のバック
-  // テストで調整する。
-  fixedNoX: 1.0,
-  modelWideX: 1.0,
+  digitDay: 1, // 日付末尾 — 実データ検証で強く確認（=0で-0.150、=2で+0.141）
+  plannedEvent: 1.5, // イベント名ごと — 実データ検証で強く確認（爆撮+0.201、百獣撮-0.143等）
+  fixedNoX: 1.5, // 台番号固有のXの法則 — 上位1/3で+0.045、下位1/3で-0.020
+  modelWideX: 1.5, // 機種全体のXの法則 — 上位1/3で+0.031、下位1/3で-0.035
+  gsuLevel: 1.2, // 前日のG数水準（大量回転/低調） — 大量回転+0.023、低調-0.025
+  pageMateGood: 1.3, // 前日、他の台が好調（50%+） — +0.058
 };
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -1311,6 +1323,41 @@ function checkPageMateTroubleToday(pageMateTroubleStats, pageHistoryByDate, last
   return pageMateTroubleStats;
 }
 
+// v6.19: 【実証済み・強い基準】前日、同じページの他の台の当たり(▲)率が
+// 高かった（50%以上）→ 今日この台が当たるか。当初「他の台が好調だった」
+// 側は効果が弱いと判断して不採用にしていたが、指示書（ユーコーラッキー
+// スレッド）の「島内の高設定台数」という着眼点をきっかけに、台数ではなく
+// 率で細かく区切って再検証したところ、50%以上のところだけ明確な正の効果
+// （n=138, 的中率29.7%、ベース比+8.6pt）を発見。0〜10%（不調）〜50%+
+// （好調）まで連続的にほぼ単調増加する構造だったことも判明。
+function computePageMateGoodStats(pageSortedHistory) {
+  let n = 0, hits = 0;
+  for (let i = 1; i < pageSortedHistory.length; i++) {
+    const prevDay = pageSortedHistory[i - 1];
+    const curDay = pageSortedHistory[i];
+    const prevValid = prevDay.machines.filter((m) => m.shutsu !== null && m.shutsu !== undefined);
+    if (prevValid.length < 2) continue;
+    const prevHitRate = prevValid.filter((m) => isHitA(m.shutsu)).length / prevValid.length;
+    if (prevHitRate < 0.5) continue; // only the "good page day" bucket
+    curDay.machines.forEach((m) => {
+      if (m.shutsu === null || m.shutsu === undefined) return;
+      n += 1;
+      if (isHitA(m.shutsu)) hits += 1;
+    });
+  }
+  return n >= 15 ? { winRate: hits / n, sampleSize: n } : null;
+}
+function checkPageMateGoodToday(pageMateGoodStats, pageHistoryByDate, lastDate, no) {
+  if (!pageMateGoodStats) return null;
+  const lastDayRec = pageHistoryByDate[lastDate];
+  if (!lastDayRec) return null;
+  const lastMates = lastDayRec.machines.filter((m) => m.no !== no && m.shutsu !== null && m.shutsu !== undefined);
+  if (lastMates.length < 2) return null;
+  const lastMateHitRate = lastMates.filter((m) => isHitA(m.shutsu)).length / lastMates.length;
+  if (lastMateHitRate < 0.5) return null;
+  return pageMateGoodStats;
+}
+
 // v6.9: 【実証済み・強い基準】前日の自分自身のG数水準（大量回転/低調）→
 // 翌日当たるか。実データ検証：前日大量回転→翌日24.6%(+3.5pt)、前日低調→
 // 翌日18.1%(-3.0pt)。当日のG数で判定すると強い相関が出るが、それは終わって
@@ -1346,6 +1393,71 @@ function checkTrailingGsuLevelToday(gsuLevelStats, seriesWithShutsu, pageGsuPerc
   const { p33, p66 } = pageGsuPercentiles;
   if (lastGsu >= p66 && gsuLevelStats.高) return { level: "大量回転", ...gsuLevelStats.高 };
   if (lastGsu <= p33 && gsuLevelStats.低) return { level: "低調", ...gsuLevelStats.低 };
+  return null;
+}
+
+// v6.20: 【Xターゲット版】前日、同じページの他の台の▲率が高かった/低
+// かった → 翌日の自分のXが高くなるか。実データ検証（会話履歴参照）で、
+// 好調(▲率50%+)は+0.058、不調(▲率10%以下)は+0.027（不調側はXでは向きが
+// 弱いので採用せず、好調側だけ本採用）。
+function computePageMateGoodStatsX(pageSortedHistory, pageXByDate) {
+  let n = 0, xSum = 0;
+  for (let i = 1; i < pageSortedHistory.length; i++) {
+    const prevDay = pageSortedHistory[i - 1];
+    const curDay = pageSortedHistory[i];
+    const prevValid = prevDay.machines.filter((m) => m.shutsu !== null && m.shutsu !== undefined);
+    if (prevValid.length < 3) continue;
+    const prevHitRate = prevValid.filter((m) => isHitA(m.shutsu)).length / prevValid.length;
+    if (prevHitRate < 0.5) continue; // only the "good page day" bucket
+    curDay.machines.forEach((m) => {
+      const x = (pageXByDate[curDay.date] || {})[m.no];
+      if (x === null || x === undefined) return;
+      n += 1; xSum += x;
+    });
+  }
+  return n >= 15 ? { avgX: xSum / n, sampleSize: n } : null;
+}
+function checkPageMateGoodTodayX(stats, pageHistoryByDate, lastDate, no) {
+  if (!stats) return null;
+  const lastDayRec = pageHistoryByDate[lastDate];
+  if (!lastDayRec) return null;
+  const lastMates = lastDayRec.machines.filter((m) => m.no !== no && m.shutsu !== null && m.shutsu !== undefined);
+  if (lastMates.length < 3) return null;
+  const lastMateHitRate = lastMates.filter((m) => isHitA(m.shutsu)).length / lastMates.length;
+  if (lastMateHitRate < 0.5) return null;
+  return stats;
+}
+
+// v6.20: 【Xターゲット版】前日の自分自身のG数水準（大量回転/低調）→
+// 翌日のXが高くなるか。実データ検証：低調→-0.025、大量回転→+0.023。
+function computeTrailingGsuLevelStatsX(pageSortedHistory, pageGsuPercentiles, pageXByDate) {
+  if (!pageGsuPercentiles) return null;
+  const { p33, p66 } = pageGsuPercentiles;
+  let highN = 0, highXSum = 0, lowN = 0, lowXSum = 0;
+  for (let i = 1; i < pageSortedHistory.length; i++) {
+    const prevDay = pageSortedHistory[i - 1];
+    const curDay = pageSortedHistory[i];
+    const prevByNo = new Map(prevDay.machines.map((m) => [m.no, m.gsu]));
+    curDay.machines.forEach((m) => {
+      const prevGsu = prevByNo.get(m.no);
+      const x = (pageXByDate[curDay.date] || {})[m.no];
+      if (prevGsu === null || prevGsu === undefined || x === null || x === undefined) return;
+      if (prevGsu >= p66) { highN += 1; highXSum += x; }
+      else if (prevGsu <= p33) { lowN += 1; lowXSum += x; }
+    });
+  }
+  return {
+    高: highN >= 15 ? { avgX: highXSum / highN, sampleSize: highN } : null,
+    低: lowN >= 15 ? { avgX: lowXSum / lowN, sampleSize: lowN } : null,
+  };
+}
+function checkTrailingGsuLevelTodayX(gsuLevelStatsX, seriesWithShutsu, pageGsuPercentiles) {
+  if (!gsuLevelStatsX || !pageGsuPercentiles) return null;
+  const lastGsu = seriesWithShutsu[seriesWithShutsu.length - 1].gsu;
+  if (lastGsu === null || lastGsu === undefined) return null;
+  const { p33, p66 } = pageGsuPercentiles;
+  if (lastGsu >= p66 && gsuLevelStatsX.高) return { level: "大量回転", ...gsuLevelStatsX.高 };
+  if (lastGsu <= p33 && gsuLevelStatsX.低) return { level: "低調", ...gsuLevelStatsX.低 };
   return null;
 }
 
@@ -2963,119 +3075,76 @@ export default function SlotDataTracker() {
   // (computed across all machines this page has ever seen)
   // core per-machine signal computation, parameterized so it can be reused
   // for both the active page and the store-wide 機種別/末尾別 summaries
+  // v6.20: 【大きな設計変更】このエンジンが予想する対象を「▲・差枚が
+  // 当たるか」から「翌日、Xの値が高くなるか」に統一。以前は▲ベースの
+  // 古い判定材料（10/20/30日足・連続日数・曜日・強いイベント翌日・
+  // イベント登録連動・おすすめ機種期間・相対ローテーション・大量回転低調・
+  // イベント間トレンド等）と、新しいX/▲ベースの判定材料が混在していた
+  // が、指示（「翌日Xの値が高くなるところを予想する」）に合わせて、古い
+  // 判定材料は全部削除し、実データ検証で全部Xの予想材料としても機能する
+  // ことを確認済みの6つの判定材料だけに絞った：
+  // ①台番号固有のXの法則 ②機種全体のXの法則 ③前日、他の台が好調
+  // ④前日のG数水準 ⑤日付末尾 ⑥イベント名（登録されているイベント）
   function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam) {
     const results = [];
-    // pageRecommendsList is usually one shared list (applies to every machine
-    // on this page) — but for the overall 機種別 list, each "no" is a
-    // different model name with its OWN periods, so it can also be passed as
-    // a Map/object keyed by "no" instead
-    function recommendsFor(no) {
-      if (Array.isArray(pageRecommendsList)) return pageRecommendsList;
-      if (pageRecommendsList instanceof Map) return pageRecommendsList.get(no) || [];
-      return pageRecommendsList[no] || [];
-    }
-    const dailySettingFlags = computeDailySettingFlags(pageSortedHistory);
-    // v6.9: precomputed once per page (not per machine) for the 3 new
-    // ▲-mark-based signals below
-    const pageBaseRateA = globalBaseRateAParam !== undefined && globalBaseRateAParam !== null ? globalBaseRateAParam : computePageBaseRateA(pageSortedHistory);
+    if (!pageXByDateParam) return results; // Xが計算できていなければ何も予想できない
+
     const pageGsuPercentiles = computePageGsuPercentiles(pageSortedHistory);
-    // v6.9.1: pooled once per page (across every machine's data), not
-    // per-machine — see computePageMateTroubleStats/computeTrailingGsuLevelStats
-    const pageMateTroubleStats = computePageMateTroubleStats(pageSortedHistory);
-    const gsuLevelStats = computeTrailingGsuLevelStats(pageSortedHistory, pageGsuPercentiles);
-    // v6.17: 【実証済み・強い基準④】機種全体の法則 — 台番号固定の実績とは
-    // 独立した情報量があることを実データで確認済み（自分の実績が高い/低い
-    // グループそれぞれで、機種全体が好調/不調による+8〜9ptの差を確認）。
-    // modelNameごとに日付順でプールしたシリーズを1回だけ作っておく（台
-    // ごとに毎回作り直さない）。
+    const pageMateGoodStatsX = computePageMateGoodStatsX(pageSortedHistory, pageXByDateParam);
+    const gsuLevelStatsX = computeTrailingGsuLevelStatsX(pageSortedHistory, pageGsuPercentiles, pageXByDateParam);
+
+    // modelNameごとに日付順でプールしたシリーズ（機種全体のXの法則用）
     const modelSeriesByName = {};
     let pageXSum = 0, pageXCount = 0;
     pageSortedHistory.forEach((h) => {
       h.machines.forEach((m) => {
         const mn = m.modelName || "__unknown__";
         if (!modelSeriesByName[mn]) modelSeriesByName[mn] = [];
-        const xVal = pageXByDateParam ? (pageXByDateParam[h.date] || {})[m.no] : null;
-        modelSeriesByName[mn].push({ date: h.date, no: m.no, shutsu: m.shutsu, x: xVal !== undefined ? xVal : null });
+        const xVal = (pageXByDateParam[h.date] || {})[m.no];
+        modelSeriesByName[mn].push({ date: h.date, no: m.no, event: h.event, x: xVal !== undefined ? xVal : null });
         if (xVal !== null && xVal !== undefined) { pageXSum += xVal; pageXCount += 1; }
       });
     });
-    // v6.18: XのX基準を▲基準のscoreItemsに合流させるための、ページ全体の
-    // Xの平均値（このページのベースライン）
     const pageXAvg = pageXCount > 0 ? pageXSum / pageXCount : 0;
-    // Xの典型的なブレ幅（computeEvPointsの正規化に使う、z-score合成なので
-    // だいたい0.7前後になる）
     let pageXAbsSum = 0;
-    modelSeriesByName && Object.values(modelSeriesByName).forEach((arr) => {
+    Object.values(modelSeriesByName).forEach((arr) => {
       arr.forEach((r) => { if (r.x !== null && r.x !== undefined) pageXAbsSum += Math.abs(r.x - pageXAvg); });
     });
     const pageXTypicalMagnitude = pageXCount > 0 ? pageXAbsSum / pageXCount || 1 : 1;
-    // "tomorrow" must mean the same date for every machine/model/digit on this
-    // page — anchored to the page's own most recent entered date, NOT each
-    // item's own last non-"-" date (otherwise an item that happened to show
-    // "-" on the latest date would predict for the wrong, already-past day)
+
     const referenceDate = pageSortedHistory.length > 0 ? pageSortedHistory[pageSortedHistory.length - 1].date : null;
+    if (!referenceDate) return results;
+    const tomorrowDate = addDays(referenceDate, 1);
+    const tomorrowDigit = parseInt(tomorrowDate.slice(-2), 10) % 10;
+    const tomorrowEventNames = splitEventNames(dateEventMap[tomorrowDate] || "");
 
     machineNumbers.forEach((no) => {
-      const seriesFull = pageSortedHistory
+      const xSeries = pageSortedHistory
         .map((h) => {
           const m = h.machines.find((mm) => mm.no === no);
-          return m && m.sada !== null ? { date: h.date, sada: m.sada, gsu: m.gsu, shutsu: m.shutsu, event: h.event, modelName: m.modelName } : null;
+          if (!m) return null;
+          const x = (pageXByDateParam[h.date] || {})[no];
+          return { date: h.date, gsu: m.gsu, x: x !== undefined ? x : null, event: h.event, modelName: m.modelName };
         })
-        .filter(Boolean);
-      if (seriesFull.length === 0) return;
-      const series = seriesFull.map((s) => ({ date: s.date, sada: s.sada }));
-      const lastDate = series[series.length - 1].date;
-      const baseRate = computeBaseRate(series);
-      // this machine's own typical scale, used to make the expected-value
-      // (average payout) component comparable across machines of very
-      // different sizes/volatility
-      const machineAvgSada = series.reduce((a, s) => a + s.sada, 0) / series.length;
-      const machineTypicalMagnitude = series.reduce((a, s) => a + Math.abs(s.sada), 0) / series.length || 1;
+        .filter((r) => r && r.x !== null && r.x !== undefined);
+      if (xSeries.length === 0) return;
+      const lastDate = xSeries[xSeries.length - 1].date;
+      const thisMachineModelName = xSeries[xSeries.length - 1].modelName;
 
-      // v6.9: 【実証済み・強い基準①】台番号固定の実績（トレイリング）——
-      // この台自身の▲率が、ページ全体の▲率と比べて高いか低いか。実データ
-      // 検証：自身の実績が平均+5pt以上のグループはn=1993で的中27.1%
-      // （+6.0pt）、-5pt以下のグループはn=2200で15.5%（-5.6pt）と、方向
-      // 両方で明確かつ大サンプルの効果を確認済み。未来のデータを含めない
-      // よう、必ずこの台の「今日までの」全実績（トレイリング）で計算する。
-      const shutsuValsForThisMachine = seriesFull.map((s) => s.shutsu).filter((v) => v !== null && v !== undefined);
-      let fixedNoMatch = null;
-      if (shutsuValsForThisMachine.length >= 10) {
-        const hits = shutsuValsForThisMachine.filter((v) => isHitA(v)).length;
-        fixedNoMatch = { winRate: hits / shutsuValsForThisMachine.length, sampleSize: shutsuValsForThisMachine.length };
-      }
+      const scoreItems = []; // { label, points }
 
-      // v6.17: 【実証済み・強い基準④】機種全体の法則（トレイリング）——
-      // 同じ機種名の「他の台」の▲率が、ページ全体の▲率と比べて高いか
-      // 低いか（この台自身は除外して集計、自分自身の実績と重複しない
-      // ようにする）。実データ検証：n=6324で、自分の実績が高い/低いどちら
-      // のグループでも、機種全体が好調な方が+8〜9pt高い的中率になることを
-      // 確認済み（台番号固定の実績とは独立した情報量）。
-      let modelWideMatch = null;
-      const thisMachineModelName = seriesFull.length > 0 ? seriesFull[seriesFull.length - 1].modelName : null;
-      if (thisMachineModelName && modelSeriesByName[thisMachineModelName]) {
-        const otherModelVals = modelSeriesByName[thisMachineModelName]
-          .filter((r) => r.no !== no && r.shutsu !== null && r.shutsu !== undefined)
-          .map((r) => r.shutsu);
-        if (otherModelVals.length >= 10) {
-          const hits = otherModelVals.filter((v) => isHitA(v)).length;
-          modelWideMatch = { winRate: hits / otherModelVals.length, sampleSize: otherModelVals.length };
-        }
-      }
-
-      // v6.18: 台番号固有のXの法則 — この台自身のトレイリング平均X（合成
-      // 確率＋出率の複合スコア）が、ページ全体平均より高いか低いか。
+      // ①台番号固有のXの法則（トレイリング平均X、この台自身の過去実績）
       let fixedNoXMatch = null;
-      if (pageXByDateParam) {
-        const ownXVals = seriesFull.map((s) => (pageXByDateParam[s.date] || {})[no]).filter((v) => v !== null && v !== undefined);
-        if (ownXVals.length >= 10) {
-          const avgX = ownXVals.reduce((a, v) => a + v, 0) / ownXVals.length;
-          fixedNoXMatch = { avgX, sampleSize: ownXVals.length };
-        }
+      if (xSeries.length >= 10) {
+        const avgX = xSeries.reduce((a, r) => a + r.x, 0) / xSeries.length;
+        fixedNoXMatch = { avgX, sampleSize: xSeries.length };
+      }
+      if (fixedNoXMatch) {
+        const evPts = computeEvPoints(fixedNoXMatch.avgX, pageXAvg, pageXTypicalMagnitude, fixedNoXMatch.sampleSize);
+        scoreItems.push({ label: "台番号固有のXの法則", points: evPts * SIGNAL_WEIGHTS.fixedNoX });
       }
 
-      // v6.18: 機種全体のXの法則 — 同じ機種名の「他の台」のトレイリング
-      // 平均Xが、ページ全体平均より高いか低いか（この台自身は除外）。
+      // ②機種全体のXの法則（同じ機種名の他の台のトレイリング平均X、この台は除外）
       let modelWideXMatch = null;
       if (thisMachineModelName && modelSeriesByName[thisMachineModelName]) {
         const otherModelXVals = modelSeriesByName[thisMachineModelName]
@@ -3086,339 +3155,44 @@ export default function SlotDataTracker() {
           modelWideXMatch = { avgX, sampleSize: otherModelXVals.length };
         }
       }
-
-      // v6.9: 【実証済み・強い基準②】前日、同じページの他の台が不調
-      const pageMateTroubleMatch = checkPageMateTroubleToday(pageMateTroubleStats, pageHistoryByDate, lastDate, no);
-
-      // v6.9: 【実証済み・強い基準③】前日の自分自身のG数水準（大量回転/低調）
-      const gsuLevelMatch = checkTrailingGsuLevelToday(gsuLevelStats, seriesFull, pageGsuPercentiles);
-
-      const windows = [10, 20, 30].map((w) => ({ windowSize: w, result: evaluateWindow(series, w, baseRate) }));
-      const matchedWindows = windows.filter((w) => w.result && w.result.reasons.length > 0);
-
-      const evaluableCount = windows.filter((w) => w.result).length;
-      const avgWinRate = matchedWindows.length
-        ? matchedWindows.reduce((a, w) => a + Math.max(...w.result.reasons.map((r) => r.winRate)), 0) / matchedWindows.length
-        : null;
-
-      // streak-based signal — prefer the EXACT streak-length stat (signed,
-      // whichever direction it points), falling back to the "N-or-more"
-      // grouped stat (positive-only) when the exact length has too few samples
-      const streakEval = series.length >= 9 ? evaluateStreakPattern(series, baseRate) : null;
-      let streakMatch = null;
-      if (streakEval && streakEval.currentStreak && streakEval.currentStreak.dir !== "flat") {
-        const dir = streakEval.currentStreak.dir;
-        const len = streakEval.currentStreak.len;
-        const exactRaw = streakEval.exactForDirRaw(dir, len);
-        const best = dir === "plus" ? streakEval.plus : streakEval.minus; // positive-only fallback
-        if (exactRaw) {
-          streakMatch = { dir, len, ...exactRaw, exact: exactRaw };
-        } else if (best && len >= best.minLen) {
-          streakMatch = { dir, len, ...best, exact: null };
-        }
-      }
-
-      // weekday-based signal (how does tomorrow's weekday historically do?)
-      const weekdayStats = computeWeekdayStats(series);
-      const tomorrowDate = addDays(referenceDate || lastDate, 1);
-      const tomorrowWeekday = weekdayOf(tomorrowDate);
-      const weekdayBucket = weekdayStats[tomorrowWeekday];
-      const weekdayMatch = weekdayBucket && weekdayBucket.count >= 3 && weekdayBucket.winRate !== null ? weekdayBucket : null;
-
-      // if tomorrow is ALSO a "2のつく日" or "7のつく日", check that intersection specifically
-      const tomorrowDigit = parseInt(tomorrowDate.slice(-2), 10) % 10;
-      let combinedWeekdayDigit = null;
-      if (tomorrowDigit === 2 || tomorrowDigit === 7) {
-        const combinedDates = series.filter(
-          (pt) => weekdayOf(pt.date) === tomorrowWeekday && parseInt(pt.date.slice(-2), 10) % 10 === tomorrowDigit
-        );
-        if (combinedDates.length > 0) {
-          const avg = combinedDates.reduce((a, p) => a + p.sada, 0) / combinedDates.length;
-          combinedWeekdayDigit = { digit: tomorrowDigit, avg, count: combinedDates.length };
-        } else {
-          combinedWeekdayDigit = { digit: tomorrowDigit, avg: null, count: 0 };
-        }
-      }
-
-      // generalized "日付末尾" signal for ANY digit 0-9 (not just a hand-picked
-      // 2/7 combo) — backtesting on real data showed "2のつく日" is a strong
-      // positive and "0のつく日" a strong negative, so this is scored like any
-      // other signal rather than assumed. compared against the OTHER 9
-      // digits' combined rate, not the plain base rate, for the same reason
-      // planned events are (digit-days are frequent enough to already be
-      // baked into the plain base rate otherwise)
-      const digitDates = [];
-      const otherDigitDates = [];
-      series.forEach((pt) => {
-        (parseInt(pt.date.slice(-2), 10) % 10 === tomorrowDigit ? digitDates : otherDigitDates).push(pt);
-      });
-      let digitDayMatch = null;
-      if (digitDates.length >= 5) {
-        const wins = digitDates.filter((pt) => pt.sada > 0).length;
-        const otherWins = otherDigitDates.filter((pt) => pt.sada > 0).length;
-        digitDayMatch = {
-          digit: tomorrowDigit,
-          winRate: wins / digitDates.length,
-          avg: digitDates.reduce((a, p) => a + p.sada, 0) / digitDates.length,
-          sampleSize: digitDates.length,
-          normalRate: otherDigitDates.length >= 5 ? otherWins / otherDigitDates.length : baseRate,
-        };
-      }
-
-      // did today follow a registered strong-event day, and how did that
-      // pattern historically do (compared to non-event-day follow-throughs)?
-      const strongFollowEval = series.length >= 6 ? evaluateStrongFollow(series, pageStrongDateSet) : null;
-      let strongFollowMatch = null;
-      if (strongFollowEval && strongFollowEval.strong && pageStrongDateSet.has(lastDate)) {
-        const normalRate = strongFollowEval.normal ? strongFollowEval.normal.winRate : 0.5;
-        strongFollowMatch = { ...strongFollowEval.strong, normalRate };
-      }
-
-      // 準イベント翌日 — same idea as strongFollowMatch but the weaker third
-      // tier (強いイベント ＞ イベント ＞ 準イベント)
-      const semiFollowEval = pageSemiDateSet && series.length >= 6 ? evaluateStrongFollow(series, pageSemiDateSet) : null;
-      let semiFollowMatch = null;
-      if (semiFollowEval && semiFollowEval.strong && pageSemiDateSet.has(lastDate)) {
-        const normalRate = semiFollowEval.normal ? semiFollowEval.normal.winRate : 0.5;
-        semiFollowMatch = { ...semiFollowEval.strong, normalRate };
-      }
-
-      // is tomorrow pre-registered (via イベント登録) as one or more named
-      // events? tomorrow may have several tags at once (e.g. "2のつく日、新
-      // 台入れ替え") — check each individually and use whichever has the
-      // best historical track record for THIS machine, compared against
-      // this machine's OWN non-event-day rate (not the plain base rate,
-      // which already has these frequent events mixed into it)
-      const plannedEventName = dateEventMap[tomorrowDate];
-      const plannedEventNameList = splitEventNames(plannedEventName);
-      let plannedEventMatch = null;
-      plannedEventNameList.forEach((name) => {
-        const perf = evaluateEventNamePerformance(series, pageHistoryByDate, name);
-        if (perf && (!plannedEventMatch || perf.winRate > plannedEventMatch.winRate)) {
-          const normalRate = perf.normalRate !== null ? perf.normalRate : baseRate;
-          plannedEventMatch = { name, favorable: perf.winRate > normalRate, normalRate, ...perf };
-        }
-      });
-
-      // does the trailing 10-day trend (as of today) predict how this
-      // specific upcoming named event will go, based on that event's own
-      // past instances split the same way? only meaningful per-event-name
-      // (backtested: strong for 2のつく日/7のつく日, much weaker for others)
-      let preEventTrendMatch = null;
-      if (series.length >= 10) {
-        const trailing10 = series.slice(-10).reduce((a, s) => a + s.sada, 0);
-        const currentDir = trailing10 > 0 ? "up" : "down";
-        plannedEventNameList.forEach((name) => {
-          const trend = evaluatePreEventTrend(series, pageHistoryByDate, name, 10);
-          const current = trend[currentDir];
-          const other = trend[currentDir === "up" ? "down" : "up"];
-          if (current && (!preEventTrendMatch || current.winRate > preEventTrendMatch.winRate)) {
-            preEventTrendMatch = {
-              name,
-              direction: currentDir === "up" ? "上昇" : "下降",
-              winRate: current.winRate,
-              avg: current.avg,
-              sampleSize: current.sampleSize,
-              baselineRate: other ? other.winRate : baseRate,
-            };
-          }
-        });
-      }
-
-      // is tomorrow within a hall-declared "おすすめ機種" period for this
-      // page/model (機種)? each model can have its OWN periods (see recommendsFor)
-      const thisRecommendsList = recommendsFor(no);
-      const pageRecommendDateSet = new Set();
-      thisRecommendsList.forEach((r) => enumerateDateRange(r.startDate, r.endDate).forEach((d) => pageRecommendDateSet.add(d)));
-      let recommendMatch = null;
-      if (pageRecommendDateSet.has(tomorrowDate)) {
-        const perf = evaluateMembershipPerformance(series, pageRecommendDateSet);
-        if (perf) {
-          const activePeriod = thisRecommendsList.find((r) => tomorrowDate >= r.startDate && tomorrowDate <= r.endDate);
-          recommendMatch = { label: activePeriod ? activePeriod.label : "おすすめ期間", ...perf };
-        }
-      }
-
-      // does the 差枚 trend since the last event predict tomorrow's event (if any)?
-      // computed separately per tier (強いイベント ＞ イベント ＞ 準イベント) so a
-      // weaker 準イベント's between-trend isn't diluted by unrelated regular events
-      const isTomorrowStrongTier = strongNameSet && plannedEventNameList.some((n) => strongNameSet.has(n));
-      const isTomorrowSemiTier = semiNameSet && !isTomorrowStrongTier && plannedEventNameList.some((n) => semiNameSet.has(n));
-      const interEventTrendMatch = evaluateInterEventTrend(seriesFull, !!plannedEventName);
-      const strongInterEventTrendMatch = isTomorrowStrongTier
-        ? evaluateInterEventTrend(seriesFull, true, pageStrongDateSet)
-        : null;
-      const semiInterEventTrendMatch = isTomorrowSemiTier
-        ? evaluateInterEventTrend(seriesFull, true, pageSemiDateSet)
-        : null;
-
-      // relative-to-peers rotation signal: was TODAY flagged "good" (heavily
-      // played, not badly losing) or "low" (little played despite being
-      // ahead) compared to other machines on this page that same day — and
-      // does that pattern historically predict tomorrow?
-      const flagByDate = new Map();
-      pageSortedHistory.forEach((h) => flagByDate.set(h.date, (dailySettingFlags[h.date] || {})[no] ?? null));
-      const settingFollow = seriesFull.length >= 6 ? evaluateSuspectedSettingFollow(seriesFull, flagByDate) : null;
-      const todayFlag = flagByDate.get(lastDate) || null;
-      let settingMatch = null;
-      if (todayFlag === "good" && settingFollow && settingFollow.good) {
-        settingMatch = { flag: "good", ...settingFollow.good };
-      }
-      let settingCaution = null;
-      if (todayFlag === "low" && settingFollow && settingFollow.low) {
-        settingCaution = { flag: "low", ...settingFollow.low };
-      }
-
-      // heavy play without a proportional payout — checked against baseRate too now
-      const volumeMismatch = evaluateVolumeMismatch(seriesFull);
-
-      const isTomorrowEvent = !!plannedEventName;
-
-      const hasAnySignal =
-        matchedWindows.length > 0 ||
-        streakMatch ||
-        weekdayMatch ||
-        strongFollowMatch ||
-        semiFollowMatch ||
-        plannedEventMatch ||
-        recommendMatch ||
-        settingMatch ||
-        settingCaution ||
-        volumeMismatch ||
-        digitDayMatch ||
-        interEventTrendMatch ||
-        strongInterEventTrendMatch ||
-        semiInterEventTrendMatch ||
-        preEventTrendMatch ||
-        fixedNoMatch ||
-        pageMateTroubleMatch ||
-        gsuLevelMatch ||
-        modelWideMatch ||
-        fixedNoXMatch ||
-        modelWideXMatch;
-      if (!hasAnySignal) return;
-
-      // ---- additive/subtractive scoring: every signal (favorable OR
-      // cautionary) contributes (its winRate − its own baseline) in
-      // percentage points PLUS an expected-value component (its average
-      // payout vs this machine's own typical day), both scaled down for
-      // small samples and by a per-signal weight calibrated from a
-      // walk-forward backtest on real hall data — then all of them are
-      // summed together, so the total can go negative. ----
-      const scoreItems = [];
-      // 10/20/30-day thresholds are only trustworthy when they backed a
-      // pattern that beats this machine's own base rate — but backtesting
-      // showed they're only genuinely reliable when tomorrow is ALSO an
-      // event day; on a normal day they were closer to a coin flip (or
-      // worse), so they're heavily discounted unless tomorrow is an event
-      const windowEventMultiplier = isTomorrowEvent ? 0.6 : 0.15;
-      matchedWindows.forEach((w) => {
-        const bestReason = w.result.reasons.reduce((a, r) => (!a || r.winRate > a.winRate ? r : a), null);
-        const winPts = computePoints(bestReason.winRate, baseRate, bestReason.sampleSize);
-        const evPts = computeEvPoints(bestReason.avgNext, machineAvgSada, machineTypicalMagnitude, bestReason.sampleSize);
-        scoreItems.push({ label: `${w.windowSize}日足${isTomorrowEvent ? "（イベント日）" : "（通常日）"}`, points: (winPts + evPts) * windowEventMultiplier });
-      });
-      if (streakMatch) {
-        const winPts = computePoints(streakMatch.winRate, baseRate, streakMatch.sampleSize);
-        const evPts = computeEvPoints(streakMatch.avgNext, machineAvgSada, machineTypicalMagnitude, streakMatch.sampleSize);
-        scoreItems.push({ label: "連続日数", points: (winPts + evPts) * SIGNAL_WEIGHTS.streak });
-      }
-      if (weekdayMatch) {
-        const winPts = computePoints(weekdayMatch.winRate, baseRate, weekdayMatch.count);
-        const evPts = computeEvPoints(weekdayMatch.avg, machineAvgSada, machineTypicalMagnitude, weekdayMatch.count);
-        scoreItems.push({ label: "曜日傾向", points: (winPts + evPts) * SIGNAL_WEIGHTS.weekday });
-      }
-      if (digitDayMatch) {
-        const winPts = computePoints(digitDayMatch.winRate, digitDayMatch.normalRate, digitDayMatch.sampleSize);
-        const evPts = computeEvPoints(digitDayMatch.avg, machineAvgSada, machineTypicalMagnitude, digitDayMatch.sampleSize);
-        scoreItems.push({ label: `日付末尾=${digitDayMatch.digit}`, points: (winPts + evPts) * SIGNAL_WEIGHTS.digitDay });
-      }
-      if (strongFollowMatch) {
-        const winPts = computePoints(strongFollowMatch.winRate, strongFollowMatch.normalRate, strongFollowMatch.sampleSize);
-        const evPts = computeEvPoints(strongFollowMatch.avgNext, machineAvgSada, machineTypicalMagnitude, strongFollowMatch.sampleSize);
-        scoreItems.push({ label: "強いイベント翌日", points: (winPts + evPts) * SIGNAL_WEIGHTS.strongFollow });
-      }
-      if (semiFollowMatch) {
-        const winPts = computePoints(semiFollowMatch.winRate, semiFollowMatch.normalRate, semiFollowMatch.sampleSize);
-        const evPts = computeEvPoints(semiFollowMatch.avgNext, machineAvgSada, machineTypicalMagnitude, semiFollowMatch.sampleSize);
-        scoreItems.push({ label: "準イベント翌日", points: (winPts + evPts) * SIGNAL_WEIGHTS.semiFollow });
-      }
-      if (plannedEventMatch) {
-        const winPts = computePoints(plannedEventMatch.winRate, plannedEventMatch.normalRate, plannedEventMatch.sampleSize);
-        const evPts = computeEvPoints(plannedEventMatch.avgNext, plannedEventMatch.normalAvg ?? machineAvgSada, machineTypicalMagnitude, plannedEventMatch.sampleSize);
-        scoreItems.push({ label: "イベント登録連動", points: (winPts + evPts) * SIGNAL_WEIGHTS.plannedEvent });
-      }
-      if (interEventTrendMatch) {
-        const winPts = computePoints(interEventTrendMatch.winRate, baseRate, interEventTrendMatch.sampleSize);
-        const evPts = computeEvPoints(interEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, interEventTrendMatch.sampleSize);
-        scoreItems.push({ label: `イベント間トレンド（${interEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.interEventTrend });
-      }
-      if (strongInterEventTrendMatch) {
-        const winPts = computePoints(strongInterEventTrendMatch.winRate, baseRate, strongInterEventTrendMatch.sampleSize);
-        const evPts = computeEvPoints(strongInterEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, strongInterEventTrendMatch.sampleSize);
-        scoreItems.push({ label: `強いイベント間トレンド（${strongInterEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.strongInterEventTrend });
-      }
-      if (semiInterEventTrendMatch) {
-        const winPts = computePoints(semiInterEventTrendMatch.winRate, baseRate, semiInterEventTrendMatch.sampleSize);
-        const evPts = computeEvPoints(semiInterEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, semiInterEventTrendMatch.sampleSize);
-        scoreItems.push({ label: `準イベント間トレンド（${semiInterEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.semiInterEventTrend });
-      }
-      if (preEventTrendMatch) {
-        const winPts = computePoints(preEventTrendMatch.winRate, preEventTrendMatch.baselineRate, preEventTrendMatch.sampleSize);
-        const evPts = computeEvPoints(preEventTrendMatch.avg, machineAvgSada, machineTypicalMagnitude, preEventTrendMatch.sampleSize);
-        scoreItems.push({ label: `イベント直前10日トレンド（${preEventTrendMatch.direction}）`, points: (winPts + evPts) * SIGNAL_WEIGHTS.preEventTrend });
-      }
-      if (recommendMatch) {
-        const winPts = computePoints(recommendMatch.winRate, baseRate, recommendMatch.sampleSize);
-        const evPts = computeEvPoints(recommendMatch.avg, machineAvgSada, machineTypicalMagnitude, recommendMatch.sampleSize);
-        scoreItems.push({ label: "おすすめ機種期間", points: (winPts + evPts) * SIGNAL_WEIGHTS.recommend });
-      }
-      if (settingMatch) {
-        const winPts = computePoints(settingMatch.winRate, baseRate, settingMatch.sampleSize);
-        const evPts = computeEvPoints(settingMatch.avg, machineAvgSada, machineTypicalMagnitude, settingMatch.sampleSize);
-        scoreItems.push({ label: "相対ローテーション（設定良さそう）", points: (winPts + evPts) * SIGNAL_WEIGHTS.settingGood });
-      }
-      if (settingCaution) {
-        const winPts = computePoints(settingCaution.winRate, baseRate, settingCaution.sampleSize);
-        const evPts = computeEvPoints(settingCaution.avg, machineAvgSada, machineTypicalMagnitude, settingCaution.sampleSize);
-        scoreItems.push({ label: "相対ローテーション（低設定っぽい）", points: (winPts + evPts) * SIGNAL_WEIGHTS.settingLow });
-      }
-      if (volumeMismatch && volumeMismatch.nextDayStats) {
-        const winPts = computePoints(volumeMismatch.nextDayStats.winRate, baseRate, volumeMismatch.nextDayStats.sampleSize);
-        const evPts = computeEvPoints(volumeMismatch.nextDayStats.avg, machineAvgSada, machineTypicalMagnitude, volumeMismatch.nextDayStats.sampleSize);
-        scoreItems.push({ label: "大量回転・低調", points: (winPts + evPts) * SIGNAL_WEIGHTS.volumeMismatch });
-      }
-      // v6.9: 3 new signals validated on real アナスロ data (81日/7,459台日,
-      // ▲マーク基準) — see conversation history for the full walk-forward
-      // scan across 13 candidate families. these use shutsu(▲)-based hit
-      // rates rather than sada>0 like the older signals above, since ▲〇は
-      // このアプリの実際の「良い/悪い」判定そのものだから
-      if (fixedNoMatch) {
-        const winPts = computePoints(fixedNoMatch.winRate, pageBaseRateA, fixedNoMatch.sampleSize);
-        scoreItems.push({ label: "台番号固定の実績", points: winPts * SIGNAL_WEIGHTS.fixedNo });
-      }
-      if (pageMateTroubleMatch) {
-        const winPts = computePoints(pageMateTroubleMatch.winRate, pageBaseRateA, pageMateTroubleMatch.sampleSize);
-        scoreItems.push({ label: "前日、他の台が不調", points: winPts * SIGNAL_WEIGHTS.pageMateTrouble });
-      }
-      if (gsuLevelMatch) {
-        const winPts = computePoints(gsuLevelMatch.winRate, pageBaseRateA, gsuLevelMatch.sampleSize);
-        scoreItems.push({ label: `前日のG数水準（${gsuLevelMatch.level}）`, points: winPts * SIGNAL_WEIGHTS.gsuLevel });
-      }
-      if (modelWideMatch) {
-        const winPts = computePoints(modelWideMatch.winRate, pageBaseRateA, modelWideMatch.sampleSize);
-        scoreItems.push({ label: "機種全体の法則", points: winPts * SIGNAL_WEIGHTS.modelWide });
-      }
-      // v6.18: X（設定期待度）ベースの2つの法則を、▲ベースの点数体系に
-      // 合流させる。continuous な値なのでcomputeEvPoints（EV差分型）を使う。
-      if (fixedNoXMatch) {
-        const evPts = computeEvPoints(fixedNoXMatch.avgX, pageXAvg, pageXTypicalMagnitude, fixedNoXMatch.sampleSize);
-        scoreItems.push({ label: "台番号固有のXの法則", points: evPts * SIGNAL_WEIGHTS.fixedNoX });
-      }
       if (modelWideXMatch) {
         const evPts = computeEvPoints(modelWideXMatch.avgX, pageXAvg, pageXTypicalMagnitude, modelWideXMatch.sampleSize);
         scoreItems.push({ label: "機種全体のXの法則", points: evPts * SIGNAL_WEIGHTS.modelWideX });
       }
+
+      // ③前日、他の台が好調（▲率50%以上）だった → 翌日の自分のX
+      const pageMateGoodMatch = checkPageMateGoodTodayX(pageMateGoodStatsX, pageHistoryByDate, lastDate, no);
+      if (pageMateGoodMatch) {
+        const evPts = computeEvPoints(pageMateGoodMatch.avgX, pageXAvg, pageXTypicalMagnitude, pageMateGoodMatch.sampleSize);
+        scoreItems.push({ label: "前日、他の台が好調", points: evPts * SIGNAL_WEIGHTS.pageMateGood });
+      }
+
+      // ④前日のG数水準（大量回転/低調）→ 翌日の自分のX
+      const gsuLevelMatch = checkTrailingGsuLevelTodayX(gsuLevelStatsX, xSeries, pageGsuPercentiles);
+      if (gsuLevelMatch) {
+        const evPts = computeEvPoints(gsuLevelMatch.avgX, pageXAvg, pageXTypicalMagnitude, gsuLevelMatch.sampleSize);
+        scoreItems.push({ label: `前日のG数水準（${gsuLevelMatch.level}）`, points: evPts * SIGNAL_WEIGHTS.gsuLevel });
+      }
+
+      // ⑤日付末尾（この台の過去、翌日と同じ末尾の日のXが高い/低いか）
+      const digitVals = xSeries.filter((r) => parseInt(r.date.slice(-2), 10) % 10 === tomorrowDigit).map((r) => r.x);
+      if (digitVals.length >= 5) {
+        const avgX = digitVals.reduce((a, v) => a + v, 0) / digitVals.length;
+        const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, digitVals.length);
+        scoreItems.push({ label: `日付末尾=${tomorrowDigit}`, points: evPts * SIGNAL_WEIGHTS.digitDay });
+      }
+
+      // ⑥イベント（明日登録されているイベント名の、過去のX平均）
+      tomorrowEventNames.forEach((name) => {
+        const matchVals = xSeries.filter((r) => r.event && splitEventNames(r.event).includes(name)).map((r) => r.x);
+        if (matchVals.length >= 5) {
+          const avgX = matchVals.reduce((a, v) => a + v, 0) / matchVals.length;
+          const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, matchVals.length);
+          scoreItems.push({ label: `イベント「${name}」`, points: evPts * SIGNAL_WEIGHTS.plannedEvent });
+        }
+      });
+
+      if (scoreItems.length === 0) return;
 
       let strongSignalCount = 0;
       let tieBreakerPoints = 0;
@@ -3433,26 +3207,6 @@ export default function SlotDataTracker() {
       results.push({
         no,
         lastDate,
-        windows,
-        matchedCount: matchedWindows.length,
-        evaluableCount,
-        avgWinRate,
-        streakMatch,
-        weekdayMatch,
-        weekdayTomorrow: WEEKDAY_LABELS[tomorrowWeekday],
-        combinedWeekdayDigit,
-        digitDayMatch,
-        strongFollowMatch,
-        semiFollowMatch,
-        plannedEventMatch,
-        recommendMatch,
-        interEventTrendMatch,
-        strongInterEventTrendMatch,
-        semiInterEventTrendMatch,
-        preEventTrendMatch,
-        settingMatch,
-        settingCaution,
-        volumeMismatch,
         scoreItems,
         totalPoints,
         strongSignalCount,
@@ -4313,205 +4067,11 @@ export default function SlotDataTracker() {
         </div>
 
         <div style={{ fontSize: "10px", color: "#5a6272", marginBottom: "8px", fontStyle: "italic" }}>
-          ※ スコア・グレードは複数の弱い手がかりを足し合わせた参考値です。精度が検証された予測ではないので、あくまで判断材料の一つとして見てください。
+          ※ 「翌日、設定期待度（X）が高くなりそうか」を予想したスコアです。差枚のプラス/マイナスとは別物（設定は基本的に毎日変わるため）で、精度が検証された予測ではないので、あくまで判断材料の一つとして見てください。
         </div>
 
-        {p.matchedCount > 0 && (
-          <div style={{ fontSize: "11px", color: "#c7cbd4", marginBottom: "6px", padding: "6px 8px", background: "rgba(79,209,197,0.08)", borderRadius: "6px" }}>
-            総合判断：<span style={{ color: "#4fd1c5", fontWeight: 700 }}>{p.evaluableCount}期間中{p.matchedCount}期間</span>でプラス条件に該当
-            （平均勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.avgWinRate * 100)}%</span>）
-          </div>
-        )}
-
-        {p.windows.map((w) => (
-          <div key={w.windowSize} style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "3px" }}>
-            <span className="mono" style={{ color: "#c7cbd4" }}>{w.windowSize}日足</span>：
-            {!w.result ? (
-              <span>データ不足</span>
-            ) : w.result.reasons.length === 0 ? (
-              <span>
-                条件非該当（直近合計 {w.result.currentTrailing >= 0 ? "+" : ""}{fmtNum(w.result.currentTrailing)}枚）
-              </span>
-            ) : (
-              w.result.reasons.map((r, i) => (
-                <span key={i}>
-                  条件該当（直近合計 {w.result.currentTrailing >= 0 ? "+" : ""}{fmtNum(w.result.currentTrailing)}枚 ／ しきい値
-                  <span className="mono" style={{ color: "#c7cbd4" }}>
-                    {" "}{r.threshold >= 0 ? "+" : ""}{fmtNum(Math.round(r.threshold))}枚{r.direction === "above" ? "以上" : "以下"}
-                  </span>
-                  ／ 過去勝率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(r.winRate * 100)}%</span>（{r.sampleSize}件中））
-                </span>
-              ))
-            )}
-          </div>
-        ))}
-
-        {p.streakMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
-            連続日数：<span className="mono" style={{ color: "#c7cbd4" }}>{p.streakMatch.len}日連続{p.streakMatch.dir === "plus" ? "プラス" : "マイナス"}</span>
-            {p.streakMatch.exact ? (
-              <>
-                （ちょうど{p.streakMatch.exact.len}日連続だった時の翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.exact.winRate * 100)}%</span>、{p.streakMatch.exact.sampleSize}件中）
-              </>
-            ) : (
-              <>
-                （ちょうど{p.streakMatch.len}日連続の過去データが少ないため、参考として{p.streakMatch.minLen}日以上でまとめた翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.streakMatch.winRate * 100)}%</span>、{p.streakMatch.sampleSize}件中）
-              </>
-            )}
-          </div>
-        )}
-
-        {p.weekdayMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
-            曜日傾向：明日は<span className="mono" style={{ color: "#c7cbd4" }}>{p.weekdayTomorrow}曜日</span>
-            （過去平均 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{p.weekdayMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.weekdayMatch.avg))}枚</span>、{p.weekdayMatch.count}件中）
-          </div>
-        )}
-
-        {p.combinedWeekdayDigit && (
-          <div style={{ fontSize: "11px", color: "#5a6272", marginTop: "3px", marginLeft: "12px" }}>
-            └ さらに絞って{p.weekdayTomorrow}曜日×{p.combinedWeekdayDigit.digit}のつく日：
-            {p.combinedWeekdayDigit.count === 0 ? (
-              <span>過去に該当日がまだありません</span>
-            ) : (
-              <span>
-                平均 <span style={{ color: p.combinedWeekdayDigit.avg >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
-                  {p.combinedWeekdayDigit.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.combinedWeekdayDigit.avg))}枚
-                </span>（{p.combinedWeekdayDigit.count}件中 — サンプルが少ないので参考程度に）
-              </span>
-            )}
-          </div>
-        )}
-
-        {p.digitDayMatch && (
-          <div style={{
-            fontSize: "11px", marginTop: "3px",
-            color: p.digitDayMatch.winRate > 0.5 ? "#8b93a3" : "#e5697a",
-          }}>
-            日付末尾={p.digitDayMatch.digit}の日：過去
-            <span style={{ color: p.digitDayMatch.winRate >= 0.5 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
-              {" "}{Math.round(p.digitDayMatch.winRate * 100)}%
-            </span>
-            でプラス（{p.digitDayMatch.sampleSize}件中、平均{p.digitDayMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.digitDayMatch.avg))}枚）
-          </div>
-        )}
-
-        {p.strongFollowMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
-            <Star size={10} style={{ display: "inline", marginRight: "2px", color: "#e5697a" }} fill="#e5697a" />
-            今日は強いイベント日 → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.strongFollowMatch.winRate * 100)}%</span>
-            （通常{Math.round(p.strongFollowMatch.normalRate * 100)}% ／ {p.strongFollowMatch.sampleSize}件中）
-          </div>
-        )}
-
-        {p.semiFollowMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px" }}>
-            <Flag size={9} style={{ display: "inline", marginRight: "2px", color: SEMI_EVENT_COLOR }} />
-            今日は準イベント日 → 翌日プラス率 <span style={{ color: "#9ece6a", fontWeight: 700 }}>{Math.round(p.semiFollowMatch.winRate * 100)}%</span>
-            （通常{Math.round(p.semiFollowMatch.normalRate * 100)}% ／ {p.semiFollowMatch.sampleSize}件中）
-          </div>
-        )}
-
-        {p.plannedEventMatch && (
-          <div style={{
-            fontSize: "11px", marginTop: "6px", padding: "6px 8px", borderRadius: "6px",
-            color: p.plannedEventMatch.favorable ? "#8b93a3" : "#e5697a",
-            background: p.plannedEventMatch.favorable ? "rgba(232,179,76,0.08)" : "rgba(229,105,122,0.06)",
-          }}>
-            📅 明日は予定イベント「{p.plannedEventMatch.name}」 → このイベントの日は過去
-            <span style={{ color: p.plannedEventMatch.favorable ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>
-              {" "}{Math.round(p.plannedEventMatch.winRate * 100)}%
-            </span>
-            でプラス（{p.plannedEventMatch.sampleSize}件中、平均{p.plannedEventMatch.avgNext >= 0 ? "+" : ""}{fmtNum(Math.round(p.plannedEventMatch.avgNext))}枚）
-          </div>
-        )}
-
-        {p.strongInterEventTrendMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.06)", borderRadius: "6px" }}>
-            📈 強いイベント同士の間の差枚が{p.strongInterEventTrendMatch.direction}傾向 → 明日の強いイベント当日は過去
-            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.strongInterEventTrendMatch.winRate * 100)}%</span>
-            でプラス（{p.strongInterEventTrendMatch.sampleSize}件中、平均{p.strongInterEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.strongInterEventTrendMatch.avg))}枚）
-          </div>
-        )}
-
-        {p.interEventTrendMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(122,162,247,0.08)", borderRadius: "6px" }}>
-            📈 前回のイベントからの差枚が{p.interEventTrendMatch.direction}傾向 → 明日のイベント当日は過去
-            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.interEventTrendMatch.winRate * 100)}%</span>
-            でプラス（{p.interEventTrendMatch.sampleSize}件中、平均{p.interEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.interEventTrendMatch.avg))}枚）
-          </div>
-        )}
-
-        {p.semiInterEventTrendMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(122,162,247,0.05)", borderRadius: "6px" }}>
-            📈 準イベント同士の間の差枚が{p.semiInterEventTrendMatch.direction}傾向 → 明日の準イベント当日は過去
-            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.semiInterEventTrendMatch.winRate * 100)}%</span>
-            でプラス（{p.semiInterEventTrendMatch.sampleSize}件中、平均{p.semiInterEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.semiInterEventTrendMatch.avg))}枚）
-          </div>
-        )}
-
-        {p.preEventTrendMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(232,179,76,0.08)", borderRadius: "6px" }}>
-            📊 直前10日間の差枚が{p.preEventTrendMatch.direction}傾向 → 明日の「{p.preEventTrendMatch.name}」当日は過去
-            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.preEventTrendMatch.winRate * 100)}%</span>
-            でプラス（{p.preEventTrendMatch.sampleSize}件中、平均{p.preEventTrendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.preEventTrendMatch.avg))}枚）
-          </div>
-        )}
-
-        {p.recommendMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(191,161,247,0.08)", borderRadius: "6px" }}>
-            🏆 明日は「{p.recommendMatch.label}」期間中 → この期間の実績は勝率
-            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.recommendMatch.winRate * 100)}%</span>
-            ・平均{p.recommendMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.recommendMatch.avg))}枚（{p.recommendMatch.sampleSize}件中）
-          </div>
-        )}
-
-        {p.settingMatch && (
-          <div style={{ fontSize: "11px", color: "#8b93a3", marginTop: "6px", padding: "6px 8px", background: "rgba(158,206,106,0.08)", borderRadius: "6px" }}>
-            🎯 今日は他と比べて回転数が多いのに大きく負けていない（設定良さそう）→ 過去このパターンの翌日は勝率
-            <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(p.settingMatch.winRate * 100)}%</span>
-            ・平均{p.settingMatch.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.settingMatch.avg))}枚（{p.settingMatch.sampleSize}件中）
-          </div>
-        )}
-
-        {p.settingCaution && (
-          <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
-            ⚠ 今日は他と比べて回転数が少ないのにプラス（早めに見切られた・低設定っぽい）→ 過去このパターンの翌日は勝率
-            <span style={{ fontWeight: 700 }}> {Math.round(p.settingCaution.winRate * 100)}%</span>
-            ・平均{p.settingCaution.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.settingCaution.avg))}枚（{p.settingCaution.sampleSize}件中）
-          </div>
-        )}
-
-        {p.volumeMismatch && (
-          <div style={{ fontSize: "11px", color: "#e5697a", marginTop: "6px", padding: "6px 8px", background: "rgba(229,105,122,0.08)", borderRadius: "6px" }}>
-            <div>
-              ⚠ 大量回転・低調：直近G数 <span className="mono">{fmtNum(p.volumeMismatch.lastGsu)}G</span>
-              （平均{fmtNum(Math.round(p.volumeMismatch.avgGsu))}G）に対し、差枚
-              <span className="mono"> {p.volumeMismatch.lastSada >= 0 ? "+" : ""}{fmtNum(p.volumeMismatch.lastSada)}枚</span>
-            </div>
-            {p.volumeMismatch.nextDayStats ? (
-              <div style={{ marginTop: "4px" }}>
-                過去、同じパターンの翌日：勝率 <span style={{ fontWeight: 700 }}>{Math.round(p.volumeMismatch.nextDayStats.winRate * 100)}%</span>
-                ・平均{p.volumeMismatch.nextDayStats.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.volumeMismatch.nextDayStats.avg))}枚
-                （{p.volumeMismatch.nextDayStats.sampleSize}件中）
-              </div>
-            ) : (
-              <div style={{ marginTop: "4px", color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（翌日）</div>
-            )}
-            {p.volumeMismatch.twoDayStats ? (
-              <div>
-                2日後：勝率 <span style={{ fontWeight: 700 }}>{Math.round(p.volumeMismatch.twoDayStats.winRate * 100)}%</span>
-                ・平均{p.volumeMismatch.twoDayStats.avg >= 0 ? "+" : ""}{fmtNum(Math.round(p.volumeMismatch.twoDayStats.avg))}枚
-                （{p.volumeMismatch.twoDayStats.sampleSize}件中）
-              </div>
-            ) : (
-              <div style={{ color: "#8b6b6f" }}>過去の同パターンのデータがまだ十分ではありません（2日後）</div>
-            )}
-          </div>
-        )}
-
         {p.scoreItems && p.scoreItems.length > 0 && (
-          <div style={{ marginTop: "8px", paddingTop: "6px", borderTop: "1px dashed #232b37", display: "flex", flexWrap: "wrap", gap: "6px" }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
             {p.scoreItems.map((s, i) => (
               <span key={i} className="mono" style={{
                 fontSize: "10px", padding: "1px 6px", borderRadius: "4px",
@@ -5809,7 +5369,7 @@ export default function SlotDataTracker() {
               下で貼り付けた「機種別サマリー」から、台ごとの分析と同じ仕組みで判定します。
             </div>
             {overallModelPickList.length === 0 ? (
-              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる機種はありません。</div>
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>民レポ（機種別サマリー）にはBB・RB回数が無く、設定期待度Xが計算できないため、現在この機能は無効です。</div>
             ) : (
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
                 {overallModelPickList.map((p) => renderPickCard(p, (pp) => pp.no))}
@@ -5825,7 +5385,7 @@ export default function SlotDataTracker() {
               下で貼り付けた「末尾別データ」から、同じ仕組みで判定します。
             </div>
             {overallDigitPickList.length === 0 ? (
-              <div style={{ fontSize: "12px", color: "#5a6272" }}>現時点で条件に当てはまる末尾はありません。</div>
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>民レポ（末尾別データ）にはBB・RB回数が無く、設定期待度Xが計算できないため、現在この機能は無効です。</div>
             ) : (
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
                 {overallDigitPickList.map((p) => renderPickCard(p, (pp) => `末尾${pp.no}`))}
@@ -6466,18 +6026,8 @@ export default function SlotDataTracker() {
               本日のピックアップ
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              直近の総差枚（10/20/30日足）・連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレに加えて、台番号固定の実績・機種全体の法則・前日の他の台の不調・前日のG数水準・台番号固有のXの法則・機種全体のXの法則も見て、当てはまる台をスコアが高い順に並べます（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。
+              「翌日、設定期待度（X）が高くなりそうか」を予想します。台番号固有のXの法則・機種全体のXの法則・前日、他の台が好調・前日のG数水準・日付末尾・イベント名の6つを見て、当てはまる台をスコアが高い順に並べます（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。<span style={{ color: "#e8b34c" }}>「差枚がプラスになるか」ではなく「設定が入っていたか」を見る指標です。</span>
             </div>
-            {overallBacktestStats && (
-              <div style={{
-                fontSize: "11px", color: "#8b93a3", marginBottom: "12px", padding: "8px 10px",
-                background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
-              }}>
-                参考：総差枚しきい値ルールの過去的中率（全台・10/20/30日足 合算） 約
-                <span style={{ color: "#9ece6a", fontWeight: 700 }}> {Math.round(overallBacktestStats.winRate * 100)}%</span>
-                （{overallBacktestStats.totalSamples}件） ※ルールを作った同じ過去データで検証した参考値です。将来を保証するものではありません。
-              </div>
-            )}
             {pickList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>{historyLoading ? "読み込み中..." : "現時点で条件に当てはまる台はありません。"}</div>
             ) : (
