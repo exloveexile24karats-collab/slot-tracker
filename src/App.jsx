@@ -236,7 +236,27 @@ const DIGIT7_COLOR = "#f6a04d";
 // 一番重いカバネリページ（41台・81日）でcomputeSignalsForPageが約41ms/回
 // （スマホではこの数倍かかっている可能性が高い）。根本的な軽量化には、
 // 画面外のセクションを開くまで計算しない等の遅延計算が今後の候補。
-const APP_VERSION = "6.14";
+// v6.15: 「本日のピックアップ（差枚・出率ベース）」を折りたたみ式にして
+// デフォルトで閉じ、「実証済み根拠」→「該当基準」に控えめな表現へ変更
+// （実データ検証でグレードAでもベース比+1.6pt程度と効果が弱く不安定
+// だったため）。【重要な訂正】設定期待度Xカードの説明に、マイジャグラー
+// V専用の理論値表ベース設定判別の実績（出玉率109.3%・相関係数0.607）を
+// 誤って書きそうになっていたのを訂正 — 実際に全ページ共通の一般的なXを
+// ウォークフォワード検証したところ、翌日の実際の出率との相関はほぼ無し
+// （相関係数0.010、n=5218）だった。109.3%の実績は理論値表を使う
+// マイジャグラーV専用の設定判別（別カード）にのみ帰属する数値で、
+// 各カードの説明文をそれぞれ正確な検証結果に修正した。
+// v6.16: 新台入れ替えでピックアップに古い台番号が出続けるバグを修正。
+// allMachineNumbers（このページの全期間の台番号の集合）を本日のピック
+// アップ・設定期待度の対象台リストにそのまま使っていたため、機種が
+// 入れ替わった後の台番号もずっと計算対象に残っていた。新たに
+// activeMachineNumbers（最新日に実際に登場した台番号のみ）を追加し、
+// pickList・settingExpectationListはこちらを使うよう変更（グラフの台
+// 選択・マトリクス表は過去を振り返る用途もあるためallMachineNumbersの
+// まま維持）。実データで確認：カバネリページは全期間41台のうち、最新日
+// には18台しかなく、23台が対象外になるべきだった（前回指摘のあった
+// カバネリの計算の重さも、対象台数が減ることで副次的に軽くなる）。
+const APP_VERSION = "6.16";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1609,6 +1629,9 @@ export default function SlotDataTracker() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteDate, setConfirmDeleteDate] = useState(null);
   const [dateListOpen, setDateListOpen] = useState(true);
+  // v6.15: 差枚・出率ベースのピックアップは補助的な位置づけになったため、
+  // デフォルトで閉じておく（設定期待度Xの方をメインで見てもらう）
+  const [legacyPickupOpen, setLegacyPickupOpen] = useState(false);
   const [useCustomRange, setUseCustomRange] = useState(false);
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
@@ -2458,6 +2481,12 @@ export default function SlotDataTracker() {
     return Array.from(set).sort((a, b) => a - b);
   }, [currentHistory]);
 
+  // v6.16: 新台入れ替えでこのページの機種が別の台番号に変わった場合、
+  // 過去のallMachineNumbers（全期間の台番号の集合）には入れ替え前の
+  // 台番号がずっと残り続け、ピックアップに古い台番号が出てきてしまう
+  // 問題があった。ピックアップ・設定期待度は「最新日に実際に登場した
+  // 台番号」だけを対象にする（グラフの台選択・マトリクス表は、過去を
+  // 振り返る用途もあるのでallMachineNumbersのまま維持）。
   useEffect(() => {
     if (!historyLoading && selectedMachines.length === 0 && allMachineNumbers.length > 0) {
       setSelectedMachines(allMachineNumbers.slice(0, Math.min(6, allMachineNumbers.length)));
@@ -2469,6 +2498,18 @@ export default function SlotDataTracker() {
     () => [...currentHistory].sort((a, b) => a.date.localeCompare(b.date)),
     [currentHistory]
   );
+
+  // v6.16: 新台入れ替えでこのページの機種が別の台番号に変わった場合、
+  // 過去のallMachineNumbers（全期間の台番号の集合）には入れ替え前の
+  // 台番号がずっと残り続け、ピックアップに古い台番号が出てきてしまう
+  // 問題があった。ピックアップ・設定期待度は「最新日に実際に登場した
+  // 台番号」だけを対象にする（グラフの台選択・マトリクス表は、過去を
+  // 振り返る用途もあるのでallMachineNumbersのまま維持）。
+  const activeMachineNumbers = useMemo(() => {
+    if (sortedHistory.length === 0) return [];
+    const lastDay = sortedHistory[sortedHistory.length - 1];
+    return Array.from(new Set(lastDay.machines.map((m) => m.no))).sort((a, b) => a - b);
+  }, [sortedHistory]);
 
   // v6.8: 台番号 -> 機種名（このページが複数機種を束ねている「理由Aタイプ」
   // ページの場合、台番号だけでは機種がわからないので表示に使う。最新の
@@ -3311,8 +3352,8 @@ export default function SlotDataTracker() {
   }
 
   const pickList = useMemo(() => {
-    return sortPickResults(computeSignalsForPage(allMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
-  }, [allMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA]);
+    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
+  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA]);
 
   // v6.10: 設定期待度（X予想）— ▲ベースのpickListとは別枠、合算しない
   // v6.14: Xの生値はページ単位で1回だけ計算し、設定期待度予想とXグリッド
@@ -3325,8 +3366,8 @@ export default function SlotDataTracker() {
 
   const settingExpectationList = useMemo(() => {
     if (sortedHistory.length < 15 || !pageXByDate) return [];
-    return computeSettingExpectationForPage(allMachineNumbers, sortedHistory, historyByDate, dateEventMap, pageXByDate);
-  }, [allMachineNumbers, sortedHistory, historyByDate, dateEventMap, pageXByDate]);
+    return computeSettingExpectationForPage(activeMachineNumbers, sortedHistory, historyByDate, dateEventMap, pageXByDate);
+  }, [activeMachineNumbers, sortedHistory, historyByDate, dateEventMap, pageXByDate]);
   // v6.13: 台番号 -> 設定期待度、本日のピックアップのカードにバッジで
   // 添えるためのルックアップ（点数の合算はしない、表示だけ）
   const settingExpectationByNo = useMemo(() => {
@@ -4173,7 +4214,7 @@ export default function SlotDataTracker() {
                 background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a",
                 borderRadius: "4px", padding: "1px 6px",
               }}>
-                実証済み根拠{p.strongSignalCount}個（微調整{p.tieBreakerPoints >= 0 ? "+" : ""}{Math.round(p.tieBreakerPoints)}pt・全{p.signalCount}件根拠）
+                該当基準{p.strongSignalCount}個（微調整{p.tieBreakerPoints >= 0 ? "+" : ""}{Math.round(p.tieBreakerPoints)}pt・全{p.signalCount}件根拠）
               </span>
             )}
           </span>
@@ -6335,7 +6376,13 @@ export default function SlotDataTracker() {
               🎰 設定期待度（メイン）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              合成確率（BB+RB合算）と出率を組み合わせた指数（X）で、「設定が良さそうだったか」を数値化し、台番号固定の実績・日付末尾・イベント・前日の他の台の不調・前日のG数水準から、翌日のXを予想します。<span style={{ color: "#e8b34c" }}>「差枚がプラスになるか」ではなく「設定が入っていたか」を見る指標です（設定が良くても差枚がマイナスの日、その逆もあります）。実際の差枚は下の「本日のピックアップ」で確認してください。</span>
+              合成確率（BB+RB合算）と出率を組み合わせた指数（X）で、「設定が良さそうだったか」を数値化し、台番号固定の実績・日付末尾・イベント・前日の他の台の不調・前日のG数水準から、翌日のXを予想します。<span style={{ color: "#e8b34c" }}>「差枚がプラスになるか」ではなく「設定が入っていたか」を見る指標です（設定が良くても差枚がマイナスの日、その逆もあります）。実際の差枚は下の「本日のピックアップ（参考）」で確認してください。</span>
+            </div>
+            <div style={{
+              fontSize: "11px", color: "#8b93a3", marginBottom: "12px", padding: "8px 10px",
+              background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+            }}>
+              正直な検証結果：全ページ・全期間のウォークフォワード検証では、この予想Xと翌日の実際の出率の相関はほぼ無し（相関係数0.01、n=5218）でした。<span style={{ color: "#e8b34c" }}>「Xが高いほど条件が当てはまっている」ことは確認できていますが、それが翌日の出玉に直結するとは言い切れません</span>（設定は基本的に毎日リセットされるため）。マイジャグラーVのみ、理論値表を使った別方式の設定判別（下のカード）でより強い相関（0.607）を確認しています。
             </div>
             {settingExpectationList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>
@@ -6389,6 +6436,14 @@ export default function SlotDataTracker() {
               <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
                 最新日（{settingLikelihoodList[0] ? settingLikelihoodList[0].date : "-"}）のBB・RB回数とG数から、設定1〜6それぞれの事後確率をポアソン尤度で計算しています（事前分布は一様と仮定）。あくまで1日分のデータからの推定なので、サンプルが少ない台は幅を持って見てください。
               </div>
+              <div style={{
+                fontSize: "11px", color: "#8b93a3", marginBottom: "12px", padding: "8px 10px",
+                background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
+              }}>
+                検証結果：実データ984台日で、予想「設定5+確率」が上位20%（32%以上）だった日は、実際の出率が
+                <span style={{ color: "#9ece6a", fontWeight: 700 }}> 109.3%</span>
+                （ベース比+16.0pt、平均差枚+2,147枚、n=200、相関係数0.607）でした。理論値表を使うこの方式は、同日中の判断材料としては信頼性が高いことを確認済みです。
+              </div>
               {settingLikelihoodList.length === 0 ? (
                 <div style={{ fontSize: "12px", color: "#5a6272" }}>{historyLoading ? "読み込み中..." : "この日のBB/RB/G数データがまだありません。"}</div>
               ) : (
@@ -6430,13 +6485,29 @@ export default function SlotDataTracker() {
 
           {/* v6.13: 差枚・出率ベースのピックアップ。設定期待度Xとは別の
               質問（「儲かりそうか」）に答えるための補助的な指標として、
-              設定期待度の下に配置している。 */}
+              設定期待度の下に配置している。
+              v6.15: 実データ検証で、設定期待度Xの上位クインタイル
+              （+11.8pt、出玉率109.3%）に対し、こちらのグレードは効果が
+              弱く不安定（グレードAでも+1.6ptほど、Sが逆にAより低いなど）
+              だったため、デフォルトで折りたたみ、控えめな表現に変更。 */}
           <div className="card" style={{ padding: "18px" }}>
-            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              本日のピックアップ（差枚・出率ベース、10日足・20日足・30日足）
-            </div>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台を「総合スコア」が高い順（同スコアなら根拠の件数が多い順）にリストアップします（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。
+            <button
+              onClick={() => setLegacyPickupOpen((v) => !v)}
+              style={{
+                display: "flex", alignItems: "center", gap: "6px", width: "100%",
+                background: "none", border: "none", cursor: "pointer", padding: 0,
+                textAlign: "left", marginBottom: legacyPickupOpen ? "4px" : 0,
+              }}
+            >
+              {legacyPickupOpen ? <ChevronDown size={14} color="#5a6272" /> : <ChevronRight size={14} color="#5a6272" />}
+              <span style={{ fontSize: "13px", fontWeight: 700, color: "#c7cbd4" }}>
+                本日のピックアップ（差枚・出率ベース、参考）
+              </span>
+            </button>
+            {legacyPickupOpen && (
+              <>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px", marginTop: "10px" }}>
+              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台をスコアが高い順に並べます（このページの全ての台が対象）。<span style={{ color: "#e8b34c" }}>実データ検証では、設定期待度Xほど明確な差は出ていません（グレードAでもベース比+1.6pt程度）。参考程度に見てください。</span>
             </div>
             {overallBacktestStats && (
               <div style={{
@@ -6454,6 +6525,8 @@ export default function SlotDataTracker() {
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
                 {pickList.map((p) => renderPickCard(p, isMultiModelPage ? (pp) => machineLabel(pp.no) : undefined, (no) => settingExpectationByNo[no] || null))}
               </div>
+            )}
+              </>
             )}
           </div>
 
