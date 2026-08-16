@@ -256,7 +256,32 @@ const DIGIT7_COLOR = "#f6a04d";
 // まま維持）。実データで確認：カバネリページは全期間41台のうち、最新日
 // には18台しかなく、23台が対象外になるべきだった（前回指摘のあった
 // カバネリの計算の重さも、対象台数が減ることで副次的に軽くなる）。
-const APP_VERSION = "6.16";
+// v6.17: 新しい強い基準「機種全体の法則」を追加。マイジャグラーVの
+// ポアソン尤度式設定判別に台番号固定の実績（トレイリング予想）を試した
+// ところ相関係数0.024でほぼ効果無しだったのを踏まえ、「機種全体（同じ
+// modelNameの他の台）の▲率トレンド」を検証したところ、n=6324で明確な
+// 単調傾向（下位1/3=14.3%、中位=21.2%、上位=27.8%、相関係数0.147）。
+// さらに台番号固定の実績で高低をコントロールしても、機種全体の法則を
+// 追加すると両グループとも+8〜9ptの差が出ることを確認 — 独立した情報量
+// があると判断し、STRONG_SIGNAL_LABELSに正式採用。computeSignalsForPage
+// 内でmodelSeriesByNameをページ単位で1回だけ作り、台ごとに自分自身を
+// 除外して機種全体のトレイリング▲率を計算する方式（v6.9.1の設計と同じ
+// パターンで、n=6324の効果を再現できることをウォークフォワード検証済み、
+// 機種全体の法則は1876回発火・A〜Eの単調な分離を維持したまま範囲が拡大）。
+// マイジャグラー設定判別（理論値表ベース）は「本日の振り返り」としての
+// 位置づけのまま、翌日予想の追加は見送り（台番号の持続効果が実データで
+// 確認できなかったため）。
+// v6.18: 【大きな設計変更】設定期待度（X）と▲・差枚ベースのA〜Gランクを
+// 完全合体。従来の「設定期待度（高/中/低）」別カード、マイジャグラー
+// 専用の設定判別カード（本日の振り返り）を削除。ご指摘の通り、①設定
+// 判別カードは「今日の振り返り」であって翌日予想になっていなかった、
+// ②機種全体の法則はX基準でも見つけて台番号固有のX法則と組み合わせるべき
+// だった、という2点を反映。新たに「台番号固有のXの法則」（own trailing
+// average X、computeEvPointsで得点化）「機種全体のXの法則」（同じ機種の
+// 他の台のtrailing average X、この台自身は除外）をcomputeSignalsForPage
+// に統合。ウォークフォワード検証で、Xベースの法則は5752回発火し、統合後
+// もA〜Eの単調な分離を維持（A25.9%→B23.5%→C18.9%→D17.6%→E14.1%）。
+const APP_VERSION = "6.18";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -686,6 +711,14 @@ const STRONG_SIGNAL_LABELS = new Set([
   // はn=2388で+10.6と、いずれも大サンプル・方向一貫で確認済み
   "台番号固定の実績",
   "前日のG数水準",
+  // v6.17: 機種全体の法則 — 台番号固定の実績とは独立した情報量があると
+  // 実データで確認済み（n=6324、自分の実績の高低どちらでも機種全体の
+  // 好不調で+8〜9ptの差）
+  "機種全体の法則",
+  // v6.18: X（設定期待度）ベースの2法則。従来の▲・差枚ベースのランクと
+  // 完全合体（別カードにしない）。
+  "台番号固有のXの法則",
+  "機種全体のXの法則",
 ]);
 function isStrongSignalLabel(label) {
   const baseLabel = label.replace(/[（(].*[）)]/g, "").trim();
@@ -762,6 +795,14 @@ const SIGNAL_WEIGHTS = {
   fixedNo: 1.5, // 台番号固定の実績 — largest, most robust finding of the batch (n≈2000, ±17〜18pt)
   pageMateTrouble: 1.3, // 前日、他の台が不調 — strong caution signal (n=1822, -15.7pt)
   gsuLevel: 1.2, // 前日のG数水準（大量回転/低調） — solid n but smaller magnitude than the two above
+  // v6.17: 機種全体の法則 — n=6324, controlling for fixedNo still shows
+  // +8〜9pt independently, comparable in strength to fixedNo itself
+  modelWide: 1.5,
+  // v6.18: X（設定期待度）ベースの2法則。▲ベースと違う情報源（合成確率＋
+  // 出率の複合値）なので、まずは中程度の重みから開始し、今後のバック
+  // テストで調整する。
+  fixedNoX: 1.0,
+  modelWideX: 1.0,
 };
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -1629,9 +1670,6 @@ export default function SlotDataTracker() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteDate, setConfirmDeleteDate] = useState(null);
   const [dateListOpen, setDateListOpen] = useState(true);
-  // v6.15: 差枚・出率ベースのピックアップは補助的な位置づけになったため、
-  // デフォルトで閉じておく（設定期待度Xの方をメインで見てもらう）
-  const [legacyPickupOpen, setLegacyPickupOpen] = useState(false);
   const [useCustomRange, setUseCustomRange] = useState(false);
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
@@ -2925,7 +2963,7 @@ export default function SlotDataTracker() {
   // (computed across all machines this page has ever seen)
   // core per-machine signal computation, parameterized so it can be reused
   // for both the active page and the store-wide 機種別/末尾別 summaries
-  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam) {
+  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam) {
     const results = [];
     // pageRecommendsList is usually one shared list (applies to every machine
     // on this page) — but for the overall 機種別 list, each "no" is a
@@ -2945,6 +2983,32 @@ export default function SlotDataTracker() {
     // per-machine — see computePageMateTroubleStats/computeTrailingGsuLevelStats
     const pageMateTroubleStats = computePageMateTroubleStats(pageSortedHistory);
     const gsuLevelStats = computeTrailingGsuLevelStats(pageSortedHistory, pageGsuPercentiles);
+    // v6.17: 【実証済み・強い基準④】機種全体の法則 — 台番号固定の実績とは
+    // 独立した情報量があることを実データで確認済み（自分の実績が高い/低い
+    // グループそれぞれで、機種全体が好調/不調による+8〜9ptの差を確認）。
+    // modelNameごとに日付順でプールしたシリーズを1回だけ作っておく（台
+    // ごとに毎回作り直さない）。
+    const modelSeriesByName = {};
+    let pageXSum = 0, pageXCount = 0;
+    pageSortedHistory.forEach((h) => {
+      h.machines.forEach((m) => {
+        const mn = m.modelName || "__unknown__";
+        if (!modelSeriesByName[mn]) modelSeriesByName[mn] = [];
+        const xVal = pageXByDateParam ? (pageXByDateParam[h.date] || {})[m.no] : null;
+        modelSeriesByName[mn].push({ date: h.date, no: m.no, shutsu: m.shutsu, x: xVal !== undefined ? xVal : null });
+        if (xVal !== null && xVal !== undefined) { pageXSum += xVal; pageXCount += 1; }
+      });
+    });
+    // v6.18: XのX基準を▲基準のscoreItemsに合流させるための、ページ全体の
+    // Xの平均値（このページのベースライン）
+    const pageXAvg = pageXCount > 0 ? pageXSum / pageXCount : 0;
+    // Xの典型的なブレ幅（computeEvPointsの正規化に使う、z-score合成なので
+    // だいたい0.7前後になる）
+    let pageXAbsSum = 0;
+    modelSeriesByName && Object.values(modelSeriesByName).forEach((arr) => {
+      arr.forEach((r) => { if (r.x !== null && r.x !== undefined) pageXAbsSum += Math.abs(r.x - pageXAvg); });
+    });
+    const pageXTypicalMagnitude = pageXCount > 0 ? pageXAbsSum / pageXCount || 1 : 1;
     // "tomorrow" must mean the same date for every machine/model/digit on this
     // page — anchored to the page's own most recent entered date, NOT each
     // item's own last non-"-" date (otherwise an item that happened to show
@@ -2955,7 +3019,7 @@ export default function SlotDataTracker() {
       const seriesFull = pageSortedHistory
         .map((h) => {
           const m = h.machines.find((mm) => mm.no === no);
-          return m && m.sada !== null ? { date: h.date, sada: m.sada, gsu: m.gsu, shutsu: m.shutsu, event: h.event } : null;
+          return m && m.sada !== null ? { date: h.date, sada: m.sada, gsu: m.gsu, shutsu: m.shutsu, event: h.event, modelName: m.modelName } : null;
         })
         .filter(Boolean);
       if (seriesFull.length === 0) return;
@@ -2979,6 +3043,48 @@ export default function SlotDataTracker() {
       if (shutsuValsForThisMachine.length >= 10) {
         const hits = shutsuValsForThisMachine.filter((v) => isHitA(v)).length;
         fixedNoMatch = { winRate: hits / shutsuValsForThisMachine.length, sampleSize: shutsuValsForThisMachine.length };
+      }
+
+      // v6.17: 【実証済み・強い基準④】機種全体の法則（トレイリング）——
+      // 同じ機種名の「他の台」の▲率が、ページ全体の▲率と比べて高いか
+      // 低いか（この台自身は除外して集計、自分自身の実績と重複しない
+      // ようにする）。実データ検証：n=6324で、自分の実績が高い/低いどちら
+      // のグループでも、機種全体が好調な方が+8〜9pt高い的中率になることを
+      // 確認済み（台番号固定の実績とは独立した情報量）。
+      let modelWideMatch = null;
+      const thisMachineModelName = seriesFull.length > 0 ? seriesFull[seriesFull.length - 1].modelName : null;
+      if (thisMachineModelName && modelSeriesByName[thisMachineModelName]) {
+        const otherModelVals = modelSeriesByName[thisMachineModelName]
+          .filter((r) => r.no !== no && r.shutsu !== null && r.shutsu !== undefined)
+          .map((r) => r.shutsu);
+        if (otherModelVals.length >= 10) {
+          const hits = otherModelVals.filter((v) => isHitA(v)).length;
+          modelWideMatch = { winRate: hits / otherModelVals.length, sampleSize: otherModelVals.length };
+        }
+      }
+
+      // v6.18: 台番号固有のXの法則 — この台自身のトレイリング平均X（合成
+      // 確率＋出率の複合スコア）が、ページ全体平均より高いか低いか。
+      let fixedNoXMatch = null;
+      if (pageXByDateParam) {
+        const ownXVals = seriesFull.map((s) => (pageXByDateParam[s.date] || {})[no]).filter((v) => v !== null && v !== undefined);
+        if (ownXVals.length >= 10) {
+          const avgX = ownXVals.reduce((a, v) => a + v, 0) / ownXVals.length;
+          fixedNoXMatch = { avgX, sampleSize: ownXVals.length };
+        }
+      }
+
+      // v6.18: 機種全体のXの法則 — 同じ機種名の「他の台」のトレイリング
+      // 平均Xが、ページ全体平均より高いか低いか（この台自身は除外）。
+      let modelWideXMatch = null;
+      if (thisMachineModelName && modelSeriesByName[thisMachineModelName]) {
+        const otherModelXVals = modelSeriesByName[thisMachineModelName]
+          .filter((r) => r.no !== no && r.x !== null && r.x !== undefined)
+          .map((r) => r.x);
+        if (otherModelXVals.length >= 10) {
+          const avgX = otherModelXVals.reduce((a, v) => a + v, 0) / otherModelXVals.length;
+          modelWideXMatch = { avgX, sampleSize: otherModelXVals.length };
+        }
       }
 
       // v6.9: 【実証済み・強い基準②】前日、同じページの他の台が不調
@@ -3186,7 +3292,10 @@ export default function SlotDataTracker() {
         preEventTrendMatch ||
         fixedNoMatch ||
         pageMateTroubleMatch ||
-        gsuLevelMatch;
+        gsuLevelMatch ||
+        modelWideMatch ||
+        fixedNoXMatch ||
+        modelWideXMatch;
       if (!hasAnySignal) return;
 
       // ---- additive/subtractive scoring: every signal (favorable OR
@@ -3296,6 +3405,20 @@ export default function SlotDataTracker() {
         const winPts = computePoints(gsuLevelMatch.winRate, pageBaseRateA, gsuLevelMatch.sampleSize);
         scoreItems.push({ label: `前日のG数水準（${gsuLevelMatch.level}）`, points: winPts * SIGNAL_WEIGHTS.gsuLevel });
       }
+      if (modelWideMatch) {
+        const winPts = computePoints(modelWideMatch.winRate, pageBaseRateA, modelWideMatch.sampleSize);
+        scoreItems.push({ label: "機種全体の法則", points: winPts * SIGNAL_WEIGHTS.modelWide });
+      }
+      // v6.18: X（設定期待度）ベースの2つの法則を、▲ベースの点数体系に
+      // 合流させる。continuous な値なのでcomputeEvPoints（EV差分型）を使う。
+      if (fixedNoXMatch) {
+        const evPts = computeEvPoints(fixedNoXMatch.avgX, pageXAvg, pageXTypicalMagnitude, fixedNoXMatch.sampleSize);
+        scoreItems.push({ label: "台番号固有のXの法則", points: evPts * SIGNAL_WEIGHTS.fixedNoX });
+      }
+      if (modelWideXMatch) {
+        const evPts = computeEvPoints(modelWideXMatch.avgX, pageXAvg, pageXTypicalMagnitude, modelWideXMatch.sampleSize);
+        scoreItems.push({ label: "機種全体のXの法則", points: evPts * SIGNAL_WEIGHTS.modelWideX });
+      }
 
       let strongSignalCount = 0;
       let tieBreakerPoints = 0;
@@ -3351,55 +3474,23 @@ export default function SlotDataTracker() {
     return results;
   }
 
-  const pickList = useMemo(() => {
-    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
-  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA]);
-
-  // v6.10: 設定期待度（X予想）— ▲ベースのpickListとは別枠、合算しない
-  // v6.14: Xの生値はページ単位で1回だけ計算し、設定期待度予想とXグリッド
-  // 表示の両方で使い回す（以前は2箇所で別々に計算していて無駄だった —
-  // スマホでの動作が重いという指摘への対策の一つ）
+  // v6.14: Xの生値はページ単位で1回だけ計算する（以前は複数箇所で別々に
+  // 計算していて無駄だった）
+  // v6.18: 台番号固有・機種全体のXの法則をcomputeSignalsForPageに統合
+  // したため、pickListより先に計算しておく必要がある
   const pageXByDate = useMemo(() => {
     if (sortedHistory.length < 15) return null;
     return computeXForPage(sortedHistory);
   }, [sortedHistory]);
 
-  const settingExpectationList = useMemo(() => {
-    if (sortedHistory.length < 15 || !pageXByDate) return [];
-    return computeSettingExpectationForPage(activeMachineNumbers, sortedHistory, historyByDate, dateEventMap, pageXByDate);
-  }, [activeMachineNumbers, sortedHistory, historyByDate, dateEventMap, pageXByDate]);
-  // v6.13: 台番号 -> 設定期待度、本日のピックアップのカードにバッジで
-  // 添えるためのルックアップ（点数の合算はしない、表示だけ）
-  const settingExpectationByNo = useMemo(() => {
-    const map = {};
-    settingExpectationList.forEach((p) => { map[p.no] = p; });
-    return map;
-  }, [settingExpectationList]);
-
-  // v6.11: 本格的な設定判別（理論値表＋ポアソン尤度）— SETTING_PROFILESに
-  // 登録されている機種（現状マイジャグラーVのみ）の正式名称と一致する
-  // ページでだけ有効。最新日の各台のBB/RB/G数から、設定1〜6の事後確率を
-  // 計算する。
-  const settingProfile = useMemo(() => {
-    if (!currentPage || !currentPage.officialName) return null;
-    const nameList = splitModelNameList(currentPage.officialName);
-    const matchedKey = Object.keys(SETTING_PROFILES).find((profileName) => nameList.some((n) => modelNamesMatch(profileName, n)));
-    return matchedKey ? SETTING_PROFILES[matchedKey] : null;
-  }, [currentPage]);
-  const settingLikelihoodList = useMemo(() => {
-    if (!settingProfile || sortedHistory.length === 0) return [];
-    const lastDay = sortedHistory[sortedHistory.length - 1];
-    const results = [];
-    lastDay.machines.forEach((m) => {
-      const posterior = evaluateSettingLikelihood(settingProfile, m.bb, m.rb, m.gsu);
-      if (!posterior) return;
-      const highProb = (posterior[5] || 0) + (posterior[6] || 0);
-      results.push({ no: m.no, posterior, highProb, date: lastDay.date });
-    });
-    results.sort((a, b) => b.highProb - a.highProb);
-    return results;
-  }, [settingProfile, sortedHistory]);
-
+  // v6.18: ▲・差枚ベースの法則とX（設定期待度）ベースの法則を1つの
+  // ランク（S〜G）に統合。以前は「設定期待度（高/中/低）」として別カード
+  // だったが、完全合体してこちらの1本にした（マイジャグラー専用の
+  // 設定判別カードは、翌日予想として機能しないことが実データ検証で
+  // わかったため削除）。
+  const pickList = useMemo(() => {
+    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA, pageXByDate));
+  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA, pageXByDate]);
 
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
   // engine (it doesn't care whether "no" is a machine number, a model name,
@@ -6365,149 +6456,17 @@ export default function SlotDataTracker() {
             )}
           </div>
 
-          {/* v6.13: 設定期待度（X予想）をメイン表示に変更。目的は「差枚が
-              プラスになる確率」ではなく「設定が入っていたか」の確認 —
-              設定が良さそうでも差枚がマイナスの日はある（逆もある）ため、
-              差枚ベースのピックアップとは別の質問に答える指標として、
-              あえて上に配置している。合成確率と出率を合成した連続値Xを
-              使い、翌日「設定が良さそうか」を予想する。 */}
+
+          {/* v6.18: 差枚・出率ベースの法則と、X（設定期待度：合成確率＋出率の
+              複合値）ベースの法則（台番号固有・機種全体）を1つのランクに
+              統合。以前は「設定期待度」を別カードにしていたが、完全合体
+              した。 */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              🎰 設定期待度（メイン）
+              本日のピックアップ
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              合成確率（BB+RB合算）と出率を組み合わせた指数（X）で、「設定が良さそうだったか」を数値化し、台番号固定の実績・日付末尾・イベント・前日の他の台の不調・前日のG数水準から、翌日のXを予想します。<span style={{ color: "#e8b34c" }}>「差枚がプラスになるか」ではなく「設定が入っていたか」を見る指標です（設定が良くても差枚がマイナスの日、その逆もあります）。実際の差枚は下の「本日のピックアップ（参考）」で確認してください。</span>
-            </div>
-            <div style={{
-              fontSize: "11px", color: "#8b93a3", marginBottom: "12px", padding: "8px 10px",
-              background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
-            }}>
-              正直な検証結果：全ページ・全期間のウォークフォワード検証では、この予想Xと翌日の実際の出率の相関はほぼ無し（相関係数0.01、n=5218）でした。<span style={{ color: "#e8b34c" }}>「Xが高いほど条件が当てはまっている」ことは確認できていますが、それが翌日の出玉に直結するとは言い切れません</span>（設定は基本的に毎日リセットされるため）。マイジャグラーVのみ、理論値表を使った別方式の設定判別（下のカード）でより強い相関（0.607）を確認しています。
-            </div>
-            {settingExpectationList.length === 0 ? (
-              <div style={{ fontSize: "12px", color: "#5a6272" }}>
-                {historyLoading ? "読み込み中..." : sortedHistory.length < 15 ? "データが15日分たまると表示されます。" : "現時点で予想できる台がありません。"}
-              </div>
-            ) : (
-              <div className="scrollbar" style={{ maxHeight: "320px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
-                {settingExpectationList.map((p) => (
-                  <div key={p.no} style={{
-                    display: "flex", alignItems: "center", justifyContent: "space-between",
-                    background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "9px 12px",
-                  }}>
-                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      <span
-                        className="mono"
-                        title={p.items.map((it) => `${it.label}: ${it.diff >= 0 ? "+" : ""}${it.diff.toFixed(2)} (n=${it.sampleSize})`).join("\n")}
-                        style={{
-                          fontSize: "11px", fontWeight: 800, padding: "2px 8px", borderRadius: "999px",
-                          color: p.label === "高" ? "#12161d" : p.label === "低" ? "#e7e9ee" : "#c7cbd4",
-                          background: p.label === "高" ? "#9ece6a" : p.label === "低" ? "#e5697a" : "#2a323f",
-                          cursor: "help",
-                        }}
-                      >
-                        {p.label}
-                      </span>
-                      <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>
-                        {isMultiModelPage ? machineLabel(p.no) : `${p.no}番`}
-                      </span>
-                      <span style={{ fontSize: "10px", color: "#5a6272" }}>根拠{p.matchCount}件</span>
-                    </span>
-                    <span className="mono" style={{ fontSize: "11px", color: "#5a6272" }}>
-                      X予想 {p.predictedX >= 0 ? "+" : ""}{p.predictedX.toFixed(2)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* v6.11: 設定判別（理論値表＋ポアソン尤度）— SETTING_PROFILESに
-              登録されている機種の正式名称と一致するページでのみ表示。
-              マイジャグラーVはG数=総回転数=通常時回転数が完全一致する
-              純粋なAタイプなので、通常時回転数ベースの理論値表がそのまま
-              使える。他の機種（AT/BT状態を持つもの）はG数の意味が曖昧な
-              ため対象外（設定期待度Xの方を参照）。 */}
-          {settingProfile && (
-            <div className="card" style={{ padding: "18px" }}>
-              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-                🎯 設定判別（{currentPage.officialName}・理論値表ベース）
-              </div>
-              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-                最新日（{settingLikelihoodList[0] ? settingLikelihoodList[0].date : "-"}）のBB・RB回数とG数から、設定1〜6それぞれの事後確率をポアソン尤度で計算しています（事前分布は一様と仮定）。あくまで1日分のデータからの推定なので、サンプルが少ない台は幅を持って見てください。
-              </div>
-              <div style={{
-                fontSize: "11px", color: "#8b93a3", marginBottom: "12px", padding: "8px 10px",
-                background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px",
-              }}>
-                検証結果：実データ984台日で、予想「設定5+確率」が上位20%（32%以上）だった日は、実際の出率が
-                <span style={{ color: "#9ece6a", fontWeight: 700 }}> 109.3%</span>
-                （ベース比+16.0pt、平均差枚+2,147枚、n=200、相関係数0.607）でした。理論値表を使うこの方式は、同日中の判断材料としては信頼性が高いことを確認済みです。
-              </div>
-              {settingLikelihoodList.length === 0 ? (
-                <div style={{ fontSize: "12px", color: "#5a6272" }}>{historyLoading ? "読み込み中..." : "この日のBB/RB/G数データがまだありません。"}</div>
-              ) : (
-                <div className="scrollbar" style={{ maxHeight: "360px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "8px" }}>
-                  {settingLikelihoodList.map((r) => (
-                    <div key={r.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "9px 12px" }}>
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
-                        <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{r.no}番</span>
-                        <span className="mono" style={{ fontSize: "12px", fontWeight: 700, color: r.highProb >= 0.4 ? "#9ece6a" : r.highProb >= 0.2 ? "#e8b34c" : "#5a6272" }}>
-                          設定5+ {Math.round(r.highProb * 100)}%
-                        </span>
-                      </div>
-                      <div style={{ display: "flex", gap: "3px" }}>
-                        {settingProfile.settings.map((s) => {
-                          const p = r.posterior[s] || 0;
-                          return (
-                            <div key={s} title={`設定${s}: ${Math.round(p * 100)}%`} style={{ flex: 1, textAlign: "center" }}>
-                              <div style={{
-                                height: "28px", borderRadius: "3px", background: "#1c2129",
-                                display: "flex", alignItems: "flex-end", overflow: "hidden",
-                              }}>
-                                <div style={{
-                                  width: "100%", height: `${Math.max(2, p * 100)}%`,
-                                  background: s >= 5 ? "#9ece6a" : s >= 3 ? "#e8b34c" : "#5a6272",
-                                }} />
-                              </div>
-                              <div className="mono" style={{ fontSize: "9px", color: "#5a6272", marginTop: "2px" }}>{s}</div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-
-
-          {/* v6.13: 差枚・出率ベースのピックアップ。設定期待度Xとは別の
-              質問（「儲かりそうか」）に答えるための補助的な指標として、
-              設定期待度の下に配置している。
-              v6.15: 実データ検証で、設定期待度Xの上位クインタイル
-              （+11.8pt、出玉率109.3%）に対し、こちらのグレードは効果が
-              弱く不安定（グレードAでも+1.6ptほど、Sが逆にAより低いなど）
-              だったため、デフォルトで折りたたみ、控えめな表現に変更。 */}
-          <div className="card" style={{ padding: "18px" }}>
-            <button
-              onClick={() => setLegacyPickupOpen((v) => !v)}
-              style={{
-                display: "flex", alignItems: "center", gap: "6px", width: "100%",
-                background: "none", border: "none", cursor: "pointer", padding: 0,
-                textAlign: "left", marginBottom: legacyPickupOpen ? "4px" : 0,
-              }}
-            >
-              {legacyPickupOpen ? <ChevronDown size={14} color="#5a6272" /> : <ChevronRight size={14} color="#5a6272" />}
-              <span style={{ fontSize: "13px", fontWeight: 700, color: "#c7cbd4" }}>
-                本日のピックアップ（差枚・出率ベース、参考）
-              </span>
-            </button>
-            {legacyPickupOpen && (
-              <>
-            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px", marginTop: "10px" }}>
-              直近の総差枚（10/20/30日足）に加えて、連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレも見て、当てはまる台をスコアが高い順に並べます（このページの全ての台が対象）。<span style={{ color: "#e8b34c" }}>実データ検証では、設定期待度Xほど明確な差は出ていません（グレードAでもベース比+1.6pt程度）。参考程度に見てください。</span>
+              直近の総差枚（10/20/30日足）・連続日数・曜日傾向・強いイベント翌日・回転数と差枚のズレに加えて、台番号固定の実績・機種全体の法則・前日の他の台の不調・前日のG数水準・台番号固有のXの法則・機種全体のXの法則も見て、当てはまる台をスコアが高い順に並べます（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。
             </div>
             {overallBacktestStats && (
               <div style={{
@@ -6523,10 +6482,8 @@ export default function SlotDataTracker() {
               <div style={{ fontSize: "12px", color: "#5a6272" }}>{historyLoading ? "読み込み中..." : "現時点で条件に当てはまる台はありません。"}</div>
             ) : (
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
-                {pickList.map((p) => renderPickCard(p, isMultiModelPage ? (pp) => machineLabel(pp.no) : undefined, (no) => settingExpectationByNo[no] || null))}
+                {pickList.map((p) => renderPickCard(p, isMultiModelPage ? (pp) => machineLabel(pp.no) : undefined))}
               </div>
-            )}
-              </>
             )}
           </div>
 
