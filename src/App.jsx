@@ -310,7 +310,19 @@ const DIGIT7_COLOR = "#f6a04d";
 // 現在無効（該当UIにその旨を明記）。renderPickCardも新しいデータ構造
 // （windows/streakMatch/digitDayMatch等の個別フィールドを廃止、
 // scoreItemsのみ）に合わせて全面書き換え。
-const APP_VERSION = "6.20";
+// v6.21: 判定材料を絞りすぎた（ユーコーラッキーは判断材料が多いから
+// 9.5%〜43.9%まで広く分かれている）との指摘、説明文が淡白になった
+// との指摘の2点に対応。①v6.20で削除した古い判定材料のうち、実データで
+// Xの予想材料として機能することを確認できた3つ（20/30日足トレイリング
+// 差枚の逆張り効果n=1428〜2018・+0.026〜0.032、準イベント翌日n=722・
+// -0.051、大量回転低調の自分比n=2160〜2250・+0.035/-0.015）をXターゲット
+// 版として復活、判定材料は6→9種類に。10日足・強いイベント翌日・連続
+// 日数（方向つき）・おすすめ機種期間は効果が弱い/データ不足で見送り。
+// ②renderPickCardに、各scoreItemの実測平均X・サンプル数を文章で説明する
+// 表示を復活（バッジだけでなく詳細も見られるように）。ウォークフォワード
+// 検証でEグレードが新たに出現（n=8, 翌日X平均-0.515）するなど、グレード
+// の裾野が広がったことを確認。
+const APP_VERSION = "6.21";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -803,11 +815,11 @@ function computeEvPoints(signalAvg, baselineAvg, typicalMagnitude, sampleSize) {
 // have little/no real predictive edge are dialed down rather than removed
 // outright, in case future data tells a different story
 // v6.20: 「翌日、Xの値が高くなるところを予想する」に統一したため、古い
-// ▲・差枚ベースの判定材料（streak/weekday/strongFollow/semiFollow/
-// interEventTrend系/preEventTrend/recommend/settingGood-Low/
-// volumeMismatch/古いplannedEvent/fixedNo/pageMateTrouble/modelWide）は
-// 全部削除。実データ検証でXの予想材料としても機能することを確認した
-// 6つの判定材料の重みだけ残す。
+// ▲・差枚ベースの判定材料は一旦全部削除したが、v6.21で判定材料が
+// 少なすぎる（ユーコーラッキーのような幅広いグレード分布にならない）
+// との指摘を受け、実データでXの予想材料として機能することを確認できた
+// 3つ（20/30日足逆張り・準イベント翌日・大量回転低調(自分比)）を
+// Xターゲット版として復活。
 const SIGNAL_WEIGHTS = {
   digitDay: 1, // 日付末尾 — 実データ検証で強く確認（=0で-0.150、=2で+0.141）
   plannedEvent: 1.5, // イベント名ごと — 実データ検証で強く確認（爆撮+0.201、百獣撮-0.143等）
@@ -815,6 +827,10 @@ const SIGNAL_WEIGHTS = {
   modelWideX: 1.5, // 機種全体のXの法則 — 上位1/3で+0.031、下位1/3で-0.035
   gsuLevel: 1.2, // 前日のG数水準（大量回転/低調） — 大量回転+0.023、低調-0.025
   pageMateGood: 1.3, // 前日、他の台が好調（50%+） — +0.058
+  // v6.21: 復活した3つ
+  trailingWindow: 1.0, // 20/30日足トレイリング差枚（逆張り） — n=1428〜2018、+0.026〜+0.032
+  semiFollow: 1.0, // 準イベント翌日 — n=722、-0.051（注意信号）
+  volumeMismatch: 1.0, // 大量回転・低調（自分比） — n=2160〜2250、+0.035/-0.015
 };
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -3124,7 +3140,7 @@ export default function SlotDataTracker() {
           const m = h.machines.find((mm) => mm.no === no);
           if (!m) return null;
           const x = (pageXByDateParam[h.date] || {})[no];
-          return { date: h.date, gsu: m.gsu, x: x !== undefined ? x : null, event: h.event, modelName: m.modelName };
+          return { date: h.date, gsu: m.gsu, sada: m.sada, x: x !== undefined ? x : null, event: h.event, modelName: m.modelName };
         })
         .filter((r) => r && r.x !== null && r.x !== undefined);
       if (xSeries.length === 0) return;
@@ -3141,7 +3157,7 @@ export default function SlotDataTracker() {
       }
       if (fixedNoXMatch) {
         const evPts = computeEvPoints(fixedNoXMatch.avgX, pageXAvg, pageXTypicalMagnitude, fixedNoXMatch.sampleSize);
-        scoreItems.push({ label: "台番号固有のXの法則", points: evPts * SIGNAL_WEIGHTS.fixedNoX });
+        scoreItems.push({ label: "台番号固有のXの法則", points: evPts * SIGNAL_WEIGHTS.fixedNoX, detail: { avgX: fixedNoXMatch.avgX, sampleSize: fixedNoXMatch.sampleSize } });
       }
 
       // ②機種全体のXの法則（同じ機種名の他の台のトレイリング平均X、この台は除外）
@@ -3157,21 +3173,21 @@ export default function SlotDataTracker() {
       }
       if (modelWideXMatch) {
         const evPts = computeEvPoints(modelWideXMatch.avgX, pageXAvg, pageXTypicalMagnitude, modelWideXMatch.sampleSize);
-        scoreItems.push({ label: "機種全体のXの法則", points: evPts * SIGNAL_WEIGHTS.modelWideX });
+        scoreItems.push({ label: "機種全体のXの法則", points: evPts * SIGNAL_WEIGHTS.modelWideX, detail: { avgX: modelWideXMatch.avgX, sampleSize: modelWideXMatch.sampleSize } });
       }
 
       // ③前日、他の台が好調（▲率50%以上）だった → 翌日の自分のX
       const pageMateGoodMatch = checkPageMateGoodTodayX(pageMateGoodStatsX, pageHistoryByDate, lastDate, no);
       if (pageMateGoodMatch) {
         const evPts = computeEvPoints(pageMateGoodMatch.avgX, pageXAvg, pageXTypicalMagnitude, pageMateGoodMatch.sampleSize);
-        scoreItems.push({ label: "前日、他の台が好調", points: evPts * SIGNAL_WEIGHTS.pageMateGood });
+        scoreItems.push({ label: "前日、他の台が好調", points: evPts * SIGNAL_WEIGHTS.pageMateGood, detail: { avgX: pageMateGoodMatch.avgX, sampleSize: pageMateGoodMatch.sampleSize } });
       }
 
-      // ④前日のG数水準（大量回転/低調）→ 翌日の自分のX
+      // ④前日のG数水準（大量回転/低調、ページ全体のパーセンタイル基準）→ 翌日の自分のX
       const gsuLevelMatch = checkTrailingGsuLevelTodayX(gsuLevelStatsX, xSeries, pageGsuPercentiles);
       if (gsuLevelMatch) {
         const evPts = computeEvPoints(gsuLevelMatch.avgX, pageXAvg, pageXTypicalMagnitude, gsuLevelMatch.sampleSize);
-        scoreItems.push({ label: `前日のG数水準（${gsuLevelMatch.level}）`, points: evPts * SIGNAL_WEIGHTS.gsuLevel });
+        scoreItems.push({ label: `前日のG数水準（${gsuLevelMatch.level}）`, points: evPts * SIGNAL_WEIGHTS.gsuLevel, detail: { avgX: gsuLevelMatch.avgX, sampleSize: gsuLevelMatch.sampleSize } });
       }
 
       // ⑤日付末尾（この台の過去、翌日と同じ末尾の日のXが高い/低いか）
@@ -3179,7 +3195,7 @@ export default function SlotDataTracker() {
       if (digitVals.length >= 5) {
         const avgX = digitVals.reduce((a, v) => a + v, 0) / digitVals.length;
         const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, digitVals.length);
-        scoreItems.push({ label: `日付末尾=${tomorrowDigit}`, points: evPts * SIGNAL_WEIGHTS.digitDay });
+        scoreItems.push({ label: `日付末尾=${tomorrowDigit}`, points: evPts * SIGNAL_WEIGHTS.digitDay, detail: { avgX, sampleSize: digitVals.length } });
       }
 
       // ⑥イベント（明日登録されているイベント名の、過去のX平均）
@@ -3188,9 +3204,85 @@ export default function SlotDataTracker() {
         if (matchVals.length >= 5) {
           const avgX = matchVals.reduce((a, v) => a + v, 0) / matchVals.length;
           const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, matchVals.length);
-          scoreItems.push({ label: `イベント「${name}」`, points: evPts * SIGNAL_WEIGHTS.plannedEvent });
+          scoreItems.push({ label: `イベント「${name}」`, points: evPts * SIGNAL_WEIGHTS.plannedEvent, detail: { avgX, sampleSize: matchVals.length, eventName: name } });
         }
       });
+
+      // v6.21: 復活＆Xターゲット化した3つの判定材料（ユーコーラッキー資料
+      // をきっかけに判定材料を絞りすぎたとの指摘を受け、実データで再検証
+      // した上で復活）
+
+      // ⑦20日足・30日足トレイリング差枚（逆張り）→ 翌日X。実データ検証：
+      // 20日足はマイナス圏でn=2018・base比+0.032、30日足はマイナス圏で
+      // n=1428・base比+0.026と、意外にも「長期でマイナスの方が翌日Xは
+      // 高い」という平均回帰型の効果を確認（10日足は弱いので不採用）。
+      [20, 30].forEach((window) => {
+        if (xSeries.length < window) return;
+        const trailing = xSeries.slice(-window);
+        if (trailing.some((r) => r.sada === null || r.sada === undefined)) return;
+        const total = trailing.reduce((a, r) => a + r.sada, 0);
+        const isMinusZone = total < 0;
+        // マイナス圏の時だけ、過去の「マイナス圏だった翌日」のX平均を集計
+        if (!isMinusZone) return;
+        const followVals = [];
+        for (let i = window; i < xSeries.length; i++) {
+          const w = xSeries.slice(i - window, i);
+          if (w.some((r) => r.sada === null || r.sada === undefined)) continue;
+          const t = w.reduce((a, r) => a + r.sada, 0);
+          if (t < 0) followVals.push(xSeries[i].x);
+        }
+        if (followVals.length >= 15) {
+          const avgX = followVals.reduce((a, v) => a + v, 0) / followVals.length;
+          const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, followVals.length);
+          scoreItems.push({ label: `${window}日足トレイリング差枚（マイナス圏）`, points: evPts * SIGNAL_WEIGHTS.trailingWindow, detail: { avgX, sampleSize: followVals.length } });
+        }
+      });
+
+      // ⑧準イベント翌日 → 翌日X。実データ検証：n=722・base比-0.051と
+      // 明確な負の効果（注意信号として採用）。強いイベント翌日は
+      // base比-0.009とほぼ効果が無かったため不採用。
+      if (pageSemiDateSet && pageSemiDateSet.has(lastDate)) {
+        const followVals = [];
+        for (let i = 1; i < xSeries.length; i++) {
+          if (pageSemiDateSet.has(xSeries[i - 1].date)) followVals.push(xSeries[i].x);
+        }
+        if (followVals.length >= 15) {
+          const avgX = followVals.reduce((a, v) => a + v, 0) / followVals.length;
+          const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, followVals.length);
+          scoreItems.push({ label: "準イベント翌日", points: evPts * SIGNAL_WEIGHTS.semiFollow, detail: { avgX, sampleSize: followVals.length } });
+        }
+      }
+
+      // ⑨大量回転・低調（この台自身の平均G数との比較）→ 翌日X。実データ
+      // 検証：自分の平均の1.3倍以上でn=2160・+0.035、0.7倍以下でn=2250・
+      // -0.015。前日のG数水準（ページ全体パーセンタイル基準）とは別の
+      // 切り口（この台自身の基準に対する相対値）。
+      if (xSeries.length >= 10) {
+        const gsuVals = xSeries.map((r) => r.gsu).filter((v) => v !== null && v !== undefined);
+        const ownAvgGsu = gsuVals.length >= 10 ? gsuVals.reduce((a, v) => a + v, 0) / gsuVals.length : null;
+        if (ownAvgGsu) {
+          const lastGsu = xSeries[xSeries.length - 1].gsu;
+          if (lastGsu !== null && lastGsu !== undefined) {
+            const ratio = lastGsu / ownAvgGsu;
+            const level = ratio >= 1.3 ? "大量回転" : ratio <= 0.7 ? "低調" : null;
+            if (level) {
+              const followVals = [];
+              for (let i = 1; i < xSeries.length; i++) {
+                const prevGsu = xSeries[i - 1].gsu;
+                if (prevGsu === null || prevGsu === undefined) continue;
+                const r2 = prevGsu / ownAvgGsu;
+                const lv = r2 >= 1.3 ? "大量回転" : r2 <= 0.7 ? "低調" : null;
+                if (lv === level) followVals.push(xSeries[i].x);
+              }
+              if (followVals.length >= 15) {
+                const avgX = followVals.reduce((a, v) => a + v, 0) / followVals.length;
+                const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, followVals.length);
+                scoreItems.push({ label: `大量回転・低調（自分比・${level}）`, points: evPts * SIGNAL_WEIGHTS.volumeMismatch, detail: { avgX, sampleSize: followVals.length } });
+              }
+            }
+          }
+        }
+      }
 
       if (scoreItems.length === 0) return;
 
@@ -4071,17 +4163,33 @@ export default function SlotDataTracker() {
         </div>
 
         {p.scoreItems && p.scoreItems.length > 0 && (
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-            {p.scoreItems.map((s, i) => (
-              <span key={i} className="mono" style={{
-                fontSize: "10px", padding: "1px 6px", borderRadius: "4px",
-                color: s.points >= 0 ? "#9ece6a" : "#e5697a",
-                background: s.points >= 0 ? "rgba(158,206,106,0.1)" : "rgba(229,105,122,0.1)",
-              }}>
-                {s.label} {s.points >= 0 ? "+" : ""}{s.points.toFixed(1)}pt
-              </span>
-            ))}
-          </div>
+          <>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
+              {p.scoreItems.map((s, i) => (
+                <span key={i} className="mono" style={{
+                  fontSize: "10px", padding: "1px 6px", borderRadius: "4px",
+                  color: s.points >= 0 ? "#9ece6a" : "#e5697a",
+                  background: s.points >= 0 ? "rgba(158,206,106,0.1)" : "rgba(229,105,122,0.1)",
+                }}>
+                  {s.label} {s.points >= 0 ? "+" : ""}{s.points.toFixed(1)}pt
+                </span>
+              ))}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              {p.scoreItems.map((s, i) => {
+                if (!s.detail) return null;
+                const { avgX, sampleSize } = s.detail;
+                return (
+                  <div key={i} style={{ fontSize: "11px", color: s.points >= 0 ? "#8b93a3" : "#c99" }}>
+                    <span style={{ color: s.points >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>{s.label}</span>
+                    ：過去の同条件では、翌日のXが平均
+                    <span className="mono" style={{ color: "#c7cbd4" }}> {avgX >= 0 ? "+" : ""}{avgX.toFixed(3)}</span>
+                    でした（{sampleSize}件中、サンプルが多いほど信頼度が高い）
+                  </div>
+                );
+              })}
+            </div>
+          </>
         )}
       </div>
     );
