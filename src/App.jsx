@@ -322,7 +322,12 @@ const DIGIT7_COLOR = "#f6a04d";
 // 表示を復活（バッジだけでなく詳細も見られるように）。ウォークフォワード
 // 検証でEグレードが新たに出現（n=8, 翌日X平均-0.515）するなど、グレード
 // の裾野が広がったことを確認。
-const APP_VERSION = "6.21";
+// v6.22: 「本日のピックアップ」というカード見出しが紛らわしい（実際は
+// 翌日を予想しているのに「本日」と書いてあった）との指摘を受け、実際の
+// 予想対象日（月/日）を表示する見出しに変更（例：「8/16のピックアップ」）。
+// 各カードの日付表示も「{日付}時点」から「{日付}までのデータで予想」に
+// 変更し、それが予想対象日ではなくデータの基準日であることを明確化。
+const APP_VERSION = "6.22";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4155,7 +4160,7 @@ export default function SlotDataTracker() {
               </span>
             )}
           </span>
-          <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}時点</span>
+          <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}までのデータで予想</span>
         </div>
 
         <div style={{ fontSize: "10px", color: "#5a6272", marginBottom: "8px", fontStyle: "italic" }}>
@@ -6131,7 +6136,12 @@ export default function SlotDataTracker() {
               した。 */}
           <div className="card" style={{ padding: "18px" }}>
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
-              本日のピックアップ
+              {(() => {
+                if (sortedHistory.length === 0) return "ピックアップ";
+                const targetDate = addDays(sortedHistory[sortedHistory.length - 1].date, 1);
+                const [, m, d] = targetDate.split("-");
+                return `${parseInt(m, 10)}/${parseInt(d, 10)}のピックアップ`;
+              })()}
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
               「翌日、設定期待度（X）が高くなりそうか」を予想します。台番号固有のXの法則・機種全体のXの法則・前日、他の台が好調・前日のG数水準・日付末尾・イベント名の6つを見て、当てはまる台をスコアが高い順に並べます（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。<span style={{ color: "#e8b34c" }}>「差枚がプラスになるか」ではなく「設定が入っていたか」を見る指標です。</span>
