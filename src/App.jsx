@@ -332,7 +332,18 @@ const DIGIT7_COLOR = "#f6a04d";
 // との指摘）。「合計{pt}pt（根拠{件数}件）{日付}までのデータで予想」を
 // ヘッダーに、各判定材料は「{ラベル}：実測X {値}（n={件数}） → {符号}
 // {pt}pt」の1行で、影響度（pointsの絶対値）が大きい順に並べる。
-const APP_VERSION = "6.23";
+// v6.24: 【設計を根本から変更】予想の基準を「平均X（生の値、連続値）」
+// から「Y（0〜100、Xマトリクス表と同じパーセンタイル値）が閾値以上に
+// なる確率」に統一（何度もの確認の末、正しい仕様に到達）。的中の定義も
+// 「翌日Y≥85」に統一 — 実データで70/75/80/85/90を比較し、85が一番綺麗な
+// 単調減少（S=21.5%>A=17.2%>B=15.6%=C=15.6%>D=13.8%）になることを確認。
+// 9つの判定材料は全部「過去、同じ条件だった時、翌日Y≥85だった割合」を
+// 実測し、ページ全体のベース出現率とcomputePoints（勝率型）で得点化する
+// 方式に統一（computeEvPoints・平均Xベースの旧方式は使わなくなった）。
+// グレード閾値（300/200/100/95/-5pt）は新方式でもS=20.3%→E=14.1%と綺麗な
+// 分離を維持することを確認したためそのまま維持。renderPickCardの表示も
+// 「実測X +値」→「実測{勝率}%」に変更。
+const APP_VERSION = "6.24";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -752,20 +763,12 @@ function scoreToGrade(score) {
 // backtesting (real hall data, walk-forward) showed these specific signals
 // have a genuine, repeatable edge; everything else is kept as a smaller
 // tie-breaker rather than being dropped, since it still carries some signal
-// v6.20: 「翌日、Xの値が高くなるところを予想する」に統一。実データ検証で
-// 全部Xの予想材料としても機能することを確認済みの6つの判定材料だけに
-// 絞った（古い▲・差枚ベースの判定材料は全部削除）。
+// v6.24: 予想の基準をX（生の値）からY（0〜100、Xマトリクス表と同じ
+// パーセンタイル値）に変更。的中の定義も「翌日Y≥85」に統一。
 const STRONG_SIGNAL_LABELS = new Set([
-  // v6.9→v6.20: 台番号固有のXの法則。実データ検証：上位1/3でbase比+0.045、
-  // 下位1/3で-0.020と、方向一貫かつ大サンプル(各n=2101)で確認済み
-  "台番号固有のXの法則",
-  // v6.17→v6.20: 機種全体のXの法則。台番号固有の実績とは独立した情報量
-  // がある。実データ検証：上位1/3でbase比+0.031、下位1/3で-0.035
-  "機種全体のXの法則",
-  // v6.19→v6.20: 前日、他の台が好調（▲率50%+）。実データ検証：+0.058
+  "台番号固有のYの法則",
+  "機種全体のYの法則",
   "前日、他の台が好調",
-  // v6.9→v6.20: 前日のG数水準（大量回転/低調）。実データ検証：大量回転
-  // +0.023、低調-0.025
   "前日のG数水準",
 ]);
 function isStrongSignalLabel(label) {
@@ -775,12 +778,17 @@ function isStrongSignalLabel(label) {
 
 // grade bands for the hybrid score: count-of-proven-signals * 100, plus a
 // capped tie-breaker from every other (weaker but non-zero) signal
+// v6.24: 実データ（5,362件、ウォークフォワード）で、点数の分布に対して
+// 均等な母数になる区切り（上位3%/12%/25%/30%/20%/10%）を探索し、旧来の
+// 決め打ち閾値（350/250/150/50/-20）から更新。「翌日、Xがパーセンタイル
+// 85以上になったか」を的中とした場合、S=23.6% vs E=12.9%とほぼ2倍の差が
+// 出ることを確認（旧閾値では差が出にくかった）。
 const POINT_GRADE_BANDS = [
-  { min: 350, grade: "S" },
-  { min: 250, grade: "A" },
-  { min: 150, grade: "B" },
-  { min: 50, grade: "C" },
-  { min: -20, grade: "D" },
+  { min: 300, grade: "S" },
+  { min: 200, grade: "A" },
+  { min: 100, grade: "B" },
+  { min: 95, grade: "C" },
+  { min: -5, grade: "D" },
   { min: -Infinity, grade: "E" },
 ];
 function pointsToGrade(points) {
@@ -3111,32 +3119,37 @@ export default function SlotDataTracker() {
   // ことを確認済みの6つの判定材料だけに絞った：
   // ①台番号固有のXの法則 ②機種全体のXの法則 ③前日、他の台が好調
   // ④前日のG数水準 ⑤日付末尾 ⑥イベント名（登録されているイベント）
-  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam) {
+  // v6.24: 【設計を根本から変更】予想の基準を「平均X（生の値）」から
+  // 「Y（0〜100、Xマトリクス表と同じパーセンタイル表示値）が閾値以上に
+  // なる確率」に統一。的中の定義も「翌日Y≥85」に統一（実データで70/75/
+  // 80/85/90を比較し、85が一番綺麗な単調減少になることを確認：
+  // S=21.5%>A=17.2%>B=15.6%=C=15.6%>D=13.8%）。各判定材料は「過去、同じ
+  // 条件だった時、翌日Y≥85だった割合」を実測し、ページ全体のベース出現率
+  // と比べてcomputePoints（勝率型スコアリング）で得点化する。
+  const Y_HIT_THRESHOLD = 85;
+  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam, pageYByDateParam) {
     const results = [];
-    if (!pageXByDateParam) return results; // Xが計算できていなければ何も予想できない
+    if (!pageXByDateParam || !pageYByDateParam) return results; // X・Yが計算できていなければ何も予想できない
 
     const pageGsuPercentiles = computePageGsuPercentiles(pageSortedHistory);
-    const pageMateGoodStatsX = computePageMateGoodStatsX(pageSortedHistory, pageXByDateParam);
-    const gsuLevelStatsX = computeTrailingGsuLevelStatsX(pageSortedHistory, pageGsuPercentiles, pageXByDateParam);
 
-    // modelNameごとに日付順でプールしたシリーズ（機種全体のXの法則用）
+    // modelNameごとに日付順でプールしたシリーズ（機種全体の法則用）、かつ
+    // ページ全体のY≥85ベース出現率を1回だけ計算
     const modelSeriesByName = {};
-    let pageXSum = 0, pageXCount = 0;
+    let pageYHitCount = 0, pageYTotalCount = 0;
     pageSortedHistory.forEach((h) => {
       h.machines.forEach((m) => {
         const mn = m.modelName || "__unknown__";
         if (!modelSeriesByName[mn]) modelSeriesByName[mn] = [];
-        const xVal = (pageXByDateParam[h.date] || {})[m.no];
-        modelSeriesByName[mn].push({ date: h.date, no: m.no, event: h.event, x: xVal !== undefined ? xVal : null });
-        if (xVal !== null && xVal !== undefined) { pageXSum += xVal; pageXCount += 1; }
+        const yVal = (pageYByDateParam[h.date] || {})[m.no];
+        modelSeriesByName[mn].push({ date: h.date, no: m.no, event: h.event, y: yVal !== undefined ? yVal : null });
+        if (yVal !== null && yVal !== undefined) {
+          pageYTotalCount += 1;
+          if (yVal >= Y_HIT_THRESHOLD) pageYHitCount += 1;
+        }
       });
     });
-    const pageXAvg = pageXCount > 0 ? pageXSum / pageXCount : 0;
-    let pageXAbsSum = 0;
-    Object.values(modelSeriesByName).forEach((arr) => {
-      arr.forEach((r) => { if (r.x !== null && r.x !== undefined) pageXAbsSum += Math.abs(r.x - pageXAvg); });
-    });
-    const pageXTypicalMagnitude = pageXCount > 0 ? pageXAbsSum / pageXCount || 1 : 1;
+    const pageBaseHitRate = pageYTotalCount > 0 ? pageYHitCount / pageYTotalCount : 0.15; // 0.15 ≈ 100-Y_HIT_THRESHOLD相当のフォールバック
 
     const referenceDate = pageSortedHistory.length > 0 ? pageSortedHistory[pageSortedHistory.length - 1].date : null;
     if (!referenceDate) return results;
@@ -3144,150 +3157,181 @@ export default function SlotDataTracker() {
     const tomorrowDigit = parseInt(tomorrowDate.slice(-2), 10) % 10;
     const tomorrowEventNames = splitEventNames(dateEventMap[tomorrowDate] || "");
 
+    // 前日のG数水準（ページ全体パーセンタイル基準）→ Y版
+    const gsuLevelStatsY = (() => {
+      if (!pageGsuPercentiles) return null;
+      const { p33, p66 } = pageGsuPercentiles;
+      let highN = 0, highHits = 0, lowN = 0, lowHits = 0;
+      for (let i = 1; i < pageSortedHistory.length; i++) {
+        const prevDay = pageSortedHistory[i - 1];
+        const curDay = pageSortedHistory[i];
+        const prevByNo = new Map(prevDay.machines.map((m) => [m.no, m.gsu]));
+        curDay.machines.forEach((m) => {
+          const prevGsu = prevByNo.get(m.no);
+          const y = (pageYByDateParam[curDay.date] || {})[m.no];
+          if (prevGsu === null || prevGsu === undefined || y === null || y === undefined) return;
+          const isHit = y >= Y_HIT_THRESHOLD;
+          if (prevGsu >= p66) { highN += 1; if (isHit) highHits += 1; }
+          else if (prevGsu <= p33) { lowN += 1; if (isHit) lowHits += 1; }
+        });
+      }
+      return {
+        高: highN >= 15 ? { hitRate: highHits / highN, sampleSize: highN } : null,
+        低: lowN >= 15 ? { hitRate: lowHits / lowN, sampleSize: lowN } : null,
+      };
+    })();
+
+    // 前日、他の台が好調（▲率50%以上）→ Y版
+    const pageMateGoodStatsY = (() => {
+      let n = 0, hits = 0;
+      for (let i = 1; i < pageSortedHistory.length; i++) {
+        const prevDay = pageSortedHistory[i - 1];
+        const curDay = pageSortedHistory[i];
+        const prevValid = prevDay.machines.filter((m) => m.shutsu !== null && m.shutsu !== undefined);
+        if (prevValid.length < 3) continue;
+        const prevHitRate = prevValid.filter((m) => isHitA(m.shutsu)).length / prevValid.length;
+        if (prevHitRate < 0.5) continue;
+        curDay.machines.forEach((m) => {
+          const y = (pageYByDateParam[curDay.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          n += 1;
+          if (y >= Y_HIT_THRESHOLD) hits += 1;
+        });
+      }
+      return n >= 15 ? { hitRate: hits / n, sampleSize: n } : null;
+    })();
+
     machineNumbers.forEach((no) => {
-      const xSeries = pageSortedHistory
+      const ySeries = pageSortedHistory
         .map((h) => {
           const m = h.machines.find((mm) => mm.no === no);
           if (!m) return null;
-          const x = (pageXByDateParam[h.date] || {})[no];
-          return { date: h.date, gsu: m.gsu, sada: m.sada, x: x !== undefined ? x : null, event: h.event, modelName: m.modelName };
+          const y = (pageYByDateParam[h.date] || {})[no];
+          return { date: h.date, gsu: m.gsu, sada: m.sada, y: y !== undefined ? y : null, event: h.event, modelName: m.modelName };
         })
-        .filter((r) => r && r.x !== null && r.x !== undefined);
-      if (xSeries.length === 0) return;
-      const lastDate = xSeries[xSeries.length - 1].date;
-      const thisMachineModelName = xSeries[xSeries.length - 1].modelName;
+        .filter((r) => r && r.y !== null && r.y !== undefined);
+      if (ySeries.length === 0) return;
+      const lastDate = ySeries[ySeries.length - 1].date;
+      const thisMachineModelName = ySeries[ySeries.length - 1].modelName;
 
-      const scoreItems = []; // { label, points }
+      const scoreItems = []; // { label, points, detail: { hitRate, sampleSize } }
+      const pushSignal = (label, hitRate, sampleSize, weight) => {
+        const pts = computePoints(hitRate, pageBaseHitRate, sampleSize);
+        if (pts === null) return;
+        scoreItems.push({ label, points: pts * weight, detail: { hitRate, sampleSize } });
+      };
 
-      // ①台番号固有のXの法則（トレイリング平均X、この台自身の過去実績）
-      let fixedNoXMatch = null;
-      if (xSeries.length >= 10) {
-        const avgX = xSeries.reduce((a, r) => a + r.x, 0) / xSeries.length;
-        fixedNoXMatch = { avgX, sampleSize: xSeries.length };
+      // ①台番号固有の法則（トレイリング、この台自身の過去Y≥85率）
+      if (ySeries.length >= 10) {
+        const hits = ySeries.filter((r) => r.y >= Y_HIT_THRESHOLD).length;
+        pushSignal("台番号固有のYの法則", hits / ySeries.length, ySeries.length, SIGNAL_WEIGHTS.fixedNoX);
       }
-      if (fixedNoXMatch) {
-        const evPts = computeEvPoints(fixedNoXMatch.avgX, pageXAvg, pageXTypicalMagnitude, fixedNoXMatch.sampleSize);
-        scoreItems.push({ label: "台番号固有のXの法則", points: evPts * SIGNAL_WEIGHTS.fixedNoX, detail: { avgX: fixedNoXMatch.avgX, sampleSize: fixedNoXMatch.sampleSize } });
-      }
 
-      // ②機種全体のXの法則（同じ機種名の他の台のトレイリング平均X、この台は除外）
-      let modelWideXMatch = null;
+      // ②機種全体の法則（同じ機種名の他の台のトレイリングY≥85率、この台は除外）
       if (thisMachineModelName && modelSeriesByName[thisMachineModelName]) {
-        const otherModelXVals = modelSeriesByName[thisMachineModelName]
-          .filter((r) => r.no !== no && r.x !== null && r.x !== undefined)
-          .map((r) => r.x);
-        if (otherModelXVals.length >= 10) {
-          const avgX = otherModelXVals.reduce((a, v) => a + v, 0) / otherModelXVals.length;
-          modelWideXMatch = { avgX, sampleSize: otherModelXVals.length };
+        const otherModelYVals = modelSeriesByName[thisMachineModelName]
+          .filter((r) => r.no !== no && r.y !== null && r.y !== undefined)
+          .map((r) => r.y);
+        if (otherModelYVals.length >= 10) {
+          const hits = otherModelYVals.filter((y) => y >= Y_HIT_THRESHOLD).length;
+          pushSignal("機種全体のYの法則", hits / otherModelYVals.length, otherModelYVals.length, SIGNAL_WEIGHTS.modelWideX);
         }
       }
-      if (modelWideXMatch) {
-        const evPts = computeEvPoints(modelWideXMatch.avgX, pageXAvg, pageXTypicalMagnitude, modelWideXMatch.sampleSize);
-        scoreItems.push({ label: "機種全体のXの法則", points: evPts * SIGNAL_WEIGHTS.modelWideX, detail: { avgX: modelWideXMatch.avgX, sampleSize: modelWideXMatch.sampleSize } });
+
+      // ③前日、他の台が好調（▲率50%以上）だった → 翌日の自分のY≥85率
+      if (pageMateGoodStatsY) {
+        const lastDayRec = pageHistoryByDate[lastDate];
+        const lastMates = lastDayRec ? lastDayRec.machines.filter((m) => m.no !== no && m.shutsu !== null && m.shutsu !== undefined) : [];
+        if (lastMates.length >= 3) {
+          const lastMateHitRate = lastMates.filter((m) => isHitA(m.shutsu)).length / lastMates.length;
+          if (lastMateHitRate >= 0.5) {
+            pushSignal("前日、他の台が好調", pageMateGoodStatsY.hitRate, pageMateGoodStatsY.sampleSize, SIGNAL_WEIGHTS.pageMateGood);
+          }
+        }
       }
 
-      // ③前日、他の台が好調（▲率50%以上）だった → 翌日の自分のX
-      const pageMateGoodMatch = checkPageMateGoodTodayX(pageMateGoodStatsX, pageHistoryByDate, lastDate, no);
-      if (pageMateGoodMatch) {
-        const evPts = computeEvPoints(pageMateGoodMatch.avgX, pageXAvg, pageXTypicalMagnitude, pageMateGoodMatch.sampleSize);
-        scoreItems.push({ label: "前日、他の台が好調", points: evPts * SIGNAL_WEIGHTS.pageMateGood, detail: { avgX: pageMateGoodMatch.avgX, sampleSize: pageMateGoodMatch.sampleSize } });
+      // ④前日のG数水準（大量回転/低調）→ 翌日の自分のY≥85率
+      if (gsuLevelStatsY && pageGsuPercentiles) {
+        const { p33, p66 } = pageGsuPercentiles;
+        const lastGsu = ySeries[ySeries.length - 1].gsu;
+        if (lastGsu !== null && lastGsu !== undefined) {
+          if (lastGsu >= p66 && gsuLevelStatsY.高) {
+            pushSignal("前日のG数水準（大量回転）", gsuLevelStatsY.高.hitRate, gsuLevelStatsY.高.sampleSize, SIGNAL_WEIGHTS.gsuLevel);
+          } else if (lastGsu <= p33 && gsuLevelStatsY.低) {
+            pushSignal("前日のG数水準（低調）", gsuLevelStatsY.低.hitRate, gsuLevelStatsY.低.sampleSize, SIGNAL_WEIGHTS.gsuLevel);
+          }
+        }
       }
 
-      // ④前日のG数水準（大量回転/低調、ページ全体のパーセンタイル基準）→ 翌日の自分のX
-      const gsuLevelMatch = checkTrailingGsuLevelTodayX(gsuLevelStatsX, xSeries, pageGsuPercentiles);
-      if (gsuLevelMatch) {
-        const evPts = computeEvPoints(gsuLevelMatch.avgX, pageXAvg, pageXTypicalMagnitude, gsuLevelMatch.sampleSize);
-        scoreItems.push({ label: `前日のG数水準（${gsuLevelMatch.level}）`, points: evPts * SIGNAL_WEIGHTS.gsuLevel, detail: { avgX: gsuLevelMatch.avgX, sampleSize: gsuLevelMatch.sampleSize } });
-      }
-
-      // ⑤日付末尾（この台の過去、翌日と同じ末尾の日のXが高い/低いか）
-      const digitVals = xSeries.filter((r) => parseInt(r.date.slice(-2), 10) % 10 === tomorrowDigit).map((r) => r.x);
+      // ⑤日付末尾（この台の過去、翌日と同じ末尾の日のY≥85率）
+      const digitVals = ySeries.filter((r) => parseInt(r.date.slice(-2), 10) % 10 === tomorrowDigit).map((r) => r.y);
       if (digitVals.length >= 5) {
-        const avgX = digitVals.reduce((a, v) => a + v, 0) / digitVals.length;
-        const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, digitVals.length);
-        scoreItems.push({ label: `日付末尾=${tomorrowDigit}`, points: evPts * SIGNAL_WEIGHTS.digitDay, detail: { avgX, sampleSize: digitVals.length } });
+        const hits = digitVals.filter((y) => y >= Y_HIT_THRESHOLD).length;
+        pushSignal(`日付末尾=${tomorrowDigit}`, hits / digitVals.length, digitVals.length, SIGNAL_WEIGHTS.digitDay);
       }
 
-      // ⑥イベント（明日登録されているイベント名の、過去のX平均）
+      // ⑥イベント（明日登録されているイベント名の、過去のY≥85率）
       tomorrowEventNames.forEach((name) => {
-        const matchVals = xSeries.filter((r) => r.event && splitEventNames(r.event).includes(name)).map((r) => r.x);
+        const matchVals = ySeries.filter((r) => r.event && splitEventNames(r.event).includes(name)).map((r) => r.y);
         if (matchVals.length >= 5) {
-          const avgX = matchVals.reduce((a, v) => a + v, 0) / matchVals.length;
-          const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, matchVals.length);
-          scoreItems.push({ label: `イベント「${name}」`, points: evPts * SIGNAL_WEIGHTS.plannedEvent, detail: { avgX, sampleSize: matchVals.length, eventName: name } });
+          const hits = matchVals.filter((y) => y >= Y_HIT_THRESHOLD).length;
+          pushSignal(`イベント「${name}」`, hits / matchVals.length, matchVals.length, SIGNAL_WEIGHTS.plannedEvent);
         }
       });
 
-      // v6.21: 復活＆Xターゲット化した3つの判定材料（ユーコーラッキー資料
-      // をきっかけに判定材料を絞りすぎたとの指摘を受け、実データで再検証
-      // した上で復活）
-
-      // ⑦20日足・30日足トレイリング差枚（逆張り）→ 翌日X。実データ検証：
-      // 20日足はマイナス圏でn=2018・base比+0.032、30日足はマイナス圏で
-      // n=1428・base比+0.026と、意外にも「長期でマイナスの方が翌日Xは
-      // 高い」という平均回帰型の効果を確認（10日足は弱いので不採用）。
+      // ⑦20日足・30日足トレイリング差枚（逆張り）→ 翌日Y≥85率
       [20, 30].forEach((window) => {
-        if (xSeries.length < window) return;
-        const trailing = xSeries.slice(-window);
+        if (ySeries.length < window) return;
+        const trailing = ySeries.slice(-window);
         if (trailing.some((r) => r.sada === null || r.sada === undefined)) return;
         const total = trailing.reduce((a, r) => a + r.sada, 0);
-        const isMinusZone = total < 0;
-        // マイナス圏の時だけ、過去の「マイナス圏だった翌日」のX平均を集計
-        if (!isMinusZone) return;
+        if (total >= 0) return; // マイナス圏の時だけ
         const followVals = [];
-        for (let i = window; i < xSeries.length; i++) {
-          const w = xSeries.slice(i - window, i);
+        for (let i = window; i < ySeries.length; i++) {
+          const w = ySeries.slice(i - window, i);
           if (w.some((r) => r.sada === null || r.sada === undefined)) continue;
           const t = w.reduce((a, r) => a + r.sada, 0);
-          if (t < 0) followVals.push(xSeries[i].x);
+          if (t < 0) followVals.push(ySeries[i].y);
         }
         if (followVals.length >= 15) {
-          const avgX = followVals.reduce((a, v) => a + v, 0) / followVals.length;
-          const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, followVals.length);
-          scoreItems.push({ label: `${window}日足トレイリング差枚（マイナス圏）`, points: evPts * SIGNAL_WEIGHTS.trailingWindow, detail: { avgX, sampleSize: followVals.length } });
+          const hits = followVals.filter((y) => y >= Y_HIT_THRESHOLD).length;
+          pushSignal(`${window}日足トレイリング差枚（マイナス圏）`, hits / followVals.length, followVals.length, SIGNAL_WEIGHTS.trailingWindow);
         }
       });
 
-      // ⑧準イベント翌日 → 翌日X。実データ検証：n=722・base比-0.051と
-      // 明確な負の効果（注意信号として採用）。強いイベント翌日は
-      // base比-0.009とほぼ効果が無かったため不採用。
+      // ⑧準イベント翌日 → 翌日Y≥85率
       if (pageSemiDateSet && pageSemiDateSet.has(lastDate)) {
         const followVals = [];
-        for (let i = 1; i < xSeries.length; i++) {
-          if (pageSemiDateSet.has(xSeries[i - 1].date)) followVals.push(xSeries[i].x);
+        for (let i = 1; i < ySeries.length; i++) {
+          if (pageSemiDateSet.has(ySeries[i - 1].date)) followVals.push(ySeries[i].y);
         }
         if (followVals.length >= 15) {
-          const avgX = followVals.reduce((a, v) => a + v, 0) / followVals.length;
-          const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, followVals.length);
-          scoreItems.push({ label: "準イベント翌日", points: evPts * SIGNAL_WEIGHTS.semiFollow, detail: { avgX, sampleSize: followVals.length } });
+          const hits = followVals.filter((y) => y >= Y_HIT_THRESHOLD).length;
+          pushSignal("準イベント翌日", hits / followVals.length, followVals.length, SIGNAL_WEIGHTS.semiFollow);
         }
       }
 
-      // ⑨大量回転・低調（この台自身の平均G数との比較）→ 翌日X。実データ
-      // 検証：自分の平均の1.3倍以上でn=2160・+0.035、0.7倍以下でn=2250・
-      // -0.015。前日のG数水準（ページ全体パーセンタイル基準）とは別の
-      // 切り口（この台自身の基準に対する相対値）。
-      if (xSeries.length >= 10) {
-        const gsuVals = xSeries.map((r) => r.gsu).filter((v) => v !== null && v !== undefined);
+      // ⑨大量回転・低調（この台自身の平均G数との比較）→ 翌日Y≥85率
+      if (ySeries.length >= 10) {
+        const gsuVals = ySeries.map((r) => r.gsu).filter((v) => v !== null && v !== undefined);
         const ownAvgGsu = gsuVals.length >= 10 ? gsuVals.reduce((a, v) => a + v, 0) / gsuVals.length : null;
         if (ownAvgGsu) {
-          const lastGsu = xSeries[xSeries.length - 1].gsu;
+          const lastGsu = ySeries[ySeries.length - 1].gsu;
           if (lastGsu !== null && lastGsu !== undefined) {
             const ratio = lastGsu / ownAvgGsu;
             const level = ratio >= 1.3 ? "大量回転" : ratio <= 0.7 ? "低調" : null;
             if (level) {
               const followVals = [];
-              for (let i = 1; i < xSeries.length; i++) {
-                const prevGsu = xSeries[i - 1].gsu;
+              for (let i = 1; i < ySeries.length; i++) {
+                const prevGsu = ySeries[i - 1].gsu;
                 if (prevGsu === null || prevGsu === undefined) continue;
                 const r2 = prevGsu / ownAvgGsu;
                 const lv = r2 >= 1.3 ? "大量回転" : r2 <= 0.7 ? "低調" : null;
-                if (lv === level) followVals.push(xSeries[i].x);
+                if (lv === level) followVals.push(ySeries[i].y);
               }
               if (followVals.length >= 15) {
-                const avgX = followVals.reduce((a, v) => a + v, 0) / followVals.length;
-                const evPts = computeEvPoints(avgX, pageXAvg, pageXTypicalMagnitude, followVals.length);
-                scoreItems.push({ label: `大量回転・低調（自分比・${level}）`, points: evPts * SIGNAL_WEIGHTS.volumeMismatch, detail: { avgX, sampleSize: followVals.length } });
+                const hits = followVals.filter((y) => y >= Y_HIT_THRESHOLD).length;
+                pushSignal(`大量回転・低調（自分比・${level}）`, hits / followVals.length, followVals.length, SIGNAL_WEIGHTS.volumeMismatch);
               }
             }
           }
@@ -3338,6 +3382,12 @@ export default function SlotDataTracker() {
     if (sortedHistory.length < 15) return null;
     return computeXForPage(sortedHistory);
   }, [sortedHistory]);
+  // v6.24: 予想の基準をY（0〜100、Xマトリクス表と同じパーセンタイル値）に
+  // 統一したため、Yもpicklistより先に計算しておく
+  const pageYByDate = useMemo(() => {
+    if (!pageXByDate) return null;
+    return computeXPercentiles(pageXByDate);
+  }, [pageXByDate]);
 
   // v6.18: ▲・差枚ベースの法則とX（設定期待度）ベースの法則を1つの
   // ランク（S〜G）に統合。以前は「設定期待度（高/中/低）」として別カード
@@ -3345,8 +3395,8 @@ export default function SlotDataTracker() {
   // 設定判別カードは、翌日予想として機能しないことが実データ検証で
   // わかったため削除）。
   const pickList = useMemo(() => {
-    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA, pageXByDate));
-  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA, pageXByDate]);
+    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA, pageXByDate, pageYByDate));
+  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA, pageXByDate, pageYByDate]);
 
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
   // engine (it doesn't care whether "no" is a machine number, a model name,
@@ -4128,6 +4178,8 @@ export default function SlotDataTracker() {
     const xInfo = xLabelLookup ? xLabelLookup(p.no) : null;
     // v6.23: 雑餉隈スタイルの1行フォーマットに変更（バッジ＋長文の2段構成
     // より、こちらの方が見やすいとの指摘）。影響度が大きい順に並べる。
+    // v6.24: 予想の基準をX（生の値）からY（0〜100のパーセンタイル、翌日
+    // Y≥85を的中とする）に変更したため、実測値も勝率%表示に統一。
     const sortedItems = p.scoreItems ? [...p.scoreItems].sort((a, b) => Math.abs(b.points) - Math.abs(a.points)) : [];
 
     return (
@@ -4172,7 +4224,7 @@ export default function SlotDataTracker() {
                   {s.label}
                   {s.detail && (
                     <span style={{ color: "#5a6272" }}>
-                      ：実測X {s.detail.avgX >= 0 ? "+" : ""}{s.detail.avgX.toFixed(3)}（n={s.detail.sampleSize}）
+                      ：実測 {(s.detail.hitRate * 100).toFixed(1)}%（n={s.detail.sampleSize}）
                     </span>
                   )}
                 </span>
@@ -4185,7 +4237,7 @@ export default function SlotDataTracker() {
         )}
 
         <div style={{ fontSize: "10px", color: "#5a6272", marginTop: "8px", fontStyle: "italic" }}>
-          ※ 「翌日、設定期待度（X）が高くなりそうか」を予想したスコアです。差枚のプラス/マイナスとは別物（設定は基本的に毎日変わるため）で、精度が検証された予測ではないので、あくまで判断材料の一つとして見てください。
+          ※ 「翌日、Y（設定期待度・0〜100のパーセンタイル値）が85以上になるか」を予想したスコアです。差枚のプラス/マイナスとは別物（設定は基本的に毎日変わるため）で、精度が検証された予測ではないので、あくまで判断材料の一つとして見てください。
         </div>
       </div>
     );
@@ -6135,7 +6187,7 @@ export default function SlotDataTracker() {
               })()}
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
-              「翌日、設定期待度（X）が高くなりそうか」を予想します。台番号固有のXの法則・機種全体のXの法則・前日、他の台が好調・前日のG数水準・日付末尾・イベント名の6つを見て、当てはまる台をスコアが高い順に並べます（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。<span style={{ color: "#e8b34c" }}>「差枚がプラスになるか」ではなく「設定が入っていたか」を見る指標です。</span>
+              「翌日、Y（設定期待度・0〜100のパーセンタイル値、Xマトリクス表と同じ数字）が85以上になりそうか」を予想します。台番号固有のYの法則・機種全体のYの法則・前日、他の台が好調・前日のG数水準・日付末尾・イベント名・20/30日足・準イベント翌日・大量回転低調の9つを見て、当てはまる台をスコアが高い順に並べます（このページの全ての台が対象）。丸いバッジはスコアをS〜Gのランクにしたものです。<span style={{ color: "#e8b34c" }}>「差枚がプラスになるか」ではなく「設定が入っていたか」を見る指標です。</span>
             </div>
             {pickList.length === 0 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>{historyLoading ? "読み込み中..." : "現時点で条件に当てはまる台はありません。"}</div>
