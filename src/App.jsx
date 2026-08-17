@@ -327,7 +327,12 @@ const DIGIT7_COLOR = "#f6a04d";
 // 予想対象日（月/日）を表示する見出しに変更（例：「8/16のピックアップ」）。
 // 各カードの日付表示も「{日付}時点」から「{日付}までのデータで予想」に
 // 変更し、それが予想対象日ではなくデータの基準日であることを明確化。
-const APP_VERSION = "6.22";
+// v6.23: renderPickCardの表示を、雑餉隈スレッドの実際の表示例を参考に、
+// 1行1判定材料のコンパクトな形式に変更（バッジ＋長文の2段構成より見やすい
+// との指摘）。「合計{pt}pt（根拠{件数}件）{日付}までのデータで予想」を
+// ヘッダーに、各判定材料は「{ラベル}：実測X {値}（n={件数}） → {符号}
+// {pt}pt」の1行で、影響度（pointsの絶対値）が大きい順に並べる。
+const APP_VERSION = "6.23";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4121,10 +4126,13 @@ export default function SlotDataTracker() {
 
   function renderPickCard(p, labelOverride, xLabelLookup) {
     const xInfo = xLabelLookup ? xLabelLookup(p.no) : null;
+    // v6.23: 雑餉隈スタイルの1行フォーマットに変更（バッジ＋長文の2段構成
+    // より、こちらの方が見やすいとの指摘）。影響度が大きい順に並べる。
+    const sortedItems = p.scoreItems ? [...p.scoreItems].sort((a, b) => Math.abs(b.points) - Math.abs(a.points)) : [];
 
     return (
       <div key={p.no} style={{ background: "#12161d", border: "1px solid #2a323f", borderRadius: "8px", padding: "10px 12px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
           <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <span className="mono" style={{ fontSize: "13px", fontWeight: 700, color: "#e8b34c" }}>{labelOverride ? labelOverride(p) : `${p.no}番`}</span>
             {p.grade && (
@@ -4150,52 +4158,35 @@ export default function SlotDataTracker() {
                 設定{xInfo.label}
               </span>
             )}
-            {p.totalPoints !== null && p.totalPoints !== undefined && (
-              <span className="mono" style={{
-                fontSize: "11px", fontWeight: 700, color: "#12161d",
-                background: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a",
-                borderRadius: "4px", padding: "1px 6px",
-              }}>
-                該当基準{p.strongSignalCount}個（微調整{p.tieBreakerPoints >= 0 ? "+" : ""}{Math.round(p.tieBreakerPoints)}pt・全{p.signalCount}件根拠）
-              </span>
-            )}
           </span>
-          <span style={{ fontSize: "10px", color: "#5a6272" }}>{p.lastDate}までのデータで予想</span>
+        </div>
+        <div className="mono" style={{ fontSize: "11px", color: p.totalPoints >= 0 ? "#9ece6a" : "#e5697a", marginBottom: "6px", fontWeight: 700 }}>
+          合計{p.totalPoints >= 0 ? "+" : ""}{p.totalPoints.toFixed(1)}pt（根拠{p.signalCount}件） {p.lastDate}までのデータで予想
         </div>
 
-        <div style={{ fontSize: "10px", color: "#5a6272", marginBottom: "8px", fontStyle: "italic" }}>
+        {sortedItems.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "1px" }}>
+            {sortedItems.map((s, i) => (
+              <div key={i} className="mono" style={{ fontSize: "11px", color: s.points >= 0 ? "#8b93a3" : "#c99", display: "flex", justifyContent: "space-between", gap: "8px" }}>
+                <span>
+                  {s.label}
+                  {s.detail && (
+                    <span style={{ color: "#5a6272" }}>
+                      ：実測X {s.detail.avgX >= 0 ? "+" : ""}{s.detail.avgX.toFixed(3)}（n={s.detail.sampleSize}）
+                    </span>
+                  )}
+                </span>
+                <span style={{ color: s.points >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700, whiteSpace: "nowrap" }}>
+                  → {s.points >= 0 ? "+" : ""}{s.points.toFixed(1)}pt
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div style={{ fontSize: "10px", color: "#5a6272", marginTop: "8px", fontStyle: "italic" }}>
           ※ 「翌日、設定期待度（X）が高くなりそうか」を予想したスコアです。差枚のプラス/マイナスとは別物（設定は基本的に毎日変わるため）で、精度が検証された予測ではないので、あくまで判断材料の一つとして見てください。
         </div>
-
-        {p.scoreItems && p.scoreItems.length > 0 && (
-          <>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "8px" }}>
-              {p.scoreItems.map((s, i) => (
-                <span key={i} className="mono" style={{
-                  fontSize: "10px", padding: "1px 6px", borderRadius: "4px",
-                  color: s.points >= 0 ? "#9ece6a" : "#e5697a",
-                  background: s.points >= 0 ? "rgba(158,206,106,0.1)" : "rgba(229,105,122,0.1)",
-                }}>
-                  {s.label} {s.points >= 0 ? "+" : ""}{s.points.toFixed(1)}pt
-                </span>
-              ))}
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-              {p.scoreItems.map((s, i) => {
-                if (!s.detail) return null;
-                const { avgX, sampleSize } = s.detail;
-                return (
-                  <div key={i} style={{ fontSize: "11px", color: s.points >= 0 ? "#8b93a3" : "#c99" }}>
-                    <span style={{ color: s.points >= 0 ? "#9ece6a" : "#e5697a", fontWeight: 700 }}>{s.label}</span>
-                    ：過去の同条件では、翌日のXが平均
-                    <span className="mono" style={{ color: "#c7cbd4" }}> {avgX >= 0 ? "+" : ""}{avgX.toFixed(3)}</span>
-                    でした（{sampleSize}件中、サンプルが多いほど信頼度が高い）
-                  </div>
-                );
-              })}
-            </div>
-          </>
-        )}
       </div>
     );
   }
