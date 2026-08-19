@@ -343,7 +343,18 @@ const DIGIT7_COLOR = "#f6a04d";
 // グレード閾値（300/200/100/95/-5pt）は新方式でもS=20.3%→E=14.1%と綺麗な
 // 分離を維持することを確認したためそのまま維持。renderPickCardの表示も
 // 「実測X +値」→「実測{勝率}%」に変更。
-const APP_VERSION = "6.24";
+// v6.25: 【設計をさらに1段階見直し】「実証済みの強い基準に該当したら
+// 実測%に関係なく+100pt」という荒い加点方式（旧▲マーク時代からの
+// 名残）を撤廃。各判定材料の実測%差（computePointsで既に信頼度補正
+// 済み）を、そのまま合計する方式に統一。合わせて信頼度（回転数）を
+// 生の値の計算式に組み込む案も実データで検証：Yの個々の値は変わる
+// （基準5000で4.7%・基準8000で7.0%が閾値をまたいで入れ替わる）ものの、
+// フルバックテストではS〜D間の差がむしろ縮む（8.4pt→4.6〜5.2pt）ため
+// 不採用、今まで通り回転数信頼度なしのYを使う。POINT_GRADE_BANDSも
+// 新しい点数スケール（100単位の跳躍がなくなったため）に合わせて
+// 28/11/-1/-12ptへ再キャリブレーション。実データ確認：S=23.2%>A=18.2%>
+// B=14.6%>C=13.9%>D=13.7%と綺麗な単調減少を維持。
+const APP_VERSION = "6.25";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -776,20 +787,19 @@ function isStrongSignalLabel(label) {
   return STRONG_SIGNAL_LABELS.has(baseLabel) || baseLabel.startsWith("日付末尾") || baseLabel.startsWith("イベント「");
 }
 
-// grade bands for the hybrid score: count-of-proven-signals * 100, plus a
-// capped tie-breaker from every other (weaker but non-zero) signal
-// v6.24: 実データ（5,362件、ウォークフォワード）で、点数の分布に対して
-// 均等な母数になる区切り（上位3%/12%/25%/30%/20%/10%）を探索し、旧来の
-// 決め打ち閾値（350/250/150/50/-20）から更新。「翌日、Xがパーセンタイル
-// 85以上になったか」を的中とした場合、S=23.6% vs E=12.9%とほぼ2倍の差が
-// 出ることを確認（旧閾値では差が出にくかった）。
+// grade bands for the hybrid score
+// v6.25: 「強い基準+100pt固定」を撤廃し、実測%の差をそのまま合計する
+// 方式に変更したため、点数のスケールが根本的に変わった（以前は100単位で
+// 跳ね上がっていたが、今は実測%差の積み上げなので数十pt程度の範囲）。
+// 実データ（5,362件、ウォークフォワード）で再キャリブレーション：
+// S=28pt+ (23.1%) > A=11pt+ (18.3%) > B=-1pt+ (14.8%) > C=-12pt+ (13.8%)
+// > D (13.5%) と綺麗な単調減少を確認。
 const POINT_GRADE_BANDS = [
-  { min: 300, grade: "S" },
-  { min: 200, grade: "A" },
-  { min: 100, grade: "B" },
-  { min: 95, grade: "C" },
-  { min: -5, grade: "D" },
-  { min: -Infinity, grade: "E" },
+  { min: 28, grade: "S" },
+  { min: 11, grade: "A" },
+  { min: -1, grade: "B" },
+  { min: -12, grade: "C" },
+  { min: -Infinity, grade: "D" },
 ];
 function pointsToGrade(points) {
   if (points === null || points === undefined) return null;
@@ -3340,13 +3350,13 @@ export default function SlotDataTracker() {
 
       if (scoreItems.length === 0) return;
 
-      let strongSignalCount = 0;
-      let tieBreakerPoints = 0;
-      scoreItems.forEach((s) => {
-        if (isStrongSignalLabel(s.label) && s.points > 0) strongSignalCount += 1;
-        else tieBreakerPoints += s.points;
-      });
-      const totalPoints = strongSignalCount * 100 + Math.max(-40, Math.min(40, tieBreakerPoints));
+      // v6.25: 「強い基準に該当したら実測%に関係なく+100pt」という荒い
+      // 加点方式をやめ、実測%の差（computePointsで既に信頼度補正済み）を
+      // そのまま合計する方式に変更。strongSignalCountは表示用に残すが、
+      // 点数計算には使わない。
+      const totalPoints = scoreItems.reduce((a, s) => a + s.points, 0);
+      const strongSignalCount = scoreItems.filter((s) => isStrongSignalLabel(s.label) && s.points > 0).length;
+      const tieBreakerPoints = totalPoints; // v6.25: 区別が無くなったため全体と同じ値
       const signalCount = scoreItems.length;
       const grade = pointsToGrade(totalPoints);
 
