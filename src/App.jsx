@@ -354,7 +354,11 @@ const DIGIT7_COLOR = "#f6a04d";
 // 新しい点数スケール（100単位の跳躍がなくなったため）に合わせて
 // 28/11/-1/-12ptへ再キャリブレーション。実データ確認：S=23.2%>A=18.2%>
 // B=14.6%>C=13.9%>D=13.7%と綺麗な単調減少を維持。
-const APP_VERSION = "6.25";
+// v6.26: 「日別データを見る」で特定の日を選んだ時、差枚推移グラフだけ
+// でなく設定期待度（X）マトリクス表も同じ期間で見たい、との要望に対応。
+// 既存のviewWindowDates（差枚推移で使っている日付範囲）とrenderXGrid・
+// pageGridXPercentilesをそのまま流用し、新規のデータ計算無しで追加。
+const APP_VERSION = "6.26";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -6064,6 +6068,19 @@ export default function SlotDataTracker() {
                     ))}
                   </div>
                 </div>
+
+                {/* v6.26: この日を見ている時に、同じ期間の設定期待度（X）
+                    マトリクス表も見たい、という要望に対応。上の差枚推移と
+                    同じ日付範囲（viewWindowDates）・同じ台リストを使い、
+                    既存のrenderXGrid/pageGridXPercentilesをそのまま流用。 */}
+                {sortedHistory.length >= 15 && (
+                  <div style={{ borderTop: "1px solid #2a323f", paddingTop: "14px", marginTop: "14px" }}>
+                    <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "10px" }}>
+                      この日までの設定期待度（X）マトリクス表
+                    </div>
+                    {renderXGrid(viewWindowDates, viewDateMachines.map((m) => m.no), pageGridXPercentiles, (no) => machineLabel(no))}
+                  </div>
+                )}
               </>
             )}
           </div>
