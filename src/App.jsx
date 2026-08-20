@@ -358,7 +358,10 @@ const DIGIT7_COLOR = "#f6a04d";
 // でなく設定期待度（X）マトリクス表も同じ期間で見たい、との要望に対応。
 // 既存のviewWindowDates（差枚推移で使っている日付範囲）とrenderXGrid・
 // pageGridXPercentilesをそのまま流用し、新規のデータ計算無しで追加。
-const APP_VERSION = "6.26";
+// v6.27: 「日別データを見る」の並び順を、差枚が大きい順→台番号順に変更。
+// viewDateMachines（表・グラフ・Xマトリクス表、全部がこれを参照）の
+// sortをa.sada降順からa.no昇順に変えるだけで、3箇所全部に反映される。
+const APP_VERSION = "6.27";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -3972,7 +3975,9 @@ export default function SlotDataTracker() {
   const viewDateMachines = useMemo(() => {
     const entry = historyByDate[viewDate];
     if (!entry) return null;
-    return [...entry.machines].sort((a, b) => (b.sada ?? -Infinity) - (a.sada ?? -Infinity));
+    // v6.27: 差枚が大きい順→台番号順に変更（表・グラフ・Xマトリクス表、
+    // 全部この並び順を使っているので、ここを直せば全部に反映される）
+    return [...entry.machines].sort((a, b) => a.no - b.no);
   }, [historyByDate, viewDate]);
 
   // for each machine present on the picked date, a cumulative 差枚 trend for
