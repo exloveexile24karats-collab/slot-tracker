@@ -361,7 +361,15 @@ const DIGIT7_COLOR = "#f6a04d";
 // v6.27: 「日別データを見る」の並び順を、差枚が大きい順→台番号順に変更。
 // viewDateMachines（表・グラフ・Xマトリクス表、全部がこれを参照）の
 // sortをa.sada降順からa.no昇順に変えるだけで、3箇所全部に反映される。
-const APP_VERSION = "6.27";
+// v6.28: Xマトリクス表（renderXGrid）の表示に、G数（回転数）による信頼度
+// 重みを追加。予想エンジン（computeSignalsForPage/computePoints/X・Y計算）
+// には一切触れない、表示専用の変更。表示値=round(Y×weight)、weightは
+// 0回転→0、8000回転以上→1のなだらかな線形ランプ（実データのG数分布：
+// 中央値4000〜7000、p90が8000〜9300前後を踏まえて決定）。セル内には元の
+// Y（重み前）も小さく併記。加えて「G数<2000なのに出率>=110%」のセルには
+// ▼マークを付与（既存のclassifyMachineMarkの▲基準=出率110%以上と統一、
+// 各ページ5〜13%程度の該当率で密度も妥当と確認）。両方ともユーザー確認済み。
+const APP_VERSION = "6.28";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -496,6 +504,24 @@ function fiveBandColor(score0to100) {
   if (score0to100 >= 45) return "#9ece6a"; // 緑
   if (score0to100 >= 30) return "#7aa2f7"; // 青
   return "#5a6272"; // 灰
+}
+
+// v6.28: Xマトリクス表の表示専用の信頼度重み（予想エンジン=computeSignals
+// ForPage/computePointsのX/Y計算には一切触れない、見た目だけの変更）。
+// 実データ検証（G数分布：中央値4000〜7000、p90が8000〜9300あたり）を踏まえ、
+// 0回転→重み0、8000回転以上→重み1のなだらかな線形ランプに決定（ユーザー
+// 確認済み）。表示値 = round(Y × 重み)。元のY（重み前）はセル内に小さく
+// 併記する。
+const GSU_RELIABILITY_CAP = 8000;
+// 「低回転数なのに出ている」▼マークの基準。実データ確認の結果、G数<2000
+// （絶対値・ページ共通）かつ出率>=110%（classifyMachineMarkの▲基準と統一）
+// で、各ページ5〜13%程度の該当率になり密度として妥当と判断（ユーザー確認済み）。
+const LOW_GSU_THRESHOLD = 2000;
+const LOW_GSU_GOOD_SHUTSU = 110;
+
+function gsuReliabilityWeight(gsu) {
+  if (gsu === null || gsu === undefined || gsu <= 0) return 0;
+  return Math.min(1, gsu / GSU_RELIABILITY_CAP);
 }
 
 // per-MACHINE version of the same idea — an individual machine on a single
@@ -3618,6 +3644,19 @@ export default function SlotDataTracker() {
     return map;
   }, [sortedHistory]);
 
+  // v6.28: Xマトリクス表の表示用信頼度重み・▼マーク判定に使うG数/出率。
+  // pageGridMarksと同じsortedHistoryソースを再利用。
+  const pageGridGsuMeta = useMemo(() => {
+    const map = {};
+    sortedHistory.forEach((h) => {
+      h.machines.forEach((m) => {
+        if (!map[m.no]) map[m.no] = {};
+        map[m.no][h.date] = { gsu: m.gsu ?? null, shutsu: m.shutsu ?? null };
+      });
+    });
+    return map;
+  }, [sortedHistory]);
+
   // v6.12: 台番号×日付のXマトリクス表用データ（設定期待度・数値表示）
   const pageGridXPercentiles = useMemo(() => {
     if (!pageXByDate) return {};
@@ -4141,7 +4180,9 @@ export default function SlotDataTracker() {
   // v6.12: 台番号×日付のXマトリクス表（雑餉隈の「数値」表示と同じ見た目：
   // 色付きの数値をそのまま並べる）。valuesMap は {no: {date: 0-100の
   // パーセンタイル}}。
-  function renderXGrid(dates, rows, valuesMap, rowLabelFn) {
+  // v6.28: gsuMetaMap（{row: {date: {gsu, shutsu}}}）を追加。省略時は従来
+  // 通り重み無し表示（呼び出し元を全部揃えたので実運用では常に渡される）。
+  function renderXGrid(dates, rows, valuesMap, rowLabelFn, gsuMetaMap) {
     if (rows.length === 0 || dates.length === 0) {
       return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
     }
@@ -4175,13 +4216,31 @@ export default function SlotDataTracker() {
                 </td>
                 {dates.map((d) => {
                   const v = valuesMap[row] && valuesMap[row][d];
+                  const meta = gsuMetaMap && gsuMetaMap[row] && gsuMetaMap[row][d];
+                  const gsu = meta ? meta.gsu : null;
+                  const shutsu = meta ? meta.shutsu : null;
+                  const hasV = v !== null && v !== undefined;
+                  const weight = hasV ? gsuReliabilityWeight(gsu) : null;
+                  const weightedV = hasV ? Math.round(v * weight) : null;
+                  const isLowGsuGood = hasV && gsu !== null && gsu !== undefined && gsu < LOW_GSU_THRESHOLD
+                    && shutsu !== null && shutsu !== undefined && shutsu >= LOW_GSU_GOOD_SHUTSU;
+                  const titleText = hasV
+                    ? `元のY=${v}　G数=${gsu !== null && gsu !== undefined ? gsu : "不明"}　信頼度重み=${weight.toFixed(2)}　表示値=${weightedV}`
+                    : undefined;
                   return (
                     <td
                       key={d}
                       className="mono"
-                      style={{ padding: "4px 3px", textAlign: "center", color: v !== null && v !== undefined ? fiveBandColor(v) : "#2a323f", borderBottom: "1px solid #1c2129" }}
+                      title={titleText}
+                      style={{ padding: "4px 3px", textAlign: "center", color: hasV ? fiveBandColor(weightedV) : "#2a323f", borderBottom: "1px solid #1c2129" }}
                     >
-                      {v !== null && v !== undefined ? v : "・"}
+                      {hasV ? (
+                        <span style={{ display: "inline-flex", alignItems: "baseline", gap: "1px" }}>
+                          {isLowGsuGood && <span style={{ fontSize: "8px", lineHeight: 1 }}>▼</span>}
+                          <span>{weightedV}</span>
+                          <sub style={{ fontSize: "8px", color: "#5a6272" }}>{v}</sub>
+                        </span>
+                      ) : "・"}
                     </td>
                   );
                 })}
@@ -5834,13 +5893,14 @@ export default function SlotDataTracker() {
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
               合成確率と出率を合成したX（設定期待度スコア）を、このページ内での順位（0〜100、高いほど良い）に変換して表示します。<span style={{ color: "#e8b34c" }}>差枚のプラス/マイナスとは別物です（設定は基本的に毎日変わるため）。</span>台番号固定の実績・日付末尾・イベント等、条件を目視で確認するのに使ってください。
+              大きい数字はG数（回転数）による信頼度重み（0回転→0、8000回転以上→1）をかけた表示値、右下の小さい数字は重み前の元のYです。<span style={{ color: "#e8b34c" }}>▼</span>は「G数2000未満なのに出率110%以上」の目立つセルの目印です。
             </div>
             {historyLoading ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>読み込み中...</div>
             ) : sortedHistory.length < 15 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>データが15日分たまると表示されます。</div>
             ) : (
-              renderXGrid(pageGridDates, pageGridRows, pageGridXPercentiles, (no) => machineLabel(no))
+              renderXGrid(pageGridDates, pageGridRows, pageGridXPercentiles, (no) => machineLabel(no), pageGridGsuMeta)
             )}
           </div>
         </div>
@@ -6083,7 +6143,7 @@ export default function SlotDataTracker() {
                     <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "10px" }}>
                       この日までの設定期待度（X）マトリクス表
                     </div>
-                    {renderXGrid(viewWindowDates, viewDateMachines.map((m) => m.no), pageGridXPercentiles, (no) => machineLabel(no))}
+                    {renderXGrid(viewWindowDates, viewDateMachines.map((m) => m.no), pageGridXPercentiles, (no) => machineLabel(no), pageGridGsuMeta)}
                   </div>
                 )}
               </>
