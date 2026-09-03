@@ -37,6 +37,9 @@ const STRONG_EVENTS_KEY = "slot-strong-events-v1";
 const SEMI_EVENTS_KEY = "slot-semi-events-v1";
 const CLOSED_DAYS_KEY = "slot-closed-days-v1";
 const DATE_EVENT_MAP_KEY = "slot-date-event-map-v1";
+// v6.28: イベント絞り込みUI専用の合成ラベル。dateEventMapには実際には保存
+// しない（未登録＝自動でこの扱いにする、手動タグ付け不要という要望のため）。
+const NO_EVENT_FILTER_LABEL = "イベント無し";
 
 // a single date can now have MULTIPLE event tags (e.g. "2のつく日" AND "新台
 //入れ替え" on the same day) — stored as one delimited string so every
@@ -369,6 +372,11 @@ const DIGIT7_COLOR = "#f6a04d";
 // Y（重み前）も小さく併記。加えて「G数<2000なのに出率>=110%」のセルには
 // ▼マークを付与（既存のclassifyMachineMarkの▲基準=出率110%以上と統一、
 // 各ページ5〜13%程度の該当率で密度も妥当と確認）。両方ともユーザー確認済み。
+// また、イベント絞り込みボタン群（renderEventMultiSelect、Xマトリクス表・
+// ▲〇マトリクス表用）に合成の「イベント無し」を追加。dateEventMapには
+// 実際には保存せず、未登録日を自動でこの扱いにする（手動タグ付け不要にし
+// たいという要望）。予想エンジン側（⑥イベント名ごと判定材料）は今回は
+// 変更していない（別件として要検討）。
 const APP_VERSION = "6.28";
 
 const RANGE_OPTIONS = [
@@ -3568,7 +3576,11 @@ export default function SlotDataTracker() {
     let dates;
     if (overallGridEventFilter.length > 0) {
       dates = overallSortedSummaries
-        .filter((s) => s.event && splitEventNames(s.event).some((n) => overallGridEventFilter.includes(n)))
+        .filter((s) => {
+          const names = s.event ? splitEventNames(s.event) : [];
+          if (names.length === 0) return overallGridEventFilter.includes(NO_EVENT_FILTER_LABEL);
+          return names.some((n) => overallGridEventFilter.includes(n));
+        })
         .map((s) => s.date);
     } else {
       dates = overallSortedSummaries.slice(-30).map((s) => s.date);
@@ -3619,7 +3631,11 @@ export default function SlotDataTracker() {
     let dates;
     if (pageGridEventFilter.length > 0) {
       dates = sortedHistory
-        .filter((h) => h.event && splitEventNames(h.event).some((n) => pageGridEventFilter.includes(n)))
+        .filter((h) => {
+          const names = h.event ? splitEventNames(h.event) : [];
+          if (names.length === 0) return pageGridEventFilter.includes(NO_EVENT_FILTER_LABEL);
+          return names.some((n) => pageGridEventFilter.includes(n));
+        })
         .map((h) => h.date);
     } else {
       dates = sortedHistory.slice(-30).map((h) => h.date);
@@ -4092,21 +4108,25 @@ export default function SlotDataTracker() {
     setList(list.includes(name) ? list.filter((n) => n !== name) : [...list, name]);
   }
 
+  // v6.28: 先頭に合成の「イベント無し」を追加（実際にdateEventMapへ保存は
+  // しない、絞り込みUIだけの見た目上の選択肢）。手動タグ付け不要にしたい
+  // という要望のため、未登録日を自動でこの扱いにする。
   function renderEventMultiSelect(selectedList, setSelectedList) {
+    const options = [NO_EVENT_FILTER_LABEL, ...allKnownEventNames];
     return (
       <div className="scrollbar" style={{ maxHeight: "120px", overflowY: "auto", display: "flex", flexWrap: "wrap", gap: "6px", marginBottom: "10px", padding: "8px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px" }}>
-        {allKnownEventNames.length === 0 && <span style={{ fontSize: "11px", color: "#5a6272" }}>登録済みのイベントがまだありません。</span>}
-        {allKnownEventNames.map((n) => {
+        {options.map((n) => {
           const active = selectedList.includes(n);
+          const isNoEvent = n === NO_EVENT_FILTER_LABEL;
           return (
             <button
               key={n}
               onClick={() => toggleEventFilter(selectedList, setSelectedList, n)}
               style={{
                 fontSize: "11px", padding: "3px 8px", borderRadius: "999px", cursor: "pointer",
-                border: active ? "1px solid #7aa2f7" : "1px solid #2a323f",
-                background: active ? "rgba(122,162,247,0.15)" : "transparent",
-                color: active ? "#7aa2f7" : "#8b93a3",
+                border: active ? (isNoEvent ? "1px solid #8b93a3" : "1px solid #7aa2f7") : (isNoEvent ? "1px dashed #3a4353" : "1px solid #2a323f"),
+                background: active ? (isNoEvent ? "rgba(139,147,163,0.15)" : "rgba(122,162,247,0.15)") : "transparent",
+                color: active ? (isNoEvent ? "#c7cbd4" : "#7aa2f7") : "#8b93a3",
               }}
             >
               {n}
