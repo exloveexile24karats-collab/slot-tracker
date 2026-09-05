@@ -377,7 +377,23 @@ const DIGIT7_COLOR = "#f6a04d";
 // 実際には保存せず、未登録日を自動でこの扱いにする（手動タグ付け不要にし
 // たいという要望）。予想エンジン側（⑥イベント名ごと判定材料）は今回は
 // 変更していない（別件として要検討）。
-const APP_VERSION = "6.28";
+// v6.29: 他AIの解析結果（あちらの検証手法：日内ランキングAUC＋前後半分割＋
+// 並べ替え検定＋z値2.6基準）を実データで独立に再検証した結果を反映。
+// ①カバネリ島移動バグ修正：X計算を「台番号セットが大きく変わった日」で
+// 世代分離してから各世代内だけでプール（computeXForPageGenerationAware/
+// splitHistoryIntoGenerations）。実データでカバネリ8/4の351-370・852-860
+// →272-320入れ替えを確認、旧島と新島が混ざって新島が一律D評価になって
+// いた問題を修正。②「台番号固有のYの法則」の重みをページ別に変更
+// （FIXED_NO_X_WEIGHT_BY_PAGE）：喰種・マイジャグは実質ゼロ（AUC≈0.50）
+// なので重み0、カバネリ・A-typeは弱いが方向一貫（AUC≈0.55）なので0.8、
+// モンキーが最も安定（AUC=0.557、z=2.75）なので1.2に。③マイジャグ専用
+// 「直近3日窓のYの法則」を新設（全履歴版は効かないが短期窓だけ効くことを
+// 確認、AUC=0.555、z=2.31）。④A-type専用「機種ローテーション」を新設
+// （機種単位で最後に高Yからの日数、AUC=0.452、z=-2.67、前後半とも同方向）。
+// なお「不発」判定材料は日内AUC方式で再検証した結果ゼロ（全ページAUC≈0.50）
+// と判明したため、候補から正式に除外（もともとコード未実装だったため
+// コード変更は無し）。「周辺台は罠」も再現できず不採用のまま。
+const APP_VERSION = "6.29";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -892,7 +908,7 @@ function computeEvPoints(signalAvg, baselineAvg, typicalMagnitude, sampleSize) {
 const SIGNAL_WEIGHTS = {
   digitDay: 1, // 日付末尾 — 実データ検証で強く確認（=0で-0.150、=2で+0.141）
   plannedEvent: 1.5, // イベント名ごと — 実データ検証で強く確認（爆撮+0.201、百獣撮-0.143等）
-  fixedNoX: 1.5, // 台番号固有のXの法則 — 上位1/3で+0.045、下位1/3で-0.020
+  fixedNoX: 1.5, // 台番号固有のXの法則（既定値、FIXED_NO_X_WEIGHT_BY_PAGEに無いページ用）
   modelWideX: 1.5, // 機種全体のXの法則 — 上位1/3で+0.031、下位1/3で-0.035
   gsuLevel: 1.2, // 前日のG数水準（大量回転/低調） — 大量回転+0.023、低調-0.025
   pageMateGood: 1.3, // 前日、他の台が好調（50%+） — +0.058
@@ -900,6 +916,25 @@ const SIGNAL_WEIGHTS = {
   trailingWindow: 1.0, // 20/30日足トレイリング差枚（逆張り） — n=1428〜2018、+0.026〜+0.032
   semiFollow: 1.0, // 準イベント翌日 — n=722、-0.051（注意信号）
   volumeMismatch: 1.0, // 大量回転・低調（自分比） — n=2160〜2250、+0.035/-0.015
+  // v6.29: 日内ランキングAUC＋前後半分割＋並べ替え検定（z値）で再検証した結果、
+  // 追加・調整した判定材料（詳細はfixedNoX重み表・下記コメント参照）
+  myjagShortTrailing: 1.0, // マイジャグ専用：直近3日窓のYの法則 — AUC0.555、z=2.31（前半2.15/後半0.60）
+  modelRotation: 1.0, // A-type専用：機種ローテーション（機種単位、最後に高Yからの日数） — AUC0.452、z=-2.67（前後半とも同方向）
+};
+
+// v6.29: 「台番号固有のYの法則（own trailing）」の重みをページごとに変更。
+// 日内ランキングAUC＋前後半分割＋並べ替え検定で再検証した結果、全ページ
+// 一律weight=1.5は言い過ぎで、喰種・マイジャグは実質ゼロ（AUC≈0.50、
+// z=-0.18/-0.30）、カバネリ・A-typeは弱いが方向一貫（AUC≈0.55、z=2.45/2.50、
+// ただし前後半個別では有意未満）、モンキーが最も安定（AUC=0.557、z=2.75）
+// という結果だった。マイジャグは全履歴版の代わりに直近3日窓版
+// （myjagShortTrailing）を別途採用。
+const FIXED_NO_X_WEIGHT_BY_PAGE = {
+  "カバネリ": 0.8,
+  "喰種": 0,
+  "モンキー": 1.2,
+  "マイジャグ": 0,
+  "A-type": 0.8,
 };
 
 // consecutive same-sign run lengths, day by day, for a {date,sada} series
@@ -1256,6 +1291,51 @@ function computeXForPage(pageSortedHistory) {
   });
   return xByDate;
 }
+
+// v6.29: 島移動（新台入れ替えで台番号セットが総入れ替わりする等）でX/Yの
+// プールが壊れる問題への対処（実データでカバネリ8/4の351-370・852-860→
+// 272-320入れ替えを確認、旧島Y≥85率19.7% vs 新島1.1%が混ざり、新島の
+// 全台が一律D評価になっていた）。連続する日同士で台番号セットの重なり率が
+// 閾値未満なら「新しい世代」とみなし、世代ごとに別々にプール・z-score化・
+// パーセンタイル化する。1つの世代内では従来通りcomputeXForPageのロジックを
+// そのまま使う。
+const GENERATION_OVERLAP_THRESHOLD = 0.5;
+function splitHistoryIntoGenerations(pageSortedHistory) {
+  if (pageSortedHistory.length === 0) return [];
+  const generations = [];
+  let current = [pageSortedHistory[0]];
+  let prevNos = new Set(pageSortedHistory[0].machines.map((m) => m.no));
+  for (let i = 1; i < pageSortedHistory.length; i++) {
+    const h = pageSortedHistory[i];
+    const nos = new Set(h.machines.map((m) => m.no));
+    let overlap = 1;
+    if (prevNos.size > 0) {
+      let common = 0;
+      prevNos.forEach((no) => { if (nos.has(no)) common += 1; });
+      overlap = common / prevNos.size;
+    }
+    if (overlap < GENERATION_OVERLAP_THRESHOLD) {
+      generations.push(current);
+      current = [h];
+    } else {
+      current.push(h);
+    }
+    prevNos = nos;
+  }
+  generations.push(current);
+  return generations;
+}
+
+function computeXForPageGenerationAware(pageSortedHistory) {
+  const generations = splitHistoryIntoGenerations(pageSortedHistory);
+  const merged = {};
+  generations.forEach((gen) => {
+    const genX = computeXForPage(gen);
+    Object.assign(merged, genX);
+  });
+  return merged;
+}
+
 
 // v6.12: Xの生値（だいたい-2〜+2くらいのz-score合成値）は数値として直感
 // 的でないので、表示用にページ内でのパーセンタイル順位（0〜100）へ変換
@@ -3178,7 +3258,7 @@ export default function SlotDataTracker() {
   // 条件だった時、翌日Y≥85だった割合」を実測し、ページ全体のベース出現率
   // と比べてcomputePoints（勝率型スコアリング）で得点化する。
   const Y_HIT_THRESHOLD = 85;
-  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam, pageYByDateParam) {
+  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam, pageYByDateParam, pageNameParam) {
     const results = [];
     if (!pageXByDateParam || !pageYByDateParam) return results; // X・Yが計算できていなければ何も予想できない
 
@@ -3252,6 +3332,50 @@ export default function SlotDataTracker() {
       return n >= 15 ? { hitRate: hits / n, sampleSize: n } : null;
     })();
 
+    // v6.29: A-type専用「機種ローテーション」の集計。機種名ごとに「最後に
+    // どれかの台がY≥85だった日」のインデックスを日付順に前進させながら
+    // 追跡し、各日について「その時点までの経過日数」バケットで翌日の
+    // Y≥85率を実測する（walk-forward：i日目までの情報だけでi+1日目を見る）。
+    // 最終状態（lastHighDateIndexByModelFinal）は、実際の予想対象日を
+    // 判定する時にも同じ変数をそのまま使う。
+    let modelRotationStatsY = null;
+    let lastHighDateIndexByModelFinal = {};
+    if (pageNameParam === "A-type") {
+      let nearN = 0, nearHits = 0, farN = 0, farHits = 0;
+      const lastHighDateIndexByModel = {};
+      pageSortedHistory.forEach((h, i) => {
+        // 先に当日の結果でlastHighDateIndexByModelを更新（前日までの情報だけ
+        // で翌日を見るため、更新は「今日の判定」より前に行う）
+        h.machines.forEach((m) => {
+          const model = m.modelName;
+          if (!model) return;
+          const y = (pageYByDateParam[h.date] || {})[m.no];
+          if (y !== null && y !== undefined && y >= Y_HIT_THRESHOLD) {
+            lastHighDateIndexByModel[model] = i;
+          }
+        });
+        if (i + 1 >= pageSortedHistory.length) return;
+        const nextDay = pageSortedHistory[i + 1];
+        nextDay.machines.forEach((m) => {
+          const model = m.modelName;
+          if (!model) return;
+          const y = (pageYByDateParam[nextDay.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          const lastIdx = lastHighDateIndexByModel[model];
+          if (lastIdx === undefined) return; // まだ一度も高Yが出ていない機種
+          const daysSince = (i + 1) - lastIdx;
+          const isHit = y >= Y_HIT_THRESHOLD;
+          if (daysSince >= 1 && daysSince <= 5) { nearN += 1; if (isHit) nearHits += 1; }
+          else if (daysSince >= 11) { farN += 1; if (isHit) farHits += 1; }
+        });
+      });
+      lastHighDateIndexByModelFinal = lastHighDateIndexByModel;
+      modelRotationStatsY = {
+        近い: nearN >= 15 ? { hitRate: nearHits / nearN, sampleSize: nearN } : null,
+        遠い: farN >= 15 ? { hitRate: farHits / farN, sampleSize: farN } : null,
+      };
+    }
+
     machineNumbers.forEach((no) => {
       const ySeries = pageSortedHistory
         .map((h) => {
@@ -3273,9 +3397,40 @@ export default function SlotDataTracker() {
       };
 
       // ①台番号固有の法則（トレイリング、この台自身の過去Y≥85率）
-      if (ySeries.length >= 10) {
+      // v6.29: 重みをページ別に変更（FIXED_NO_X_WEIGHT_BY_PAGE参照）。
+      // 重み0のページ（喰種・マイジャグ）ではこの判定材料自体を出さない。
+      const fixedNoXWeight = pageNameParam !== null && pageNameParam !== undefined && FIXED_NO_X_WEIGHT_BY_PAGE.hasOwnProperty(pageNameParam)
+        ? FIXED_NO_X_WEIGHT_BY_PAGE[pageNameParam]
+        : SIGNAL_WEIGHTS.fixedNoX;
+      if (fixedNoXWeight > 0 && ySeries.length >= 10) {
         const hits = ySeries.filter((r) => r.y >= Y_HIT_THRESHOLD).length;
-        pushSignal("台番号固有のYの法則", hits / ySeries.length, ySeries.length, SIGNAL_WEIGHTS.fixedNoX);
+        pushSignal("台番号固有のYの法則", hits / ySeries.length, ySeries.length, fixedNoXWeight);
+      }
+
+      // v6.29: マイジャグ専用「直近3日窓のYの法則」。全履歴版（①）は
+      // マイジャグでは効かない（AUC≈0.49）が、直近3日だけの窓に絞ると
+      // 実データで確認できた（AUC=0.555、z=2.31）短期モメンタム。
+      if (pageNameParam === "マイジャグ" && ySeries.length >= 3) {
+        const windowVals = ySeries.slice(-3);
+        const hits = windowVals.filter((r) => r.y >= Y_HIT_THRESHOLD).length;
+        pushSignal("直近3日のYの法則", hits / windowVals.length, windowVals.length, SIGNAL_WEIGHTS.myjagShortTrailing);
+      }
+
+      // v6.29: A-type専用「機種ローテーション」。機種単位で「最後にどれかの
+      // 台がY≥85だった日」からの経過日数を見て、直近(1〜5日)/長期(11日以上)
+      // の2バケットで過去の翌日Y≥85率を実測（日内AUC=0.452、z=-2.67、
+      // 前後半とも同方向で確認済み）。
+      if (pageNameParam === "A-type" && modelRotationStatsY && thisMachineModelName) {
+        const daysSinceModelHigh = lastHighDateIndexByModelFinal[thisMachineModelName] !== undefined
+          ? pageSortedHistory.length - lastHighDateIndexByModelFinal[thisMachineModelName]
+          : null;
+        if (daysSinceModelHigh !== null) {
+          if (daysSinceModelHigh >= 1 && daysSinceModelHigh <= 5 && modelRotationStatsY.近い) {
+            pushSignal(`機種ローテーション（${thisMachineModelName}、直近5日以内）`, modelRotationStatsY.近い.hitRate, modelRotationStatsY.近い.sampleSize, SIGNAL_WEIGHTS.modelRotation);
+          } else if (daysSinceModelHigh >= 11 && modelRotationStatsY.遠い) {
+            pushSignal(`機種ローテーション（${thisMachineModelName}、11日以上空き）`, modelRotationStatsY.遠い.hitRate, modelRotationStatsY.遠い.sampleSize, SIGNAL_WEIGHTS.modelRotation);
+          }
+        }
       }
 
       // ②機種全体の法則（同じ機種名の他の台のトレイリングY≥85率、この台は除外）
@@ -3431,7 +3586,7 @@ export default function SlotDataTracker() {
   // したため、pickListより先に計算しておく必要がある
   const pageXByDate = useMemo(() => {
     if (sortedHistory.length < 15) return null;
-    return computeXForPage(sortedHistory);
+    return computeXForPageGenerationAware(sortedHistory);
   }, [sortedHistory]);
   // v6.24: 予想の基準をY（0〜100、Xマトリクス表と同じパーセンタイル値）に
   // 統一したため、Yもpicklistより先に計算しておく
@@ -3446,8 +3601,8 @@ export default function SlotDataTracker() {
   // 設定判別カードは、翌日予想として機能しないことが実データ検証で
   // わかったため削除）。
   const pickList = useMemo(() => {
-    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA, pageXByDate, pageYByDate));
-  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA, pageXByDate, pageYByDate]);
+    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA, pageXByDate, pageYByDate, currentPage ? currentPage.name : null));
+  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA, pageXByDate, pageYByDate, currentPage]);
 
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
   // engine (it doesn't care whether "no" is a machine number, a model name,
