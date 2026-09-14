@@ -410,7 +410,23 @@ const DIGIT7_COLOR = "#f6a04d";
 // 両方）。▲〇マトリクス表はもともとYを経由しない別ロジック（生の出率から
 // 直接マーク化）なので、v6.30のX/Y世代分離だけでは効いておらず、今回別途
 // 対応が必要だった。
-const APP_VERSION = "6.31";
+// v6.32: v6.31で見つかった2つの追加バグを修正。①renderXGridで空欄セルが
+// 「0」と表示されていた（`!beforeGenerationStart && valuesMap[...]`が
+// booleanのfalseを返し、null/undefined判定のhasVチェックをすり抜けていた）。
+// v = beforeGenerationStart ? null : ... に修正。②予想エンジン側
+// （computeSignalsForPage）がXマトリクス表と同じ世代分離の恩恵を受けて
+// おらず、「台番号固有のYの法則」等の判定材料が台番号だけで過去データを
+// 引っ張ってきていた（ユーザー指摘：「台番号+台の名前でセットで考える」）。
+// noCurrentGenerationStartDateを予想エンジンにも渡し、ySeriesを「今の機種に
+// 切り替わってから」の日付だけに絞り込むよう修正（①⑤⑦⑨・マイジャグ短期窓
+// など、ySeriesを使う判定材料すべてに波及）。②機種全体のYの法則
+// （modelWideX）はもともとmodelNameで直接グルーピングしているため無関係、
+// 修正不要。また、A-type機種ローテーションのラベルが「（タコスロ、直近5日
+// 以内）」のように機種名を含んでいたが、実際の統計はAタイプ全機種プール
+// （タコスロ単独ではn不足のため意図的にプールしている）なので、n=1565の
+// ような大きい数字が「タコスロだけのデータ」に見えて誤解を招いていた。
+// ラベルを「Aタイプ全機種の統計、○○は直近5日以内」に変更して明確化。
+const APP_VERSION = "6.32";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -3334,7 +3350,7 @@ export default function SlotDataTracker() {
   // 条件だった時、翌日Y≥85だった割合」を実測し、ページ全体のベース出現率
   // と比べてcomputePoints（勝率型スコアリング）で得点化する。
   const Y_HIT_THRESHOLD = 85;
-  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam, pageYByDateParam, pageNameParam) {
+  function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam, pageYByDateParam, pageNameParam, noGenerationStartDateParam) {
     const results = [];
     if (!pageXByDateParam || !pageYByDateParam) return results; // X・Yが計算できていなければ何も予想できない
 
@@ -3453,7 +3469,13 @@ export default function SlotDataTracker() {
     }
 
     machineNumbers.forEach((no) => {
+      // v6.31: 台番号だけでなく「今の機種に切り替わってから」の日付だけを
+      // この台自身の履歴として扱う（台番号＋機種名をセットで考える）。
+      // 機種が変わっていない台番号ではnoGenerationStartDateParam[no]は
+      // 一番古い日付になるので、実質的に絞り込みは発生しない。
+      const genStartDate = noGenerationStartDateParam ? noGenerationStartDateParam[no] : null;
       const ySeries = pageSortedHistory
+        .filter((h) => !genStartDate || h.date >= genStartDate)
         .map((h) => {
           const m = h.machines.find((mm) => mm.no === no);
           if (!m) return null;
@@ -3501,10 +3523,14 @@ export default function SlotDataTracker() {
           ? pageSortedHistory.length - lastHighDateIndexByModelFinal[thisMachineModelName]
           : null;
         if (daysSinceModelHigh !== null) {
+          // v6.31: この統計はタコスロ単独ではなくA-typeページ全機種を
+          // プールした統計（実データ検証でそうしないとサンプルが足りない
+          // ため）。ラベルにその旨を明記し、「n=1565なのにタコスロは3日
+          // しかない」という誤解を防ぐ。
           if (daysSinceModelHigh >= 1 && daysSinceModelHigh <= 5 && modelRotationStatsY.近い) {
-            pushSignal(`機種ローテーション（${thisMachineModelName}、直近5日以内）`, modelRotationStatsY.近い.hitRate, modelRotationStatsY.近い.sampleSize, SIGNAL_WEIGHTS.modelRotation);
+            pushSignal(`機種ローテーション（Aタイプ全機種の統計、${thisMachineModelName}は直近5日以内）`, modelRotationStatsY.近い.hitRate, modelRotationStatsY.近い.sampleSize, SIGNAL_WEIGHTS.modelRotation);
           } else if (daysSinceModelHigh >= 11 && modelRotationStatsY.遠い) {
-            pushSignal(`機種ローテーション（${thisMachineModelName}、11日以上空き）`, modelRotationStatsY.遠い.hitRate, modelRotationStatsY.遠い.sampleSize, SIGNAL_WEIGHTS.modelRotation);
+            pushSignal(`機種ローテーション（Aタイプ全機種の統計、${thisMachineModelName}は11日以上空き）`, modelRotationStatsY.遠い.hitRate, modelRotationStatsY.遠い.sampleSize, SIGNAL_WEIGHTS.modelRotation);
           }
         }
       }
@@ -3677,8 +3703,8 @@ export default function SlotDataTracker() {
   // 設定判別カードは、翌日予想として機能しないことが実データ検証で
   // わかったため削除）。
   const pickList = useMemo(() => {
-    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA, pageXByDate, pageYByDate, currentPage ? currentPage.name : null));
-  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA, pageXByDate, pageYByDate, currentPage]);
+    return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA, pageXByDate, pageYByDate, currentPage ? currentPage.name : null, noCurrentGenerationStartDate));
+  }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA, pageXByDate, pageYByDate, currentPage, noCurrentGenerationStartDate]);
 
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
   // engine (it doesn't care whether "no" is a machine number, a model name,
@@ -4468,7 +4494,7 @@ export default function SlotDataTracker() {
                 </td>
                 {dates.map((d) => {
                   const beforeGenerationStart = rowStartDateMap && rowStartDateMap[row] && d < rowStartDateMap[row];
-                  const v = !beforeGenerationStart && valuesMap[row] && valuesMap[row][d];
+                  const v = beforeGenerationStart ? null : (valuesMap[row] && valuesMap[row][d]);
                   const meta = gsuMetaMap && gsuMetaMap[row] && gsuMetaMap[row][d];
                   const gsu = meta ? meta.gsu : null;
                   const shutsu = meta ? meta.shutsu : null;
