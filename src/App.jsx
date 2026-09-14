@@ -393,7 +393,14 @@ const DIGIT7_COLOR = "#f6a04d";
 // なお「不発」判定材料は日内AUC方式で再検証した結果ゼロ（全ページAUC≈0.50）
 // と判明したため、候補から正式に除外（もともとコード未実装だったため
 // コード変更は無し）。「周辺台は罠」も再現できず不採用のまま。
-const APP_VERSION = "6.29";
+// v6.30: splitHistoryIntoGenerationsを拡張。台番号セット自体は変わらない
+// まま中身の機種だけ入れ替わるケース（実データでA-typeの157・158・160番が
+// 9/9「不二子BT・SHAKE BONUS TRIGGER」→9/11「タコスロ」に切り替わっている
+// のを発見、v6.29の台番号セット重なり率チェックだけでは検知できなかった）
+// にも対応。共通する台番号のうち機種名が実際に変わった割合が15%を超えたら
+// 新しい世代とみなす（片方がmodelName不明の場合は不一致扱いしない、誤検知
+// 防止）。
+const APP_VERSION = "6.30";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1299,27 +1306,52 @@ function computeXForPage(pageSortedHistory) {
 // 閾値未満なら「新しい世代」とみなし、世代ごとに別々にプール・z-score化・
 // パーセンタイル化する。1つの世代内では従来通りcomputeXForPageのロジックを
 // そのまま使う。
+// v6.30: 台番号セット自体は変わらないが、同じ台番号の中身（機種）だけが
+// 入れ替わるケース（実データでA-typeの157・158・160番が9/9「不二子BT・
+// SHAKE BONUS TRIGGER」→9/11「タコスロ」に切り替わっているのを発見）は、
+// 台番号の重なり率だけでは検知できなかった。共通する台番号のうち、機種名が
+// （両日とも判明していて）実際に変わっている割合を見て、これも世代の区切り
+// とみなすようにした。片方がmodelName不明（民レポ由来などでnull）の場合は
+// 不一致とみなさない（誤検知防止）。
+const MODEL_CHANGE_FRACTION_THRESHOLD = 0.15;
 const GENERATION_OVERLAP_THRESHOLD = 0.5;
 function splitHistoryIntoGenerations(pageSortedHistory) {
   if (pageSortedHistory.length === 0) return [];
   const generations = [];
   let current = [pageSortedHistory[0]];
-  let prevNos = new Set(pageSortedHistory[0].machines.map((m) => m.no));
+  let prevModelByNo = {};
+  pageSortedHistory[0].machines.forEach((m) => { prevModelByNo[m.no] = m.modelName; });
+  let prevNos = new Set(Object.keys(prevModelByNo).map(Number));
   for (let i = 1; i < pageSortedHistory.length; i++) {
     const h = pageSortedHistory[i];
-    const nos = new Set(h.machines.map((m) => m.no));
+    const modelByNo = {};
+    h.machines.forEach((m) => { modelByNo[m.no] = m.modelName; });
+    const nos = new Set(Object.keys(modelByNo).map(Number));
     let overlap = 1;
     if (prevNos.size > 0) {
       let common = 0;
       prevNos.forEach((no) => { if (nos.has(no)) common += 1; });
       overlap = common / prevNos.size;
     }
-    if (overlap < GENERATION_OVERLAP_THRESHOLD) {
+    let checked = 0;
+    let mismatches = 0;
+    nos.forEach((no) => {
+      if (!prevNos.has(no)) return;
+      const oldModel = prevModelByNo[no];
+      const newModel = modelByNo[no];
+      if (oldModel && newModel) {
+        checked += 1;
+        if (oldModel !== newModel) mismatches += 1;
+      }
+    });
+    const modelChangeFraction = checked > 0 ? mismatches / checked : 0;
+    if (overlap < GENERATION_OVERLAP_THRESHOLD || modelChangeFraction > MODEL_CHANGE_FRACTION_THRESHOLD) {
       generations.push(current);
       current = [h];
     } else {
       current.push(h);
     }
+    prevModelByNo = modelByNo;
     prevNos = nos;
   }
   generations.push(current);
