@@ -400,7 +400,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // にも対応。共通する台番号のうち機種名が実際に変わった割合が15%を超えたら
 // 新しい世代とみなす（片方がmodelName不明の場合は不一致扱いしない、誤検知
 // 防止）。
-const APP_VERSION = "6.30";
+// v6.31: v6.30はX/Yの計算自体は正しく世代分離していたが、表示側（Xマトリ
+// クス表・▲〇マトリクス表）は台番号だけで行を作っていて、行見出しは
+// machineLabelが常に「その台番号の最新の機種名」を表示するため、9/9以前
+// （不二子BT時代）のマーク・数値が「タコスロ157番」という行の中に混在して
+// 見えてしまっていた（ユーザー報告で発覚）。noCurrentGenerationStartDateを
+// 追加し、台番号ごとに「現在の機種名に切り替わった日」を求めて、それより
+// 前の日付は該当行では空欄表示にするよう修正（renderMarkGrid・renderXGrid
+// 両方）。▲〇マトリクス表はもともとYを経由しない別ロジック（生の出率から
+// 直接マーク化）なので、v6.30のX/Y世代分離だけでは効いておらず、今回別途
+// 対応が必要だった。
+const APP_VERSION = "6.31";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2879,6 +2889,40 @@ export default function SlotDataTracker() {
     return isMultiModelPage && noToModelName[no] ? `${noToModelName[no]} ${no}番` : `${no}番`;
   }
 
+  // v6.31: 台番号は同じまま中身の機種だけ入れ替わった場合（実データで
+  // A-typeの157・158・160番が9/9「不二子BT・SHAKE BONUS TRIGGER」→9/11
+  // 「タコスロ」に切り替わっているのを確認）、machineLabelは常に最新の
+  // 機種名を表示するため、Xマトリクス表・▲〇マトリクス表でその台番号の
+  // 行を見ると「タコスロ157番」という見出しの下に、実際には別機種だった
+  // 頃（不二子BT時代）の数値・マークまで並んで見えてしまう。計算自体は
+  // splitHistoryIntoGenerationsで世代分離されて正しいが、表示上は同じ行に
+  // 混在して見えるため紛らわしい、という指摘を受けての対応。
+  // 台番号ごとに「現在の機種名に切り替わった日」を求め、それより前の日付は
+  // 該当の行では空欄表示にする（modelName不明の日は世代の境目として扱う、
+  // splitHistoryIntoGenerationsの考え方と統一）。
+  const noCurrentGenerationStartDate = useMemo(() => {
+    const modelHistoryByNo = {};
+    sortedHistory.forEach((h) => {
+      h.machines.forEach((m) => {
+        if (!modelHistoryByNo[m.no]) modelHistoryByNo[m.no] = [];
+        modelHistoryByNo[m.no].push({ date: h.date, modelName: m.modelName });
+      });
+    });
+    const map = {};
+    Object.entries(modelHistoryByNo).forEach(([no, entries]) => {
+      if (entries.length === 0) return;
+      const latestModel = entries[entries.length - 1].modelName;
+      let startDate = entries[entries.length - 1].date;
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const e = entries[i];
+        if (!e.modelName || !latestModel || e.modelName !== latestModel) break;
+        startDate = e.date;
+      }
+      map[no] = startDate;
+    });
+    return map;
+  }, [sortedHistory]);
+
   const historyByDate = useMemo(() => {
     const map = {};
     currentHistory.forEach((h) => {
@@ -4324,7 +4368,7 @@ export default function SlotDataTracker() {
     );
   }
 
-  function renderMarkGrid(dates, rows, marksMap, rowLabelFn, varietyCells) {
+  function renderMarkGrid(dates, rows, marksMap, rowLabelFn, varietyCells, rowStartDateMap) {
     if (rows.length === 0 || dates.length === 0) {
       return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
     }
@@ -4358,13 +4402,14 @@ export default function SlotDataTracker() {
                   {rowLabelFn(row)}
                 </td>
                 {dates.map((d) => {
-                  const mark = marksMap[row] && marksMap[row][d];
+                  const beforeGenerationStart = rowStartDateMap && rowStartDateMap[row] && d < rowStartDateMap[row];
+                  const mark = !beforeGenerationStart && marksMap[row] && marksMap[row][d];
                   const isVarietyCell = varietyCells && varietyCells.has(`${d}|${row}`);
                   return (
                     <td
                       key={d}
                       className="mono"
-                      title={isVarietyCell ? "バラエティコーナー（1台設置）" : undefined}
+                      title={beforeGenerationStart ? "この台番号は別の機種でした" : (isVarietyCell ? "バラエティコーナー（1台設置）" : undefined)}
                       style={{
                         padding: "4px 3px", textAlign: "center", color: mark ? markColor(mark) : "#2a323f", borderBottom: "1px solid #1c2129",
                         background: isVarietyCell ? "rgba(122,162,247,0.18)" : undefined,
@@ -4389,7 +4434,7 @@ export default function SlotDataTracker() {
   // パーセンタイル}}。
   // v6.28: gsuMetaMap（{row: {date: {gsu, shutsu}}}）を追加。省略時は従来
   // 通り重み無し表示（呼び出し元を全部揃えたので実運用では常に渡される）。
-  function renderXGrid(dates, rows, valuesMap, rowLabelFn, gsuMetaMap) {
+  function renderXGrid(dates, rows, valuesMap, rowLabelFn, gsuMetaMap, rowStartDateMap) {
     if (rows.length === 0 || dates.length === 0) {
       return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
     }
@@ -4422,7 +4467,8 @@ export default function SlotDataTracker() {
                   {rowLabelFn(row)}
                 </td>
                 {dates.map((d) => {
-                  const v = valuesMap[row] && valuesMap[row][d];
+                  const beforeGenerationStart = rowStartDateMap && rowStartDateMap[row] && d < rowStartDateMap[row];
+                  const v = !beforeGenerationStart && valuesMap[row] && valuesMap[row][d];
                   const meta = gsuMetaMap && gsuMetaMap[row] && gsuMetaMap[row][d];
                   const gsu = meta ? meta.gsu : null;
                   const shutsu = meta ? meta.shutsu : null;
@@ -4431,9 +4477,9 @@ export default function SlotDataTracker() {
                   const weightedV = hasV ? Math.round(v * weight) : null;
                   const isLowGsuGood = hasV && gsu !== null && gsu !== undefined && gsu < LOW_GSU_THRESHOLD
                     && shutsu !== null && shutsu !== undefined && shutsu >= LOW_GSU_GOOD_SHUTSU;
-                  const titleText = hasV
-                    ? `元のY=${v}　G数=${gsu !== null && gsu !== undefined ? gsu : "不明"}　信頼度重み=${weight.toFixed(2)}　表示値=${weightedV}`
-                    : undefined;
+                  const titleText = beforeGenerationStart
+                    ? "この台番号は別の機種でした"
+                    : (hasV ? `元のY=${v}　G数=${gsu !== null && gsu !== undefined ? gsu : "不明"}　信頼度重み=${weight.toFixed(2)}　表示値=${weightedV}` : undefined);
                   return (
                     <td
                       key={d}
@@ -6087,7 +6133,7 @@ export default function SlotDataTracker() {
               このページの台番号ごとに、日付ごとの出率ベースの簡易マーク（▲＝出率110%以上・◯＝出率105%以上）を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
             </div>
             {renderEventMultiSelect(pageGridEventFilter, setPageGridEventFilter)}
-            {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => machineLabel(no))}
+            {renderMarkGrid(pageGridDates, pageGridRows, pageGridMarks, (no) => machineLabel(no), undefined, noCurrentGenerationStartDate)}
           </div>
 
           {/* v6.12: 台番号×日付のXマトリクス表（設定期待度・雑餉隈の「数値」
@@ -6107,7 +6153,7 @@ export default function SlotDataTracker() {
             ) : sortedHistory.length < 15 ? (
               <div style={{ fontSize: "12px", color: "#5a6272" }}>データが15日分たまると表示されます。</div>
             ) : (
-              renderXGrid(pageGridDates, pageGridRows, pageGridXPercentiles, (no) => machineLabel(no), pageGridGsuMeta)
+              renderXGrid(pageGridDates, pageGridRows, pageGridXPercentiles, (no) => machineLabel(no), pageGridGsuMeta, noCurrentGenerationStartDate)
             )}
           </div>
         </div>
@@ -6350,7 +6396,7 @@ export default function SlotDataTracker() {
                     <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "10px" }}>
                       この日までの設定期待度（X）マトリクス表
                     </div>
-                    {renderXGrid(viewWindowDates, viewDateMachines.map((m) => m.no), pageGridXPercentiles, (no) => machineLabel(no), pageGridGsuMeta)}
+                    {renderXGrid(viewWindowDates, viewDateMachines.map((m) => m.no), pageGridXPercentiles, (no) => machineLabel(no), pageGridGsuMeta, noCurrentGenerationStartDate)}
                   </div>
                 )}
               </>
