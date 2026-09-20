@@ -426,7 +426,17 @@ const DIGIT7_COLOR = "#f6a04d";
 // （タコスロ単独ではn不足のため意図的にプールしている）なので、n=1565の
 // ような大きい数字が「タコスロだけのデータ」に見えて誤解を招いていた。
 // ラベルを「Aタイプ全機種の統計、○○は直近5日以内」に変更して明確化。
-const APP_VERSION = "6.32";
+// v6.33: 「アナスロの更新が朝10時頃と遅く、入場に間に合わない」という相談
+// を受け、民レポ個別台データ入力を新設（v6.7で一度廃止した「台データ入力
+// （表貼り付け形式）」の代替復活＋自動上書き機構つき）。ページ→（複数機種
+// ページなら）機種→日付を選んで、台番号ごとの表（台番／差枚／G数／出率／
+// BB／RB／合成／BB率／RB率、民レポの列順はアナスロと違い差枚がG数より先で
+// 出率が直接入っている）を貼るとpageHistoriesに直接保存される
+// （parseMinRepoIndividualTable/saveMinRepoIndividualEntry）。保存した台には
+// source:"minrepo"を付け、backfillPageFromRawTableを変更してこのタグが
+// 付いている台番号だけを後からのアナスロ取り込みで自動上書きするように
+// した（すでにアナスロ由来のデータがある台番号は従来通り触らない）。
+const APP_VERSION = "6.33";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -656,6 +666,49 @@ function serializeFullStoreRows(rows) {
       ].join("\t");
     })
     .join("\n");
+}
+
+// v6.32: 民レポ個別台データ（ページ／機種を選んでから貼る、アナスロが遅い
+// 日の代用データ）の貼り付け解析。列：台番／差枚／G数／出率／BB／RB／
+// 合成／BB率／RB率（アナスロの列順「機種名→台番号→G数→差枚」とは違い、
+// 差枚がG数より先、出率が直接入っている点に注意）。ヘッダー行（先頭に
+// 「台番」を含む行、表の途中で繰り返される）と「平均」行はスキップする。
+function parseMinRepoIndividualTable(text, modelName) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const rows = [];
+  for (const line of lines) {
+    if (line.startsWith("台番")) continue; // header row（表の途中で繰り返される）
+    const cols = line.split("\t").map((c) => c.trim());
+    if (cols.length < 6) continue;
+    const [noStr, sadaStr, gsuStr, shutsuStr, bbStr, rbStr, gouseiStr, bbRateStr, rbRateStr] = cols;
+    if (noStr === "平均") continue;
+    const no = parseInt(String(noStr).replace(/,/g, ""), 10);
+    if (Number.isNaN(no)) continue;
+    const sada = parseInt(toAsciiMinus(sadaStr).replace(/,/g, ""), 10);
+    const gsu = parseInt(toAsciiMinus(gsuStr).replace(/,/g, ""), 10);
+    const shutsuNum = shutsuStr ? parseFloat(toAsciiMinus(shutsuStr).replace("%", "").trim()) : NaN;
+    const bb = bbStr === "-" || bbStr === undefined || bbStr === "" ? null : parseInt(toAsciiMinus(bbStr), 10);
+    const rb = rbStr === "-" || rbStr === undefined || rbStr === "" ? null : parseInt(toAsciiMinus(rbStr), 10);
+    const gouseiMatch = gouseiStr ? gouseiStr.match(/1\s*\/\s*([\d.]+)/) : null;
+    const gousei = gouseiMatch ? parseFloat(gouseiMatch[1]) : null;
+    rows.push({
+      no,
+      modelName,
+      sada: Number.isNaN(sada) ? null : sada,
+      gsu: Number.isNaN(gsu) ? null : gsu,
+      shutsu: Number.isNaN(shutsuNum) ? null : shutsuNum, // 民レポは出率が直接入っているので逆算しない
+      bb: bb !== null && Number.isNaN(bb) ? null : bb,
+      rb: rb !== null && Number.isNaN(rb) ? null : rb,
+      gousei,
+      bbRateStr: bbRateStr ?? "-",
+      rbRateStr: rbRateStr ?? "-",
+    });
+  }
+  return rows;
 }
 
 // v6.7: a stable fingerprint of a day's worth of アナスロ rows, used to
@@ -2002,6 +2055,13 @@ export default function SlotDataTracker() {
   const [fullTableStatus, setFullTableStatus] = useState(null);
   const [fullTableDuplicateWarning, setFullTableDuplicateWarning] = useState(null); // { conflictingDate } | null
   const [fullTableDuplicateCheckResults, setFullTableDuplicateCheckResults] = useState(null);
+  // v6.32: 民レポ個別台データ（アナスロが遅い日の代用、ページ／機種を
+  // 選んでから台番号ごとの表を貼る）
+  const [minRepoIndividualPageId, setMinRepoIndividualPageId] = useState("");
+  const [minRepoIndividualModelName, setMinRepoIndividualModelName] = useState("");
+  const [minRepoIndividualDate, setMinRepoIndividualDate] = useState(todayStr());
+  const [minRepoIndividualPasteText, setMinRepoIndividualPasteText] = useState("");
+  const [minRepoIndividualStatus, setMinRepoIndividualStatus] = useState(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteDate, setConfirmDeleteDate] = useState(null);
   const [dateListOpen, setDateListOpen] = useState(true);
@@ -2268,6 +2328,11 @@ export default function SlotDataTracker() {
   // （byDate.has(date)で即returnしていたため）。
   // これで台データ入力を廃止しても、各ページのグラフ・ピックアップ・
   // マトリクス表は今まで通り pageHistories を見るだけで動く。
+  // v6.32: 民レポ個別台データ入力（アナスロの更新が朝遅い日の代用）を追加
+  // したのに伴い、上書きルールを変更。既存の台番号が「民レポの手入力由来
+  // （m.source === "minrepo"）」の場合だけ、アナスロのデータで置き換える。
+  // すでにアナスロ由来のデータが入っている台番号は、従来通り触らない
+  // （再取込みのたびに上書きし直すと無駄な書き込みが増えるため）。
   const backfillPageFromRawTable = useCallback(
     async (pageId, officialName) => {
       if (!officialName) return;
@@ -2283,24 +2348,36 @@ export default function SlotDataTracker() {
         const matched = rows.filter((r) => nameList.some((n) => modelNamesMatch(r.modelName, n)));
         if (matched.length === 0) return;
         const existingEntry = byDate.get(date);
-        const existingNos = existingEntry ? new Set(existingEntry.machines.map((m) => m.no)) : new Set();
-        const newMachines = matched
-          .filter((r) => !existingNos.has(r.no)) // don't touch machines already present for this date
-          .map((r) => ({
-            no: r.no,
-            modelName: r.modelName, // v6.8: kept so multi-機種ページ can show which model each 台番号 belongs to
-            sada: r.sada,
-            gsu: r.gsu,
-            shutsu: r.shutsu,
-            bb: r.bb,
-            rb: r.rb,
-            gousei: r.gousei,
-            bbRateStr: r.bbRateStr,
-            rbRateStr: r.rbRateStr,
-          }));
-        if (newMachines.length === 0) return; // this date already has everything that matches
+        const existingByNo = existingEntry ? new Map(existingEntry.machines.map((m) => [m.no, m])) : new Map();
+        const toAdd = []; // 台番号が既存に無い＝新規追加
+        const toReplace = []; // 既存が民レポ手入力由来＝アナスロで置き換え
+        matched.forEach((r) => {
+          const existing = existingByNo.get(r.no);
+          if (!existing) {
+            toAdd.push(r);
+          } else if (existing.source === "minrepo") {
+            toReplace.push(r);
+          }
+          // それ以外（既にアナスロ由来のデータがある）は触らない
+        });
+        if (toAdd.length === 0 && toReplace.length === 0) return; // 反映すべき変更なし
+        const replaceNos = new Set(toReplace.map((r) => r.no));
+        const keptMachines = existingEntry ? existingEntry.machines.filter((m) => !replaceNos.has(m.no)) : [];
+        const newMachines = [...toAdd, ...toReplace].map((r) => ({
+          no: r.no,
+          modelName: r.modelName, // v6.8: kept so multi-機種ページ can show which model each 台番号 belongs to
+          sada: r.sada,
+          gsu: r.gsu,
+          shutsu: r.shutsu,
+          bb: r.bb,
+          rb: r.rb,
+          gousei: r.gousei,
+          bbRateStr: r.bbRateStr,
+          rbRateStr: r.rbRateStr,
+          // sourceフィールドを付けない＝アナスロ由来（民レポ手入力ではない）
+        }));
         if (existingEntry) {
-          byDate.set(date, { ...existingEntry, machines: [...existingEntry.machines, ...newMachines] });
+          byDate.set(date, { ...existingEntry, machines: [...keptMachines, ...newMachines] });
         } else {
           const autoEvent = (dateEventMap[date] || "").trim();
           byDate.set(date, { date, event: autoEvent, machines: newMachines });
@@ -2313,6 +2390,77 @@ export default function SlotDataTracker() {
     },
     [pageHistories, dateEventMap, persistPageHistory]
   );
+
+  // v6.32: 民レポ個別台データ（アナスロが遅い日の代用）を、選んだ
+  // ページ・機種・日付でpageHistoriesに直接保存する。同じ日・同じ機種名の
+  // 既存台番号は（民レポ由来かアナスロ由来かに関わらず）今回の貼り付けで
+  // 置き換える＝再貼り付けでの訂正・上書きができる。他の機種（A-typeで
+  // 別モデルの台）や他の日付のデータには触れない。保存した台には
+  // source:"minrepo" を付け、後でアナスロが同じ日・同じ台番号のデータを
+  // 持ってきた時に自動で置き換えられるようにする（backfillPageFromRawTable
+  // 参照）。
+  const saveMinRepoIndividualEntry = useCallback(
+    async (pageId, date, modelName, parsedRows) => {
+      const existingHistory = pageHistories[pageId] || [];
+      const existingEntry = existingHistory.find((h) => h.date === date);
+      const existingMachines = existingEntry ? existingEntry.machines : [];
+      const keptMachines = existingMachines.filter((m) => m.modelName !== modelName);
+      const newMachines = parsedRows.map((r) => ({
+        no: r.no,
+        modelName: r.modelName,
+        sada: r.sada,
+        gsu: r.gsu,
+        shutsu: r.shutsu,
+        bb: r.bb,
+        rb: r.rb,
+        gousei: r.gousei,
+        bbRateStr: r.bbRateStr,
+        rbRateStr: r.rbRateStr,
+        source: "minrepo",
+      }));
+      const finalMachines = [...keptMachines, ...newMachines];
+      const autoEvent = existingEntry ? existingEntry.event : (dateEventMap[date] || "").trim();
+      const nextEntry = { date, event: autoEvent, machines: finalMachines };
+      const nextHistory = existingHistory.filter((h) => h.date !== date).concat([nextEntry]).sort((a, b) => (a.date < b.date ? -1 : 1));
+      await persistPageHistory(pageId, nextHistory);
+    },
+    [pageHistories, dateEventMap, persistPageHistory]
+  );
+
+  // v6.32: 民レポ個別台データ入力フォームの保存ハンドラ。ページ選択→
+  // （複数機種ページなら）機種選択→日付→貼り付け、の入力内容を検証して
+  // 保存する。
+  async function handleSaveMinRepoIndividual() {
+    if (!minRepoIndividualPageId) {
+      setMinRepoIndividualStatus({ type: "error", msg: "ページを選んでください。" });
+      return;
+    }
+    const page = pages.find((p) => p.id === minRepoIndividualPageId);
+    if (!page) {
+      setMinRepoIndividualStatus({ type: "error", msg: "ページが見つかりませんでした。" });
+      return;
+    }
+    const modelOptions = splitModelNameList(page.officialName || "");
+    const isMulti = modelOptions.length > 1;
+    const modelName = isMulti ? minRepoIndividualModelName : (modelOptions[0] || page.name);
+    if (isMulti && !modelName) {
+      setMinRepoIndividualStatus({ type: "error", msg: "機種を選んでください。" });
+      return;
+    }
+    if (!minRepoIndividualPasteText.trim()) {
+      setMinRepoIndividualStatus({ type: "error", msg: "データを貼り付けてください。" });
+      return;
+    }
+    const rows = parseMinRepoIndividualTable(minRepoIndividualPasteText, modelName);
+    if (rows.length === 0) {
+      setMinRepoIndividualStatus({ type: "error", msg: "有効な行が見つかりませんでした。貼り付け形式を確認してください。" });
+      return;
+    }
+    await saveMinRepoIndividualEntry(minRepoIndividualPageId, minRepoIndividualDate, modelName, rows);
+    setMinRepoIndividualStatus({ type: "ok", msg: `${minRepoIndividualDate}（${modelName}）を${rows.length}台分保存しました。あとでアナスロにこの日のデータが来ると自動的に上書きされます。` });
+  }
+
+
 
   async function handleDeleteFullTableDate(date) {
     const nextRaw = { ...rawFullTableRef.current };
@@ -5002,6 +5150,103 @@ export default function SlotDataTracker() {
                 })()}
               </div>
             </div>
+          </div>
+
+          {/* v6.32: 民レポ個別台データ入力（アナスロの更新が朝遅い日の代用）。
+              ページ→（複数機種ページなら）機種→日付を選んでから、台番号
+              ごとの表（台番／差枚／G数／出率／BB／RB／合成／BB率／RB率）を
+              貼る。あとでアナスロにその日のデータが来ると、この手入力分は
+              自動的に上書きされる（backfillPageFromRawTable参照）。 */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📝 民レポ 個別台データ入力（アナスロが遅い日の代用）
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
+              アナスロの更新が翌朝遅くなる日、民レポの個別機種ページ（台番号ごとの表）から代わりに入力できます。あとでアナスロにこの日のデータが取り込まれると、この手入力分は自動的に上書きされます。
+            </div>
+            <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", marginBottom: "10px" }}>
+              <div>
+                <label style={{ fontSize: "11px", color: "#8b93a3" }}>ページ</label>
+                <select
+                  value={minRepoIndividualPageId}
+                  onChange={(e) => {
+                    setMinRepoIndividualPageId(e.target.value);
+                    setMinRepoIndividualModelName("");
+                    setMinRepoIndividualStatus(null);
+                  }}
+                  style={{
+                    display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", minWidth: "160px",
+                  }}
+                >
+                  <option value="">選択してください</option>
+                  {pages.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </div>
+              {(() => {
+                const page = pages.find((p) => p.id === minRepoIndividualPageId);
+                const modelOptions = page ? splitModelNameList(page.officialName || "") : [];
+                if (modelOptions.length <= 1) return null;
+                return (
+                  <div>
+                    <label style={{ fontSize: "11px", color: "#8b93a3" }}>機種</label>
+                    <select
+                      value={minRepoIndividualModelName}
+                      onChange={(e) => { setMinRepoIndividualModelName(e.target.value); setMinRepoIndividualStatus(null); }}
+                      style={{
+                        display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                        borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px", minWidth: "160px",
+                      }}
+                    >
+                      <option value="">選択してください</option>
+                      {modelOptions.map((n) => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                  </div>
+                );
+              })()}
+              <div>
+                <label style={{ fontSize: "11px", color: "#8b93a3" }}>日付</label>
+                <input
+                  type="date"
+                  value={minRepoIndividualDate}
+                  onChange={(e) => { setMinRepoIndividualDate(e.target.value); setMinRepoIndividualStatus(null); }}
+                  style={{
+                    display: "block", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f",
+                    borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "13px",
+                  }}
+                />
+              </div>
+            </div>
+            <textarea
+              className="mono scrollbar"
+              value={minRepoIndividualPasteText}
+              onChange={(e) => setMinRepoIndividualPasteText(e.target.value)}
+              placeholder={"台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n110\t-3,303\t5,856\t81.2%\t0\t13\t1/450\t-\t1/450\n..."}
+              rows={10}
+              style={{
+                width: "100%", background: "#0e1218", border: "1px solid #2a323f", borderRadius: "6px",
+                padding: "8px", color: "#d7dae0", fontSize: "11.5px", lineHeight: 1.5, resize: "vertical",
+                boxSizing: "border-box", marginBottom: "10px",
+              }}
+            />
+            <button
+              onClick={handleSaveMinRepoIndividual}
+              style={{
+                width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
+                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+              }}
+            >
+              この日・この機種のデータを保存
+            </button>
+            {minRepoIndividualStatus && (
+              <div style={{ marginTop: "8px", fontSize: "11px", color: minRepoIndividualStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>
+                {minRepoIndividualStatus.msg}
+              </div>
+            )}
           </div>
 
           {/* export everything for offline analysis / backtesting */}
