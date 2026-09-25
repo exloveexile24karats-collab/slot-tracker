@@ -507,7 +507,19 @@ const DIGIT7_COLOR = "#f6a04d";
 // 方式（hitsSoFarを1個ずつ加算）に書き換えてO(日数)に軽量化。他の新規
 // 判定材料（カバネリ・マイジャグ・喰種）や機種別サマリー側
 // （computeOverallSummarySignals）には同様の重い書き方は無いことを確認済み。
-const APP_VERSION = "6.40";
+// v6.41: v6.40の軽量化だけでは再現しなかった（Safariでも同じ症状）ため、
+// jsdom＋react-dom/clientで実際のブラウザマウント〜useEffectのデータ読込
+// までを再現するテスト環境を新たに用意し、実データ（本番相当のFirestore
+// キー構成をモックしたstorage.js）を流し込んで再現に成功。原因は
+// カバネリ専用「翌日が日曜かつイベント無し」判定材料（v6.39）内の
+// ReferenceError（存在しない変数`dateEventMapForKabaneri`を参照していた、
+// 実装時の書き損じ）。翌日のデータがまだ存在しない（＝pageHistoryByDate
+// にエントリが無い、本番では常にこの状態）場合に必ずこの行を通ってしまい、
+// カバネリのピックアップ計算全体が例外を起こしてアプリがクラッシュして
+// いた。正しくはコンポーネント全体で使っているdateEventMap（state）を
+// 参照するのが意図だったので、`dateEventMap[tomorrowDate]`に修正。修正後、
+// 同じ統合テストでエラーなく最後まで描画できることを確認。
+const APP_VERSION = "6.41";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4216,7 +4228,7 @@ export default function SlotDataTracker() {
         const tomorrowDate = addDays(lastDate, 1);
         const tomorrowIsSunday = new Date(tomorrowDate + "T00:00:00Z").getUTCDay() === 0;
         const tomorrowEntry = pageHistoryByDate[tomorrowDate];
-        const tomorrowHasEvent = tomorrowEntry ? !!tomorrowEntry.event : !!dateEventMapForKabaneri;
+        const tomorrowHasEvent = tomorrowEntry ? !!tomorrowEntry.event : !!dateEventMap[tomorrowDate];
         if (tomorrowIsSunday && !tomorrowHasEvent) {
           pushSignal75("翌日が日曜かつイベント無し", kabaneriSundayNoEventStats.hitRate, kabaneriSundayNoEventStats.sampleSize, SIGNAL_WEIGHTS.kabaneriSundayNoEvent);
         }
