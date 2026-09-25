@@ -452,7 +452,16 @@ const DIGIT7_COLOR = "#f6a04d";
 // も永遠にマークが付かない仕様の穴だった。isVariety行だけ、個別台マーク用
 // のclassifyMachineMarkと同じ「出率だけで判定（▲110%以上、◯105%以上）」
 // に分岐させて修正。
-const APP_VERSION = "6.35";
+// v6.36: v6.34で「表示する台番」（差枚推移グラフの選択欄）だけ現行の台番号
+// に絞るトグルを作ったが、Xマトリクス表・▲〇マトリクス表（pageGridRows）・
+// 台同士の相関（machineCorrelations）・システム全体の的中率
+// （overallBacktestStats）は別々に「全期間の台番号」（allMachineNumbers）を
+// 参照していて連動していなかった（ユーザー指摘：「すべて連動させて」）。
+// 全部machineSelectorOptions（トグルで切り替わる方）を参照するように統一。
+// pageGridRowsは独自のuseMemoをやめてmachineSelectorOptionsをそのまま使う
+// ようにした。viewDateMachines（日別データを見る）は特定の1日の実データ
+// そのものなので対象外（その日に実在した台をそのまま見せるのが正しい）。
+const APP_VERSION = "6.36";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4089,11 +4098,11 @@ export default function SlotDataTracker() {
     return [...dates].sort((a, b) => b.localeCompare(a)); // newest first (left side)
   }, [sortedHistory, pageGridEventFilter]);
 
-  const pageGridRows = useMemo(() => {
-    const nos = new Set();
-    sortedHistory.forEach((h) => h.machines.forEach((m) => nos.add(m.no)));
-    return Array.from(nos).sort((a, b) => a - b);
-  }, [sortedHistory]);
+  // v6.36: 「過去の台番も表示」トグルに、Xマトリクス表・▲〇マトリクス表
+  // （pageGridRows）も連動させる。以前はここだけ常に全期間の台番号を
+  // 対象にしていて、差枚推移グラフの選択欄（machineSelectorOptions）とは
+  // 別々にトグルが効かなかった。
+  const pageGridRows = machineSelectorOptions;
 
   const pageGridMarks = useMemo(() => {
     const map = {};
@@ -4186,7 +4195,7 @@ export default function SlotDataTracker() {
   const overallBacktestStats = useMemo(() => {
     let totalWins = 0;
     let totalSamples = 0;
-    allMachineNumbers.forEach((no) => {
+    machineSelectorOptions.forEach((no) => {
       const series = sortedHistory
         .map((h) => {
           const m = h.machines.find((mm) => mm.no === no);
@@ -4208,13 +4217,13 @@ export default function SlotDataTracker() {
       });
     });
     return totalSamples > 0 ? { winRate: totalWins / totalSamples, totalSamples } : null;
-  }, [allMachineNumbers, sortedHistory]);
+  }, [machineSelectorOptions, sortedHistory]);
 
   // machine-to-machine correlation: does machine A's daily 差枚 tend to move
   // with machine B's, on days both have data? (Pearson correlation)
   const machineCorrelations = useMemo(() => {
     const seriesByMachine = {};
-    allMachineNumbers.forEach((no) => {
+    machineSelectorOptions.forEach((no) => {
       const map = {};
       sortedHistory.forEach((h) => {
         const m = h.machines.find((mm) => mm.no === no);
@@ -4224,10 +4233,10 @@ export default function SlotDataTracker() {
     });
 
     const results = [];
-    for (let i = 0; i < allMachineNumbers.length; i++) {
-      for (let j = i + 1; j < allMachineNumbers.length; j++) {
-        const noA = allMachineNumbers[i];
-        const noB = allMachineNumbers[j];
+    for (let i = 0; i < machineSelectorOptions.length; i++) {
+      for (let j = i + 1; j < machineSelectorOptions.length; j++) {
+        const noA = machineSelectorOptions[i];
+        const noB = machineSelectorOptions[j];
         const mapA = seriesByMachine[noA];
         const mapB = seriesByMachine[noB];
         const commonDates = Object.keys(mapA).filter((d) => d in mapB);
@@ -4243,7 +4252,7 @@ export default function SlotDataTracker() {
     }
     results.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
     return results.slice(0, 20);
-  }, [allMachineNumbers, sortedHistory]);
+  }, [machineSelectorOptions, sortedHistory]);
 
   function handleDeleteDate(date) {
     persistPageHistory(activePageId, currentHistory.filter((h) => h.date !== date));
