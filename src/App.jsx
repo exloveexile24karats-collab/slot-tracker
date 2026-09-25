@@ -499,7 +499,15 @@ const DIGIT7_COLOR = "#f6a04d";
 // なお「台同士の近隣密度」は全期間+14.6pt・z=5.77という強い数字が出たが、
 // 前半-0.6pt/後半+13.2ptと完全に後半だけの効果だったため却下（見せかけの
 // 強さに要注意という教訓）。
-const APP_VERSION = "6.39";
+// v6.40: 「アプリがブラックアウトする（一瞬v6.39が見えて真っ暗になる）」
+// という報告を受けて調査。v6.39で追加したA-type専用「own trailing（Y≥75
+// 基準）」の計算が、ループ内で`ownSeries.slice(0, i+1)`を毎回作り直して
+// いてO(日数²)になっていた（A-typeは全期間の台番号数が多いページなので
+// 特に重く、ブラウザが固まって真っ暗に見えていたと推測）。累積カウンタ
+// 方式（hitsSoFarを1個ずつ加算）に書き換えてO(日数)に軽量化。他の新規
+// 判定材料（カバネリ・マイジャグ・喰種）や機種別サマリー側
+// （computeOverallSummarySignals）には同様の重い書き方は無いことを確認済み。
+const APP_VERSION = "6.40";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -4045,14 +4053,20 @@ export default function SlotDataTracker() {
       let n1 = 0, h1 = 0;
       const allNos = new Set();
       pageSortedHistory.forEach((h) => h.machines.forEach((m) => allNos.add(m.no)));
+      // v6.40: 以前はownSeries.slice(0, i+1)をループ内で毎回作り直していて
+      // O(日数²)になっていた（A-typeは全期間の台番号数が多いページなので
+      // 特に重く、アプリが固まって見える不具合の原因になっていた）。
+      // 累積カウンタ方式にしてO(日数)に軽量化。
       allNos.forEach((no) => {
         const ownSeries = pageSortedHistory
           .map((h) => ({ date: h.date, y: (pageYByDateParam[h.date] || {})[no] }))
           .filter((r) => r.y !== null && r.y !== undefined);
+        let hitsSoFar = 0;
         for (let i = 0; i + 1 < ownSeries.length; i++) {
-          const histVals = ownSeries.slice(0, i + 1).map((r) => r.y);
-          if (histVals.length < 10) continue;
-          const rate = histVals.filter((v) => v >= CHIKUSHU_Y_HIT_THRESHOLD).length / histVals.length;
+          hitsSoFar += ownSeries[i].y >= CHIKUSHU_Y_HIT_THRESHOLD ? 1 : 0;
+          const countSoFar = i + 1;
+          if (countSoFar < 10) continue;
+          const rate = hitsSoFar / countSoFar;
           if (rate < 0.3) continue; // 実データ検証時の「own trailing」条件（過去的中率30%以上）
           n1 += 1;
           if (ownSeries[i + 1].y >= CHIKUSHU_Y_HIT_THRESHOLD) h1 += 1;
