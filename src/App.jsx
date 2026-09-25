@@ -461,7 +461,15 @@ const DIGIT7_COLOR = "#f6a04d";
 // pageGridRowsは独自のuseMemoをやめてmachineSelectorOptionsをそのまま使う
 // ようにした。viewDateMachines（日別データを見る）は特定の1日の実データ
 // そのものなので対象外（その日に実在した台をそのまま見せるのが正しい）。
-const APP_VERSION = "6.36";
+// v6.37: 「本日のおすすめ機種」「末尾別のおすすめ」を有効化。BB・RB回数が
+// 無くXが計算できないため、Y≥85基準ではなく「classifyMinRepoMarkでマーク
+// （☆◎◯▲）が付くかどうか」を的中定義にした別系統のエンジン
+// （computeOverallSummarySignals）を新設。判定材料は要望通り4つ：①機種/
+// 末尾自身の過去マーク率、②イベント連動性、③ローテーション（機種単位、
+// 最後にマークが付いてから何日か）、④直近5日差枚トレンド。実データ検証
+// （機種の前半/後半マーク率相関0.347で中程度の安定性を確認、爆撮×真打吉宗
+// 80%等イベント×機種の顕著な差も複数確認）を経てユーザー確認の上で実装。
+const APP_VERSION = "6.37";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -3548,6 +3556,146 @@ export default function SlotDataTracker() {
   // 条件だった時、翌日Y≥85だった割合」を実測し、ページ全体のベース出現率
   // と比べてcomputePoints（勝率型スコアリング）で得点化する。
   const Y_HIT_THRESHOLD = 85;
+  // v6.37: 民レポ全体データ（機種別サマリー・末尾別データ）専用の予想
+  // エンジン。BB・RB回数が無くXが計算できないため、的中定義を
+  // 「classifyMinRepoMarkでマーク（☆◎◯▲）が付くかどうか」に変更した、
+  // ページ側のcomputeSignalsForPage（Y≥85基準）とは別系統のロジック。
+  // 判定材料は4つ（実データ検証で確認：機種の前半/後半マーク率相関0.347、
+  // イベント×機種で顕著な差を複数確認）：
+  // ①機種/末尾自身の過去マーク率、②イベント連動性、③ローテーション
+  // （機種単位、最後にマークが付いてから何日か）、④直近差枚トレンド。
+  // sortedEntries: [{date, event, rows: [{name, sada, gsu, shutsu, wins,
+  // total, isVariety}]}] — 機種別サマリーならmodelRows、末尾別データなら
+  // digitRowsをこの形に詰めて渡す。
+  const OVERALL_SIGNAL_WEIGHTS = {
+    ownTrailing: 1.3,
+    event: 1.5,
+    rotation: 1.0,
+    sadaTrend: 1.0,
+  };
+
+  function computeOverallSummarySignals(sortedEntries) {
+    if (sortedEntries.length < 10) return [];
+
+    const lastEntry = sortedEntries[sortedEntries.length - 1];
+    const names = Array.from(new Set(lastEntry.rows.map((r) => r.name)));
+
+    let baseHits = 0;
+    let baseTotal = 0;
+    sortedEntries.forEach((e) => {
+      e.rows.forEach((r) => {
+        baseTotal += 1;
+        if (classifyMinRepoMark(r) !== null) baseHits += 1;
+      });
+    });
+    const baseRate = baseTotal > 0 ? baseHits / baseTotal : 0.1;
+
+    // ③ローテーション用の集計（walk-forward：i日目までの情報だけでi+1日目を見る）
+    let nearN = 0, nearHits = 0, farN = 0, farHits = 0;
+    const lastHitIdxByName = {};
+    sortedEntries.forEach((e, i) => {
+      e.rows.forEach((r) => {
+        if (classifyMinRepoMark(r) !== null) lastHitIdxByName[r.name] = i;
+      });
+      if (i + 1 >= sortedEntries.length) return;
+      const next = sortedEntries[i + 1];
+      next.rows.forEach((r) => {
+        const lastIdx = lastHitIdxByName[r.name];
+        if (lastIdx === undefined) return;
+        const daysSince = (i + 1) - lastIdx;
+        const isHit = classifyMinRepoMark(r) !== null;
+        if (daysSince >= 1 && daysSince <= 5) { nearN += 1; if (isHit) nearHits += 1; }
+        else if (daysSince >= 11) { farN += 1; if (isHit) farHits += 1; }
+      });
+    });
+    const rotationStats = {
+      近い: nearN >= 15 ? { hitRate: nearHits / nearN, sampleSize: nearN } : null,
+      遠い: farN >= 15 ? { hitRate: farHits / farN, sampleSize: farN } : null,
+    };
+
+    const results = [];
+    names.forEach((name) => {
+      const series = sortedEntries
+        .map((e) => {
+          const row = e.rows.find((r) => r.name === name);
+          if (!row) return null;
+          return { date: e.date, event: e.event, row, isHit: classifyMinRepoMark(row) !== null };
+        })
+        .filter(Boolean);
+      if (series.length === 0) return;
+
+      const lastDate = series[series.length - 1].date;
+      const scoreItems = [];
+      const pushSignal = (label, hitRate, sampleSize, weight) => {
+        const pts = computePoints(hitRate, baseRate, sampleSize);
+        if (pts === null) return;
+        scoreItems.push({ label, points: pts * weight, detail: { hitRate, sampleSize } });
+      };
+
+      // ①own trailing（この機種/末尾自身の過去マーク率）
+      if (series.length >= 10) {
+        const hits = series.filter((r) => r.isHit).length;
+        pushSignal(`${name}自身の過去マーク率`, hits / series.length, series.length, OVERALL_SIGNAL_WEIGHTS.ownTrailing);
+      }
+
+      // ②イベント連動性（明日のイベント名での過去マーク率）
+      const lastIdx = sortedEntries.findIndex((e) => e.date === lastDate);
+      const tomorrowEntry = lastIdx >= 0 && lastIdx + 1 < sortedEntries.length ? sortedEntries[lastIdx + 1] : null;
+      const tomorrowEventNames = tomorrowEntry && tomorrowEntry.event ? splitEventNames(tomorrowEntry.event) : [];
+      tomorrowEventNames.forEach((evName) => {
+        const matchVals = series.filter((r) => r.event && splitEventNames(r.event).includes(evName));
+        if (matchVals.length >= 5) {
+          const hits = matchVals.filter((r) => r.isHit).length;
+          pushSignal(`イベント「${evName}」`, hits / matchVals.length, matchVals.length, OVERALL_SIGNAL_WEIGHTS.event);
+        }
+      });
+
+      // ③ローテーション（機種単位、最後にマークが付いてから何日か）
+      const finalLastHitIdx = lastHitIdxByName[name];
+      if (finalLastHitIdx !== undefined) {
+        const daysSince = sortedEntries.length - finalLastHitIdx;
+        if (daysSince >= 1 && daysSince <= 5 && rotationStats.近い) {
+          pushSignal("ローテーション（直近5日以内）", rotationStats.近い.hitRate, rotationStats.近い.sampleSize, OVERALL_SIGNAL_WEIGHTS.rotation);
+        } else if (daysSince >= 11 && rotationStats.遠い) {
+          pushSignal("ローテーション（11日以上空き）", rotationStats.遠い.hitRate, rotationStats.遠い.sampleSize, OVERALL_SIGNAL_WEIGHTS.rotation);
+        }
+      }
+
+      // ④直近差枚トレンド（直近5日の平均差枚がプラス/マイナスかで条件付けし、
+      // 過去同じ条件だった時の翌日マーク率をwalk-forwardで実測）
+      const WINDOW = 5;
+      if (series.length >= WINDOW) {
+        const trailingSadaVals = series.slice(-WINDOW).map((r) => r.row.sada).filter((v) => v !== null && v !== undefined);
+        if (trailingSadaVals.length >= 3) {
+          const avgSada = trailingSadaVals.reduce((a, v) => a + v, 0) / trailingSadaVals.length;
+          const level = avgSada > 0 ? "プラス" : "マイナス";
+          let n = 0, hits = 0;
+          for (let i = WINDOW; i < series.length; i++) {
+            const w = series.slice(i - WINDOW, i).map((r) => r.row.sada).filter((v) => v !== null && v !== undefined);
+            if (w.length < 3) continue;
+            const wAvg = w.reduce((a, v) => a + v, 0) / w.length;
+            const wLevel = wAvg > 0 ? "プラス" : "マイナス";
+            if (wLevel === level) {
+              n += 1;
+              if (series[i].isHit) hits += 1;
+            }
+          }
+          if (n >= 15) {
+            pushSignal(`直近${WINDOW}日差枚トレンド（${level}）`, hits / n, n, OVERALL_SIGNAL_WEIGHTS.sadaTrend);
+          }
+        }
+      }
+
+      if (scoreItems.length === 0) return;
+      const totalPoints = scoreItems.reduce((a, s) => a + s.points, 0);
+      const signalCount = scoreItems.length;
+      const grade = pointsToGrade(totalPoints);
+      results.push({ no: name, lastDate, scoreItems, totalPoints, strongSignalCount: 0, tieBreakerPoints: totalPoints, signalCount, grade });
+    });
+
+    return results;
+  }
+
   function computeSignalsForPage(machineNumbers, pageSortedHistory, pageHistoryByDate, pageRecommendsList, pageStrongDateSet, pageSemiDateSet, strongNameSet, semiNameSet, globalBaseRateAParam, pageXByDateParam, pageYByDateParam, pageNameParam, noGenerationStartDateParam) {
     const results = [];
     if (!pageXByDateParam || !pageYByDateParam) return results; // X・Yが計算できていなければ何も予想できない
@@ -4143,49 +4291,33 @@ export default function SlotDataTracker() {
     return map;
   }, [pageXByDate]);
 
+  // v6.37: BB・RB回数が無くXが計算できないため、computeSignalsForPage
+  // （Y≥85基準）ではなくcomputeOverallSummarySignals（マーク基準、
+  // ①自身の過去マーク率②イベント連動性③ローテーション④差枚トレンド）に
+  // 切り替え。
   const overallModelPickList = useMemo(() => {
-    const sortedH = overallSortedSummaries.map((s) => ({
+    const sortedEntries = overallSortedSummaries.map((s) => ({
       date: s.date,
       event: s.event,
-      machines: s.modelRows.map((r) => ({ no: r.name, sada: r.avgSada, gsu: r.avgGsu, shutsu: r.shutsu })),
+      rows: s.modelRows.map((r) => ({
+        name: r.name, sada: r.avgSada, avgGsu: r.avgGsu, shutsu: r.shutsu,
+        wins: r.wins, total: r.total, isVariety: r.isVariety,
+      })),
     }));
-    const hbd = {};
-    sortedH.forEach((h) => {
-      hbd[h.date] = h;
-    });
-    const names = Array.from(new Set(sortedH.flatMap((h) => h.machines.map((m) => m.no)))).sort();
-    const oStrongDateSet = new Set(
-      sortedH.filter((h) => h.event && splitEventNames(h.event).some((n) => strongEventColorByName[n])).map((h) => h.date)
-    );
-    const oSemiDateSet = new Set(
-      sortedH
-        .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
-        .map((h) => h.date)
-    );
-    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, overallRecommends, oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
-  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap, overallRecommends, globalBaseRateA]);
+    return sortPickResults(computeOverallSummarySignals(sortedEntries));
+  }, [overallSortedSummaries]);
 
   const overallDigitPickList = useMemo(() => {
-    const sortedH = overallSortedSummaries.map((s) => ({
+    const sortedEntries = overallSortedSummaries.map((s) => ({
       date: s.date,
       event: s.event,
-      machines: s.digitRows.map((r) => ({ no: r.name, sada: r.avgSada, gsu: r.avgGsu, shutsu: r.shutsu })),
+      rows: s.digitRows.map((r) => ({
+        name: r.name, sada: r.avgSada, avgGsu: r.avgGsu, shutsu: r.shutsu,
+        wins: r.wins, total: r.total, isVariety: r.isVariety,
+      })),
     }));
-    const hbd = {};
-    sortedH.forEach((h) => {
-      hbd[h.date] = h;
-    });
-    const names = Array.from(new Set(sortedH.flatMap((h) => h.machines.map((m) => m.no)))).sort();
-    const oStrongDateSet = new Set(
-      sortedH.filter((h) => h.event && splitEventNames(h.event).some((n) => strongEventColorByName[n])).map((h) => h.date)
-    );
-    const oSemiDateSet = new Set(
-      sortedH
-        .filter((h) => h.event && !splitEventNames(h.event).some((n) => strongEventColorByName[n]) && splitEventNames(h.event).some((n) => semiEventColorByName[n]))
-        .map((h) => h.date)
-    );
-    return sortPickResults(computeSignalsForPage(names, sortedH, hbd, [], oStrongDateSet, oSemiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA));
-  }, [overallSortedSummaries, strongEventColorByName, semiEventColorByName, strongEventNameSet, semiEventNameSet, dateEventMap, globalBaseRateA]);
+    return sortPickResults(computeOverallSummarySignals(sortedEntries));
+  }, [overallSortedSummaries]);
 
   // system-wide reference accuracy: aggregates every 10/20/30-day threshold
   // rule found across every machine on this page, weighted by sample size.
@@ -6174,10 +6306,10 @@ export default function SlotDataTracker() {
               🎯 本日のおすすめ機種（未追跡の機種も含む）
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "12px" }}>
-              下で貼り付けた「機種別サマリー」から、台ごとの分析と同じ仕組みで判定します。
+              下で貼り付けた「機種別サマリー」から判定します。BB・RB回数が無く設定期待度Xは計算できないため、翌日「マーク（☆◎◯▲）が付くか」を的中の目安にした別ロジックです（自身の過去マーク率・イベント連動性・ローテーション・直近差枚トレンドの4つで判定）。
             </div>
             {overallModelPickList.length === 0 ? (
-              <div style={{ fontSize: "12px", color: "#5a6272" }}>民レポ（機種別サマリー）にはBB・RB回数が無く、設定期待度Xが計算できないため、現在この機能は無効です。</div>
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>データが10日分たまると表示されます。</div>
             ) : (
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
                 {overallModelPickList.map((p) => renderPickCard(p, (pp) => pp.no))}
@@ -6193,7 +6325,7 @@ export default function SlotDataTracker() {
               下で貼り付けた「末尾別データ」から、同じ仕組みで判定します。
             </div>
             {overallDigitPickList.length === 0 ? (
-              <div style={{ fontSize: "12px", color: "#5a6272" }}>民レポ（末尾別データ）にはBB・RB回数が無く、設定期待度Xが計算できないため、現在この機能は無効です。</div>
+              <div style={{ fontSize: "12px", color: "#5a6272" }}>データが10日分たまると表示されます。</div>
             ) : (
               <div className="scrollbar" style={{ maxHeight: "460px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "12px" }}>
                 {overallDigitPickList.map((p) => renderPickCard(p, (pp) => `末尾${pp.no}`))}
