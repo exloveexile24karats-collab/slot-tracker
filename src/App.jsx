@@ -436,7 +436,14 @@ const DIGIT7_COLOR = "#f6a04d";
 // source:"minrepo"を付け、backfillPageFromRawTableを変更してこのタグが
 // 付いている台番号だけを後からのアナスロ取り込みで自動上書きするように
 // した（すでにアナスロ由来のデータがある台番号は従来通り触らない）。
-const APP_VERSION = "6.33";
+// v6.34: 「差枚推移グラフ」の「表示する台番」一覧に、新台入れ替えで無く
+// なった古い台番号（SHAKE BONUS TRIGGER等）がずっと残って邪魔、という
+// 指摘を受けて対応。デフォルトはactiveMachineNumbers（最新日に実在する
+// 台番号）のみを表示するmachineSelectorOptionsに変更し、「過去の台番も
+// 表示」チェックボックスをオンにした時だけallMachineNumbers（全期間）に
+// 切り替わるようにした。初期選択（最初の6台）もactiveMachineNumbers基準に
+// 変更。
+const APP_VERSION = "6.34";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -2034,6 +2041,11 @@ export default function SlotDataTracker() {
   // 登録済み日付一覧の削除・リセット操作やグラフ表示に引き続き使うので残す
   const [status, setStatus] = useState(null);
   const [selectedMachines, setSelectedMachines] = useState([]);
+  // v6.34: 「表示する台番」一覧に新台入れ替えで無くなった古い台番号
+  // （例：SHAKE BONUS TRIGGER等）がずっと残って邪魔、という指摘を受けて
+  // 追加。デフォルトは現行の台番号のみ、過去の台番号も見たい時だけこの
+  // トグルをオンにする。
+  const [showInactiveMachines, setShowInactiveMachines] = useState(false);
   const [officialNameInput, setOfficialNameInput] = useState(""); // v6.8.1: text currently being typed to add a new bundled 機種名
   const [range, setRange] = useState(30);
 
@@ -3002,19 +3014,6 @@ export default function SlotDataTracker() {
     return Array.from(set).sort((a, b) => a - b);
   }, [currentHistory]);
 
-  // v6.16: 新台入れ替えでこのページの機種が別の台番号に変わった場合、
-  // 過去のallMachineNumbers（全期間の台番号の集合）には入れ替え前の
-  // 台番号がずっと残り続け、ピックアップに古い台番号が出てきてしまう
-  // 問題があった。ピックアップ・設定期待度は「最新日に実際に登場した
-  // 台番号」だけを対象にする（グラフの台選択・マトリクス表は、過去を
-  // 振り返る用途もあるのでallMachineNumbersのまま維持）。
-  useEffect(() => {
-    if (!historyLoading && selectedMachines.length === 0 && allMachineNumbers.length > 0) {
-      setSelectedMachines(allMachineNumbers.slice(0, Math.min(6, allMachineNumbers.length)));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [historyLoading, allMachineNumbers]);
-
   const sortedHistory = useMemo(
     () => [...currentHistory].sort((a, b) => a.date.localeCompare(b.date)),
     [currentHistory]
@@ -3031,6 +3030,25 @@ export default function SlotDataTracker() {
     const lastDay = sortedHistory[sortedHistory.length - 1];
     return Array.from(new Set(lastDay.machines.map((m) => m.no))).sort((a, b) => a - b);
   }, [sortedHistory]);
+
+  // v6.34: 「表示する台番」一覧に出す候補。デフォルトは現行の台番号のみ
+  // （activeMachineNumbers）、トグルオンで過去の台番号も含める
+  // （allMachineNumbers）。
+  const machineSelectorOptions = useMemo(
+    () => (showInactiveMachines ? allMachineNumbers : activeMachineNumbers),
+    [showInactiveMachines, allMachineNumbers, activeMachineNumbers]
+  );
+
+
+  // v6.34: 「表示する台番」一覧の初期選択も、無くなった古い台番号を
+  // デフォルトで拾ってしまわないよう、allMachineNumbersではなく
+  // activeMachineNumbers（最新日に実在する台番号）から選ぶように変更。
+  useEffect(() => {
+    if (!historyLoading && selectedMachines.length === 0 && activeMachineNumbers.length > 0) {
+      setSelectedMachines(activeMachineNumbers.slice(0, Math.min(6, activeMachineNumbers.length)));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyLoading, activeMachineNumbers]);
 
   // v6.8: 台番号 -> 機種名（このページが複数機種を束ねている「理由Aタイプ」
   // ページの場合、台番号だけでは機種がわからないので表示に使う。最新の
@@ -6543,21 +6561,25 @@ export default function SlotDataTracker() {
 
           {/* machine selector */}
           <div className="card" style={{ padding: "18px" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px", flexWrap: "wrap", gap: "8px" }}>
               <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", display: "flex", alignItems: "center", gap: "6px" }}>
                 <ListChecks size={14} />
-                表示する台番（{selectedMachines.length}/{allMachineNumbers.length}）
+                表示する台番（{selectedMachines.length}/{machineSelectorOptions.length}）
               </div>
-              <div style={{ display: "flex", gap: "10px" }}>
-                <button onClick={() => setSelectedMachines(allMachineNumbers)} style={{ fontSize: "11px", color: "#4fd1c5", background: "none", border: "none", cursor: "pointer" }}>全選択</button>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <label style={{ fontSize: "11px", color: "#8b93a3", display: "flex", alignItems: "center", gap: "4px", cursor: "pointer" }}>
+                  <input type="checkbox" checked={showInactiveMachines} onChange={(e) => setShowInactiveMachines(e.target.checked)} />
+                  過去の台番も表示
+                </label>
+                <button onClick={() => setSelectedMachines(machineSelectorOptions)} style={{ fontSize: "11px", color: "#4fd1c5", background: "none", border: "none", cursor: "pointer" }}>全選択</button>
                 <button onClick={() => setSelectedMachines([])} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>全解除</button>
               </div>
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-              {allMachineNumbers.length === 0 && (
+              {machineSelectorOptions.length === 0 && (
                 <div style={{ fontSize: "12px", color: "#5a6272" }}>データを保存すると台番がここに表示されます。</div>
               )}
-              {allMachineNumbers.map((no) => {
+              {machineSelectorOptions.map((no) => {
                 const active = selectedMachines.includes(no);
                 const idx = selectedMachines.indexOf(no);
                 const color = active ? PALETTE[idx % PALETTE.length] : "#2a323f";
