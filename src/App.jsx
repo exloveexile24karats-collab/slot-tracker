@@ -443,7 +443,16 @@ const DIGIT7_COLOR = "#f6a04d";
 // 表示」チェックボックスをオンにした時だけallMachineNumbers（全期間）に
 // 切り替わるようにした。初期選択（最初の6台）もactiveMachineNumbers基準に
 // 変更。
-const APP_VERSION = "6.34";
+// v6.35: 「SHAKE BONUS TRIGGERまだあるのに消えたみたいに見える」という
+// 報告を受けて調査。実は台番号が変わったからではなく、民レポ全体データ
+// （機種別サマリー）でこの機種が9/11に「2台設置」→「バラエティコーナー
+// （1台設置）」に変わったのが原因だった。classifyMinRepoMarkは勝率（wins/
+// total、○台中△台当たりの分数）が無いと無条件でマーク無しにする仕組みで、
+// 1台設置行にはそもそも勝率の分数が民レポ側に存在しないため、出率が良くて
+// も永遠にマークが付かない仕様の穴だった。isVariety行だけ、個別台マーク用
+// のclassifyMachineMarkと同じ「出率だけで判定（▲110%以上、◯105%以上）」
+// に分岐させて修正。
+const APP_VERSION = "6.35";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -531,6 +540,20 @@ function fmtNum(v) {
 // ◯ = 出率105%以上 & 勝率80%以上　▲ = 出率110%以上
 // condition: 2台以上設置 かつ 平均G数3000以上
 function classifyMinRepoMark(row) {
+  // v6.35: バラエティコーナー（1台設置）の行は、民レポの表構造上そもそも
+  // 「設置◯台中△台当たり」という勝率の分数が存在しない（1台しか無いので
+  // 分数にする意味が無い）。そのためwins/totalが常にnullになり、下の通常
+  // ロジック（勝率必須）だとバラエティ台は出率がどんなに良くても永遠に
+  // マーク無しになっていた（実データでSHAKE BONUS TRIGGERが9/11に2台設置
+  // →1台設置に変わった際に発覚。台番号が変わったからではなく、1台設置化
+  // した時点で仕様の穴にハマっていた）。個別台マーク用のclassifyMachineMark
+  // と同じ「出率だけで判定」に分岐する。
+  if (row.isVariety) {
+    if (row.shutsu === null || row.shutsu === undefined) return null;
+    if (row.shutsu >= 110) return "▲";
+    if (row.shutsu >= 105) return "◯";
+    return null;
+  }
   if (!row.total || row.total < 2) return null;
   if (row.avgGsu === null || row.avgGsu === undefined || row.avgGsu < 3000) return null;
   if (row.shutsu === null || row.shutsu === undefined) return null;
