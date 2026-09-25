@@ -483,7 +483,23 @@ const DIGIT7_COLOR = "#f6a04d";
 // Y≥75基準・専用ベース率（chikushuBaseHitRate75）を使う設計にした
 // （pushSignal75、他の判定材料のY≥85基準とは独立）。カバネリ・モンキー・
 // マイジャグ・A-typeはこのカテゴリでは有意な新規候補が見つからなかった。
-const APP_VERSION = "6.38";
+// v6.39: 「機種ごとにS-Dの差が最大となる条件」の探索第2〜3ラウンド（数十
+// 候補を追加で網羅探索、うち約80候補は前後半不安定で却下）を経て見つかった
+// 5つを追加実装。chikushuBaseHitRate75はもう喰種専用ではなく全ページ共通の
+// 「Y≥75版pageBaseHitRate」として汎用化した（pushSignal75も同様）。
+// ①カバネリ「翌日が日曜かつイベント無し」+10.0pt(z=2.40)、前半+10.5pt/
+// 後半+9.1pt — カバネリで唯一見つかったイベント以外の判定材料。
+// ②マイジャグ「出率100%以上が3日連続」+10.0pt(z=2.71)、前半+10.7pt/
+// 後半+6.3pt。③マイジャグ「（翌日イベント無し限定）直近3日差枚平均≥1000」
+// +9.0pt、前半+10.0pt/後半+7.4pt。④A-type「own trailing（Y≥75基準、
+// 全履歴）」+7.5pt(z=2.33)、前半+9.0pt/後半+7.2pt（既存のfixedNoX＝Y≥85
+// 基準・重み0.8とは別物として追加）。⑤A-type「5日前にY≥85だった」
+// +5.0pt(z=2.16)、前半+5.7pt/後半+4.4pt。⑥喰種「月末(21〜31日)」
+// +4.4pt(z=4.29)、前半+6.7pt/後半+5.1pt（既存のchikushuMonthStartと対）。
+// なお「台同士の近隣密度」は全期間+14.6pt・z=5.77という強い数字が出たが、
+// 前半-0.6pt/後半+13.2ptと完全に後半だけの効果だったため却下（見せかけの
+// 強さに要注意という教訓）。
+const APP_VERSION = "6.39";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1074,6 +1090,13 @@ const SIGNAL_WEIGHTS = {
   chikushuMonthStart: 1.2, // 月初(1〜3日) — 全期間+13.8pt(z=5.51)、前半+11.5pt/後半+13.9pt、非常に安定
   chikushuGsuPageRank: 1.0, // G数のページ内相対順位(同日コホート内、上位20%) — 上位20%vs下位20%では+5.3pt、vs全体平均では+2.7pt(n=632)
   chikushuLastWeekSameWeekday: 1.0, // 先週同曜日にY>=75だったか — +10.1pt(z=3.78)、前半+3.4pt/後半+5.9pt
+  // v6.39: 「機種ごとにS-Dの差が最大となる条件」を探す第2ラウンドで追加
+  chikushuMonthEnd: 1.0, // 喰種専用：月末(21〜31日) — +4.4pt(z=4.29)、前半+6.7pt/後半+5.1pt
+  kabaneriSundayNoEvent: 1.2, // カバネリ専用：翌日が日曜かつイベント無し — +10.0pt(z=2.40)、前半+10.5pt/後半+9.1pt
+  myjagShutsuStreak3: 1.0, // マイジャグ専用：出率100%以上が3日連続 — +10.0pt(z=2.71)、前半+10.7pt/後半+6.3pt
+  myjagSadaTrendNoEvent: 1.0, // マイジャグ専用：（イベント無し日限定）直近3日差枚平均≥1000 — +9.0pt、前半+10.0pt/後半+7.4pt
+  atypeOwnTrailing75: 1.0, // A-type専用：own trailing(Y≥75基準、全履歴) — +7.5pt(z=2.33)、前半+9.0pt/後半+7.2pt
+  atypeLag5: 1.0, // A-type専用：5日前にY≥85だった — +5.0pt(z=2.16)、前半+5.7pt/後半+4.4pt
 };
 
 // v6.29: 「台番号固有のYの法則（own trailing）」の重みをページごとに変更。
@@ -3841,17 +3864,11 @@ export default function SlotDataTracker() {
       };
     }
 
-    // v6.38: 喰種専用の3つの追加判定材料。すべて「翌日Y≥75」基準で内部
-    // 完結させる（chikushuBaseHitRate75も同じ基準で計算し、他の判定材料の
-    // pageBaseHitRate＝Y≥85基準とは混ぜない）。実データ検証：
-    // ①月初(1-3日) 全期間+13.8pt(z=5.51)、前半+11.5pt/後半+13.9pt
-    // ②G数ページ内相対順位(同日コホート上位20%、vs全体平均+2.7pt、n=632)
-    // ③先週同曜日にY≥75だったか +10.1pt(z=3.78)、前半+3.4pt/後半+5.9pt
-    let chikushuBaseHitRate75 = null;
-    let chikushuMonthStartStats = null;
-    let chikushuGsuRankStats = null;
-    let chikushuLastWeekStats = null;
-    if (pageNameParam === "喰種") {
+    // v6.38-39: 「翌日Y≥75」基準の汎用ベース率。喰種専用に始まったが、
+    // v6.39でカバネリ・マイジャグ・A-typeにも同じ基準の判定材料を追加した
+    // ため、全ページで計算するように変更（変数名はchikushuのままだが
+    // 実質「Y≥75版のpageBaseHitRate」として全ページ共通で使う）。
+    let chikushuBaseHitRate75 = (() => {
       let baseHits75 = 0, baseTotal75 = 0;
       pageSortedHistory.forEach((h) => {
         h.machines.forEach((m) => {
@@ -3861,8 +3878,20 @@ export default function SlotDataTracker() {
           if (y >= CHIKUSHU_Y_HIT_THRESHOLD) baseHits75 += 1;
         });
       });
-      chikushuBaseHitRate75 = baseTotal75 > 0 ? baseHits75 / baseTotal75 : 0.25;
+      return baseTotal75 > 0 ? baseHits75 / baseTotal75 : 0.25;
+    })();
 
+    // v6.38: 喰種専用の3つの追加判定材料。すべて「翌日Y≥75」基準で内部
+    // 完結させる（chikushuBaseHitRate75も同じ基準で計算し、他の判定材料の
+    // pageBaseHitRate＝Y≥85基準とは混ぜない）。実データ検証：
+    // ①月初(1-3日) 全期間+13.8pt(z=5.51)、前半+11.5pt/後半+13.9pt
+    // ②G数ページ内相対順位(同日コホート上位20%、vs全体平均+2.7pt、n=632)
+    // ③先週同曜日にY≥75だったか +10.1pt(z=3.78)、前半+3.4pt/後半+5.9pt
+    let chikushuMonthStartStats = null;
+    let chikushuMonthEndStats = null;
+    let chikushuGsuRankStats = null;
+    let chikushuLastWeekStats = null;
+    if (pageNameParam === "喰種") {
       // ①月初(1〜3日)
       let msHits = 0, msTotal = 0;
       pageSortedHistory.forEach((h) => {
@@ -3923,6 +3952,129 @@ export default function SlotDataTracker() {
         });
       });
       chikushuLastWeekStats = lwTotal >= 20 ? { hitRate: lwHits / lwTotal, sampleSize: lwTotal } : null;
+
+      // v6.39: 喰種専用④月末(21〜31日) +4.4pt(z=4.29)、前半+6.7pt/後半+5.1pt
+      let meHits = 0, meTotal = 0;
+      pageSortedHistory.forEach((h) => {
+        const day = parseInt(h.date.slice(8, 10), 10);
+        if (Number.isNaN(day) || day < 21) return;
+        h.machines.forEach((m) => {
+          const y = (pageYByDateParam[h.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          meTotal += 1;
+          if (y >= CHIKUSHU_Y_HIT_THRESHOLD) meHits += 1;
+        });
+      });
+      chikushuMonthEndStats = meTotal >= 20 ? { hitRate: meHits / meTotal, sampleSize: meTotal } : null;
+    }
+
+    // v6.39: カバネリ専用「翌日が日曜 かつ イベント無し」 +10.0pt(z=2.40)、
+    // 前半+10.5pt/後半+9.1pt、非常に安定（カバネリはイベント連動性以外で
+    // 唯一見つかった信号）。ページ全体でプールし、全機種に同じ実測%を適用。
+    let kabaneriSundayNoEventStats = null;
+    if (pageNameParam === "カバネリ") {
+      let hits = 0, total = 0;
+      pageSortedHistory.forEach((h) => {
+        const y_ = new Date(h.date + "T00:00:00Z").getUTCDay(); // 0=日
+        if (y_ !== 0 || h.event) return;
+        h.machines.forEach((m) => {
+          const y = (pageYByDateParam[h.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          total += 1;
+          if (y >= CHIKUSHU_Y_HIT_THRESHOLD) hits += 1;
+        });
+      });
+      kabaneriSundayNoEventStats = total >= 15 ? { hitRate: hits / total, sampleSize: total } : null;
+    }
+
+    // v6.39: マイジャグ専用の2つ。
+    // ①出率100%以上が3日連続 +10.0pt(z=2.71)、前半+10.7pt/後半+6.3pt
+    // ②（イベント無し日限定）直近3日差枚平均≥1000 +9.0pt、前半+10.0pt/後半+7.4pt
+    let myjagShutsuStreak3Stats = null;
+    let myjagSadaTrendNoEventStats = null;
+    if (pageNameParam === "マイジャグ") {
+      let n1 = 0, h1 = 0;
+      pageSortedHistory.forEach((h, i) => {
+        if (i < 2 || i + 1 >= pageSortedHistory.length) return;
+        const nextDay = pageSortedHistory[i + 1];
+        nextDay.machines.forEach((m) => {
+          const streakOk = [0, 1, 2].every((k) => {
+            const prevDay = pageSortedHistory[i - k];
+            const pm = prevDay.machines.find((mm) => mm.no === m.no);
+            return pm && pm.shutsu !== null && pm.shutsu !== undefined && pm.shutsu >= 100;
+          });
+          if (!streakOk) return;
+          const y = (pageYByDateParam[nextDay.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          n1 += 1;
+          if (y >= CHIKUSHU_Y_HIT_THRESHOLD) h1 += 1;
+        });
+      });
+      myjagShutsuStreak3Stats = n1 >= 15 ? { hitRate: h1 / n1, sampleSize: n1 } : null;
+
+      let n2 = 0, h2 = 0;
+      pageSortedHistory.forEach((h, i) => {
+        if (i + 1 >= pageSortedHistory.length) return;
+        const nextDay = pageSortedHistory[i + 1];
+        if (nextDay.event) return; // イベント無し日限定
+        nextDay.machines.forEach((m) => {
+          const window = [];
+          for (let k = 0; k < 3 && i - k >= 0; k++) {
+            const day = pageSortedHistory[i - k];
+            const dm = day.machines.find((mm) => mm.no === m.no);
+            if (dm && dm.sada !== null && dm.sada !== undefined) window.push(dm.sada);
+          }
+          if (window.length < 2) return;
+          const avg = window.reduce((a, v) => a + v, 0) / window.length;
+          if (avg < 1000) return;
+          const y = (pageYByDateParam[nextDay.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          n2 += 1;
+          if (y >= CHIKUSHU_Y_HIT_THRESHOLD) h2 += 1;
+        });
+      });
+      myjagSadaTrendNoEventStats = n2 >= 10 ? { hitRate: h2 / n2, sampleSize: n2 } : null;
+    }
+
+    // v6.39: A-type専用の2つ。
+    // ①own trailing（Y≥75基準、全履歴） +7.5pt(z=2.33)、前半+9.0pt/後半+7.2pt
+    // ②5日前にY≥85だった（単体ラグ） +5.0pt(z=2.16)、前半+5.7pt/後半+4.4pt
+    let atypeOwnTrailing75Stats = null;
+    let atypeLag5Stats = null;
+    if (pageNameParam === "A-type") {
+      let n1 = 0, h1 = 0;
+      const allNos = new Set();
+      pageSortedHistory.forEach((h) => h.machines.forEach((m) => allNos.add(m.no)));
+      allNos.forEach((no) => {
+        const ownSeries = pageSortedHistory
+          .map((h) => ({ date: h.date, y: (pageYByDateParam[h.date] || {})[no] }))
+          .filter((r) => r.y !== null && r.y !== undefined);
+        for (let i = 0; i + 1 < ownSeries.length; i++) {
+          const histVals = ownSeries.slice(0, i + 1).map((r) => r.y);
+          if (histVals.length < 10) continue;
+          const rate = histVals.filter((v) => v >= CHIKUSHU_Y_HIT_THRESHOLD).length / histVals.length;
+          if (rate < 0.3) continue; // 実データ検証時の「own trailing」条件（過去的中率30%以上）
+          n1 += 1;
+          if (ownSeries[i + 1].y >= CHIKUSHU_Y_HIT_THRESHOLD) h1 += 1;
+        }
+      });
+      atypeOwnTrailing75Stats = n1 >= 20 ? { hitRate: h1 / n1, sampleSize: n1 } : null;
+
+      let n2 = 0, h2 = 0;
+      pageSortedHistory.forEach((h, i) => {
+        if (i < 4 || i + 1 >= pageSortedHistory.length) return;
+        const lagDay = pageSortedHistory[i - 4]; // 5日前＝今日を含めて5営業日前
+        const nextDay = pageSortedHistory[i + 1];
+        nextDay.machines.forEach((m) => {
+          const lagY = (pageYByDateParam[lagDay.date] || {})[m.no];
+          if (lagY === null || lagY === undefined || lagY < 85) return;
+          const y = (pageYByDateParam[nextDay.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          n2 += 1;
+          if (y >= CHIKUSHU_Y_HIT_THRESHOLD) h2 += 1;
+        });
+      });
+      atypeLag5Stats = n2 >= 15 ? { hitRate: h2 / n2, sampleSize: n2 } : null;
     }
 
     machineNumbers.forEach((no) => {
@@ -3937,7 +4089,7 @@ export default function SlotDataTracker() {
           const m = h.machines.find((mm) => mm.no === no);
           if (!m) return null;
           const y = (pageYByDateParam[h.date] || {})[no];
-          return { date: h.date, gsu: m.gsu, sada: m.sada, y: y !== undefined ? y : null, event: h.event, modelName: m.modelName };
+          return { date: h.date, gsu: m.gsu, sada: m.sada, shutsu: m.shutsu, y: y !== undefined ? y : null, event: h.event, modelName: m.modelName };
         })
         .filter((r) => r && r.y !== null && r.y !== undefined);
       if (ySeries.length === 0) return;
@@ -4034,6 +4186,76 @@ export default function SlotDataTracker() {
           const targetY = (pageYByDateParam[targetDate] || {})[no];
           if (targetY !== null && targetY !== undefined && targetY >= CHIKUSHU_Y_HIT_THRESHOLD) {
             pushSignal75("先週同曜日にY≥75だった", chikushuLastWeekStats.hitRate, chikushuLastWeekStats.sampleSize, SIGNAL_WEIGHTS.chikushuLastWeekSameWeekday);
+          }
+        }
+
+        // ④月末(21〜31日)
+        const tomorrowDateForMonthEnd = addDays(lastDate, 1);
+        const tomorrowDayForEnd = parseInt(tomorrowDateForMonthEnd.slice(8, 10), 10);
+        if (!Number.isNaN(tomorrowDayForEnd) && tomorrowDayForEnd >= 21 && chikushuMonthEndStats) {
+          pushSignal75("月末（21〜31日）", chikushuMonthEndStats.hitRate, chikushuMonthEndStats.sampleSize, SIGNAL_WEIGHTS.chikushuMonthEnd);
+        }
+      }
+
+      // v6.39: カバネリ専用「翌日が日曜かつイベント無し」
+      if (pageNameParam === "カバネリ" && kabaneriSundayNoEventStats) {
+        const tomorrowDate = addDays(lastDate, 1);
+        const tomorrowIsSunday = new Date(tomorrowDate + "T00:00:00Z").getUTCDay() === 0;
+        const tomorrowEntry = pageHistoryByDate[tomorrowDate];
+        const tomorrowHasEvent = tomorrowEntry ? !!tomorrowEntry.event : !!dateEventMapForKabaneri;
+        if (tomorrowIsSunday && !tomorrowHasEvent) {
+          pushSignal75("翌日が日曜かつイベント無し", kabaneriSundayNoEventStats.hitRate, kabaneriSundayNoEventStats.sampleSize, SIGNAL_WEIGHTS.kabaneriSundayNoEvent);
+        }
+      }
+
+      // v6.39: マイジャグ専用の2つ
+      if (pageNameParam === "マイジャグ") {
+        // ①出率100%以上が3日連続（この台自身の直近3日）
+        if (myjagShutsuStreak3Stats && ySeries.length >= 3) {
+          const last3 = ySeries.slice(-3);
+          const streakOk = last3.length === 3 && last3.every((r) => {
+            const dayEntry = pageHistoryByDate[r.date];
+            const m = dayEntry ? dayEntry.machines.find((mm) => mm.no === no) : null;
+            return m && m.shutsu !== null && m.shutsu !== undefined && m.shutsu >= 100;
+          });
+          if (streakOk) {
+            pushSignal75("出率100%以上が3日連続", myjagShutsuStreak3Stats.hitRate, myjagShutsuStreak3Stats.sampleSize, SIGNAL_WEIGHTS.myjagShutsuStreak3);
+          }
+        }
+        // ②（イベント無し日限定）直近3日差枚平均≥1000
+        if (myjagSadaTrendNoEventStats) {
+          const tomorrowDate = addDays(lastDate, 1);
+          const tomorrowEntry = pageHistoryByDate[tomorrowDate];
+          const tomorrowHasEvent = tomorrowEntry ? !!tomorrowEntry.event : true; // 未登録日は判定材料自体を出さない（安全側）
+          if (tomorrowEntry && !tomorrowHasEvent) {
+            const last3 = ySeries.slice(-3);
+            const sadaVals = last3.map((r) => r.sada).filter((v) => v !== null && v !== undefined);
+            if (sadaVals.length >= 2) {
+              const avg = sadaVals.reduce((a, v) => a + v, 0) / sadaVals.length;
+              if (avg >= 1000) {
+                pushSignal75("イベント無し日・直近3日差枚平均1000以上", myjagSadaTrendNoEventStats.hitRate, myjagSadaTrendNoEventStats.sampleSize, SIGNAL_WEIGHTS.myjagSadaTrendNoEvent);
+              }
+            }
+          }
+        }
+      }
+
+      // v6.39: A-type専用の2つ
+      if (pageNameParam === "A-type") {
+        // ①own trailing（Y≥75基準、全履歴）
+        if (atypeOwnTrailing75Stats && ySeries.length >= 10) {
+          const rate75 = ySeries.filter((r) => r.y >= CHIKUSHU_Y_HIT_THRESHOLD).length / ySeries.length;
+          if (rate75 >= 0.3) {
+            pushSignal75("own trailing（Y≥75基準）", atypeOwnTrailing75Stats.hitRate, atypeOwnTrailing75Stats.sampleSize, SIGNAL_WEIGHTS.atypeOwnTrailing75);
+          }
+        }
+        // ②5日前にY≥85だった
+        if (atypeLag5Stats) {
+          const tomorrowDate = addDays(lastDate, 1);
+          const lagDate = addDays(tomorrowDate, -5);
+          const lagY = (pageYByDateParam[lagDate] || {})[no];
+          if (lagY !== null && lagY !== undefined && lagY >= 85) {
+            pushSignal75("5日前にY≥85だった", atypeLag5Stats.hitRate, atypeLag5Stats.sampleSize, SIGNAL_WEIGHTS.atypeLag5);
           }
         }
       }
