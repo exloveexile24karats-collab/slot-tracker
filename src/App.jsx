@@ -469,7 +469,21 @@ const DIGIT7_COLOR = "#f6a04d";
 // 最後にマークが付いてから何日か）、④直近5日差枚トレンド。実データ検証
 // （機種の前半/後半マーク率相関0.347で中程度の安定性を確認、爆撮×真打吉宗
 // 80%等イベント×機種の顕著な差も複数確認）を経てユーザー確認の上で実装。
-const APP_VERSION = "6.37";
+// v6.38: 「機種ごとにS-Dの的中率差が最大となる条件を探す」という依頼を受け、
+// 差枚・イベント・ローテーション・相関・隣接・階段（連続）・曜日・前日
+// イベント・月初月末・G数トレンド・Yの勢い・大負け反発・先週同曜日など
+// 数十種類の候補を、ページ別に前後半分割の頑健性チェック込みで網羅探索
+// （的中定義は翌日Y≥75で統一）。結果、イベント連動性がほぼ唯一全ページで
+// 強く安定していた（既存の⑥判定材料が汎用的に対応済みのためコード変更
+// 不要）ほか、喰種だけ以下3つの新しい信号が前後半とも安定して見つかった
+// ため追加：①月初(1〜3日) 全期間+13.8pt(z=5.51)、前半+11.5pt/後半+13.9pt、
+// ②G数のページ内相対順位(同日コホート上位20%) +2.7pt(vs全体平均)、
+// ③先週同曜日にY≥75だったか +10.1pt(z=3.78)。喰種はY≥85基準のown
+// trailing等がほぼ効かないページと分かっていたため、この3つだけ内部で
+// Y≥75基準・専用ベース率（chikushuBaseHitRate75）を使う設計にした
+// （pushSignal75、他の判定材料のY≥85基準とは独立）。カバネリ・モンキー・
+// マイジャグ・A-typeはこのカテゴリでは有意な新規候補が見つからなかった。
+const APP_VERSION = "6.38";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1053,6 +1067,13 @@ const SIGNAL_WEIGHTS = {
   // 追加・調整した判定材料（詳細はfixedNoX重み表・下記コメント参照）
   myjagShortTrailing: 1.0, // マイジャグ専用：直近3日窓のYの法則 — AUC0.555、z=2.31（前半2.15/後半0.60）
   modelRotation: 1.0, // A-type専用：機種ローテーション（機種単位、最後に高Yからの日数） — AUC0.452、z=-2.67（前後半とも同方向）
+  // v6.38: 喰種専用の3つ（的中の定義を「翌日Y≥75」に変えて機種別に網羅
+  // 探索し直した結果、見つかった新しい判定材料。他の判定材料と違い、
+  // ここだけ内部計算を「翌日Y≥75」基準で行う（喰種はY≥85基準のown
+  // trailing等がほぼ効かないページだったため、閾値ごと変えて再検証した）。
+  chikushuMonthStart: 1.2, // 月初(1〜3日) — 全期間+13.8pt(z=5.51)、前半+11.5pt/後半+13.9pt、非常に安定
+  chikushuGsuPageRank: 1.0, // G数のページ内相対順位(同日コホート内、上位20%) — 上位20%vs下位20%では+5.3pt、vs全体平均では+2.7pt(n=632)
+  chikushuLastWeekSameWeekday: 1.0, // 先週同曜日にY>=75だったか — +10.1pt(z=3.78)、前半+3.4pt/後半+5.9pt
 };
 
 // v6.29: 「台番号固有のYの法則（own trailing）」の重みをページごとに変更。
@@ -3556,6 +3577,12 @@ export default function SlotDataTracker() {
   // 条件だった時、翌日Y≥85だった割合」を実測し、ページ全体のベース出現率
   // と比べてcomputePoints（勝率型スコアリング）で得点化する。
   const Y_HIT_THRESHOLD = 85;
+  // v6.38: 喰種専用の3判定材料だけは「翌日Y≥75」基準で内部計算する
+  // （喰種はY≥85基準のown trailing等がほぼ効かないページと分かっていて、
+  // 閾値を変えて機種別に再探索した結果、Y≥75基準でだけ強い信号が見つかった
+  // ため）。この定数と、対応するベース率（chikushuBaseHitRate75）は、他の
+  // 判定材料のpageBaseHitRate（Y≥85基準）とは別に、内部で完結させて使う。
+  const CHIKUSHU_Y_HIT_THRESHOLD = 75;
   // v6.37: 民レポ全体データ（機種別サマリー・末尾別データ）専用の予想
   // エンジン。BB・RB回数が無くXが計算できないため、的中定義を
   // 「classifyMinRepoMarkでマーク（☆◎◯▲）が付くかどうか」に変更した、
@@ -3814,6 +3841,90 @@ export default function SlotDataTracker() {
       };
     }
 
+    // v6.38: 喰種専用の3つの追加判定材料。すべて「翌日Y≥75」基準で内部
+    // 完結させる（chikushuBaseHitRate75も同じ基準で計算し、他の判定材料の
+    // pageBaseHitRate＝Y≥85基準とは混ぜない）。実データ検証：
+    // ①月初(1-3日) 全期間+13.8pt(z=5.51)、前半+11.5pt/後半+13.9pt
+    // ②G数ページ内相対順位(同日コホート上位20%、vs全体平均+2.7pt、n=632)
+    // ③先週同曜日にY≥75だったか +10.1pt(z=3.78)、前半+3.4pt/後半+5.9pt
+    let chikushuBaseHitRate75 = null;
+    let chikushuMonthStartStats = null;
+    let chikushuGsuRankStats = null;
+    let chikushuLastWeekStats = null;
+    if (pageNameParam === "喰種") {
+      let baseHits75 = 0, baseTotal75 = 0;
+      pageSortedHistory.forEach((h) => {
+        h.machines.forEach((m) => {
+          const y = (pageYByDateParam[h.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          baseTotal75 += 1;
+          if (y >= CHIKUSHU_Y_HIT_THRESHOLD) baseHits75 += 1;
+        });
+      });
+      chikushuBaseHitRate75 = baseTotal75 > 0 ? baseHits75 / baseTotal75 : 0.25;
+
+      // ①月初(1〜3日)
+      let msHits = 0, msTotal = 0;
+      pageSortedHistory.forEach((h) => {
+        const day = parseInt(h.date.slice(8, 10), 10);
+        if (Number.isNaN(day) || day > 3) return;
+        h.machines.forEach((m) => {
+          const y = (pageYByDateParam[h.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          msTotal += 1;
+          if (y >= CHIKUSHU_Y_HIT_THRESHOLD) msHits += 1;
+        });
+      });
+      chikushuMonthStartStats = msTotal >= 20 ? { hitRate: msHits / msTotal, sampleSize: msTotal } : null;
+
+      // ②G数のページ内相対順位（同日コホート内で上位20%かどうか。元の検証は
+      // 上位20%vs下位20%の比較で+5.3ptだったが、pushSignal75はvs全体平均
+      // で計算するため効果はやや薄まる。実データで上位20%が一番良いバラ
+      // ンスだったためcutoffを0.8に設定）
+      let rankHits = 0, rankTotal = 0;
+      pageSortedHistory.forEach((h, i) => {
+        if (i + 1 >= pageSortedHistory.length) return;
+        const nextDay = pageSortedHistory[i + 1];
+        const gsuVals = h.machines.map((m) => m.gsu).filter((v) => v !== null && v !== undefined).sort((a, b) => a - b);
+        if (gsuVals.length < 5) return;
+        const n = gsuVals.length;
+        h.machines.forEach((m) => {
+          if (m.gsu === null || m.gsu === undefined) return;
+          let lo = 0, hi = n;
+          while (lo < hi) { const mid = (lo + hi) >> 1; if (gsuVals[mid] < m.gsu) lo = mid + 1; else hi = mid; }
+          const rank = lo / n;
+          if (rank < 0.8) return;
+          const nextY = (pageYByDateParam[nextDay.date] || {})[m.no];
+          if (nextY === null || nextY === undefined) return;
+          rankTotal += 1;
+          if (nextY >= CHIKUSHU_Y_HIT_THRESHOLD) rankHits += 1;
+        });
+      });
+      chikushuGsuRankStats = rankTotal >= 20 ? { hitRate: rankHits / rankTotal, sampleSize: rankTotal } : null;
+
+      // ③先週同曜日（7日前）にY>=75だったか（機種横断でプール、walk-forward：
+      // i日目の予想には i+1日目の7日前＝i-6日目までの情報しか使わない）
+      let lwHits = 0, lwTotal = 0;
+      pageSortedHistory.forEach((h, i) => {
+        if (i + 1 >= pageSortedHistory.length) return;
+        const nextDay = pageSortedHistory[i + 1];
+        const d = new Date(nextDay.date + "T00:00:00Z");
+        d.setUTCDate(d.getUTCDate() - 7);
+        const targetDateStr = d.toISOString().slice(0, 10);
+        const targetMap = pageYByDateParam[targetDateStr];
+        if (!targetMap) return;
+        nextDay.machines.forEach((m) => {
+          const pastY = targetMap[m.no];
+          if (pastY === null || pastY === undefined || pastY < CHIKUSHU_Y_HIT_THRESHOLD) return;
+          const y = (pageYByDateParam[nextDay.date] || {})[m.no];
+          if (y === null || y === undefined) return;
+          lwTotal += 1;
+          if (y >= CHIKUSHU_Y_HIT_THRESHOLD) lwHits += 1;
+        });
+      });
+      chikushuLastWeekStats = lwTotal >= 20 ? { hitRate: lwHits / lwTotal, sampleSize: lwTotal } : null;
+    }
+
     machineNumbers.forEach((no) => {
       // v6.31: 台番号だけでなく「今の機種に切り替わってから」の日付だけを
       // この台自身の履歴として扱う（台番号＋機種名をセットで考える）。
@@ -3836,6 +3947,14 @@ export default function SlotDataTracker() {
       const scoreItems = []; // { label, points, detail: { hitRate, sampleSize } }
       const pushSignal = (label, hitRate, sampleSize, weight) => {
         const pts = computePoints(hitRate, pageBaseHitRate, sampleSize);
+        if (pts === null) return;
+        scoreItems.push({ label, points: pts * weight, detail: { hitRate, sampleSize } });
+      };
+      // v6.38: 喰種専用の3判定材料用。ベース率をpageBaseHitRate（Y≥85基準）
+      // ではなくchikushuBaseHitRate75（Y≥75基準）にする以外はpushSignalと同じ。
+      const pushSignal75 = (label, hitRate, sampleSize, weight) => {
+        if (chikushuBaseHitRate75 === null) return;
+        const pts = computePoints(hitRate, chikushuBaseHitRate75, sampleSize);
         if (pts === null) return;
         scoreItems.push({ label, points: pts * weight, detail: { hitRate, sampleSize } });
       };
@@ -3877,6 +3996,44 @@ export default function SlotDataTracker() {
             pushSignal(`機種ローテーション（Aタイプ全機種の統計、${thisMachineModelName}は直近5日以内）`, modelRotationStatsY.近い.hitRate, modelRotationStatsY.近い.sampleSize, SIGNAL_WEIGHTS.modelRotation);
           } else if (daysSinceModelHigh >= 11 && modelRotationStatsY.遠い) {
             pushSignal(`機種ローテーション（Aタイプ全機種の統計、${thisMachineModelName}は11日以上空き）`, modelRotationStatsY.遠い.hitRate, modelRotationStatsY.遠い.sampleSize, SIGNAL_WEIGHTS.modelRotation);
+          }
+        }
+      }
+
+      // v6.38: 喰種専用の3判定材料。すべて「翌日Y≥75」基準（pushSignal75）。
+      if (pageNameParam === "喰種" && chikushuBaseHitRate75 !== null) {
+        // ①月初(1〜3日)：明日の日付が1〜3日かどうか
+        const tomorrowDateForMonthStart = addDays(lastDate, 1);
+        const tomorrowDay = parseInt(tomorrowDateForMonthStart.slice(8, 10), 10);
+        if (!Number.isNaN(tomorrowDay) && tomorrowDay <= 3 && chikushuMonthStartStats) {
+          pushSignal75("月初（1〜3日）", chikushuMonthStartStats.hitRate, chikushuMonthStartStats.sampleSize, SIGNAL_WEIGHTS.chikushuMonthStart);
+        }
+
+        // ②G数のページ内相対順位（今日のG数が同日コホート内で上位20%か）
+        const lastRow = ySeries[ySeries.length - 1];
+        if (lastRow && lastRow.gsu !== null && lastRow.gsu !== undefined && chikushuGsuRankStats) {
+          const sameDay = pageHistoryByDate[lastDate];
+          if (sameDay) {
+            const gsuVals = sameDay.machines.map((m) => m.gsu).filter((v) => v !== null && v !== undefined).sort((a, b) => a - b);
+            if (gsuVals.length >= 5) {
+              const n = gsuVals.length;
+              let lo = 0, hi = n;
+              while (lo < hi) { const mid = (lo + hi) >> 1; if (gsuVals[mid] < lastRow.gsu) lo = mid + 1; else hi = mid; }
+              const rank = lo / n;
+              if (rank >= 0.8) {
+                pushSignal75("G数のページ内相対順位（本日上位20%）", chikushuGsuRankStats.hitRate, chikushuGsuRankStats.sampleSize, SIGNAL_WEIGHTS.chikushuGsuPageRank);
+              }
+            }
+          }
+        }
+
+        // ③先週同曜日（7日前）にY>=75だったか
+        if (chikushuLastWeekStats) {
+          const tomorrowDate = addDays(lastDate, 1);
+          const targetDate = addDays(tomorrowDate, -7);
+          const targetY = (pageYByDateParam[targetDate] || {})[no];
+          if (targetY !== null && targetY !== undefined && targetY >= CHIKUSHU_Y_HIT_THRESHOLD) {
+            pushSignal75("先週同曜日にY≥75だった", chikushuLastWeekStats.hitRate, chikushuLastWeekStats.sampleSize, SIGNAL_WEIGHTS.chikushuLastWeekSameWeekday);
           }
         }
       }
