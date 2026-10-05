@@ -507,6 +507,7 @@ const DIGIT7_COLOR = "#f6a04d";
 // 方式（hitsSoFarを1個ずつ加算）に書き換えてO(日数)に軽量化。他の新規
 // 判定材料（カバネリ・マイジャグ・喰種）や機種別サマリー側
 // （computeOverallSummarySignals）には同様の重い書き方は無いことを確認済み。
+// v6.42: 予想対象日を「最終データ日の翌日」から「次の営業日（店休日を飛ばす）」に変更。見出しと日付系シグナル（曜日・月初月末・日付末尾・イベント・先週同曜日）に反映。
 // v6.41: v6.40の軽量化だけでは再現しなかった（Safariでも同じ症状）ため、
 // jsdom＋react-dom/clientで実際のブラウザマウント〜useEffectのデータ読込
 // までを再現するテスト環境を新たに用意し、実データ（本番相当のFirestore
@@ -519,7 +520,7 @@ const DIGIT7_COLOR = "#f6a04d";
 // いた。正しくはコンポーネント全体で使っているdateEventMap（state）を
 // 参照するのが意図だったので、`dateEventMap[tomorrowDate]`に修正。修正後、
 // 同じ統合テストでエラーなく最後まで描画できることを確認。
-const APP_VERSION = "6.41";
+const APP_VERSION = "6.42";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -541,6 +542,14 @@ function addDays(dateStr, days) {
   const d = new Date(dateStr);
   d.setDate(d.getDate() + days);
   return d.toISOString().slice(0, 10);
+}
+// v6.42: 店休日を飛ばした「次の営業日」。予想対象日の決定に使う。
+// closedDays（共通の店休日）は描画のたびに下で更新される。
+let CURRENT_CLOSED_DATES = new Set();
+function nextOpenDate(dateStr) {
+  let d = addDays(dateStr, 1);
+  for (let i = 0; i < 60 && CURRENT_CLOSED_DATES.has(d); i++) d = addDays(d, 1);
+  return d;
 }
 
 // Parse pasted hall-data table text into an array of machine records.
@@ -1864,7 +1873,7 @@ function computeSettingExpectationForPage(machineNumbers, pageSortedHistory, pag
   const pageBaseX = allXCount > 0 ? allXSum / allXCount : 0;
   const referenceDate = pageSortedHistory.length > 0 ? pageSortedHistory[pageSortedHistory.length - 1].date : null;
   if (!referenceDate) return [];
-  const tomorrowDate = addDays(referenceDate, 1);
+  const tomorrowDate = nextOpenDate(referenceDate);
 
   // v6.14: 台番号ごとの.find()呼び出しを毎回繰り返すと機種数×日数の
   // 二乗オーダーになって重い（スマホでの動作が重いという指摘への対策）。
@@ -3218,6 +3227,7 @@ export default function SlotDataTracker() {
   }, [currentHistory]);
 
   const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
+  CURRENT_CLOSED_DATES = closedDateSet; // v6.42: 予想対象日の計算用
 
   // v6.7: アナスロの保存本体。1週間1キーへの複数日連続保存で途中の日付が
   // 消える競合状態対策として、①ref をawaitの前に同期更新する、②同じ週
@@ -3792,7 +3802,7 @@ export default function SlotDataTracker() {
 
     const referenceDate = pageSortedHistory.length > 0 ? pageSortedHistory[pageSortedHistory.length - 1].date : null;
     if (!referenceDate) return results;
-    const tomorrowDate = addDays(referenceDate, 1);
+    const tomorrowDate = nextOpenDate(referenceDate);
     const tomorrowDigit = parseInt(tomorrowDate.slice(-2), 10) % 10;
     const tomorrowEventNames = splitEventNames(dateEventMap[tomorrowDate] || "");
 
@@ -4181,7 +4191,7 @@ export default function SlotDataTracker() {
       // v6.38: 喰種専用の3判定材料。すべて「翌日Y≥75」基準（pushSignal75）。
       if (pageNameParam === "喰種" && chikushuBaseHitRate75 !== null) {
         // ①月初(1〜3日)：明日の日付が1〜3日かどうか
-        const tomorrowDateForMonthStart = addDays(lastDate, 1);
+        const tomorrowDateForMonthStart = nextOpenDate(lastDate);
         const tomorrowDay = parseInt(tomorrowDateForMonthStart.slice(8, 10), 10);
         if (!Number.isNaN(tomorrowDay) && tomorrowDay <= 3 && chikushuMonthStartStats) {
           pushSignal75("月初（1〜3日）", chikushuMonthStartStats.hitRate, chikushuMonthStartStats.sampleSize, SIGNAL_WEIGHTS.chikushuMonthStart);
@@ -4207,7 +4217,7 @@ export default function SlotDataTracker() {
 
         // ③先週同曜日（7日前）にY>=75だったか
         if (chikushuLastWeekStats) {
-          const tomorrowDate = addDays(lastDate, 1);
+          const tomorrowDate = nextOpenDate(lastDate);
           const targetDate = addDays(tomorrowDate, -7);
           const targetY = (pageYByDateParam[targetDate] || {})[no];
           if (targetY !== null && targetY !== undefined && targetY >= CHIKUSHU_Y_HIT_THRESHOLD) {
@@ -4216,7 +4226,7 @@ export default function SlotDataTracker() {
         }
 
         // ④月末(21〜31日)
-        const tomorrowDateForMonthEnd = addDays(lastDate, 1);
+        const tomorrowDateForMonthEnd = nextOpenDate(lastDate);
         const tomorrowDayForEnd = parseInt(tomorrowDateForMonthEnd.slice(8, 10), 10);
         if (!Number.isNaN(tomorrowDayForEnd) && tomorrowDayForEnd >= 21 && chikushuMonthEndStats) {
           pushSignal75("月末（21〜31日）", chikushuMonthEndStats.hitRate, chikushuMonthEndStats.sampleSize, SIGNAL_WEIGHTS.chikushuMonthEnd);
@@ -4225,7 +4235,7 @@ export default function SlotDataTracker() {
 
       // v6.39: カバネリ専用「翌日が日曜かつイベント無し」
       if (pageNameParam === "カバネリ" && kabaneriSundayNoEventStats) {
-        const tomorrowDate = addDays(lastDate, 1);
+        const tomorrowDate = nextOpenDate(lastDate);
         const tomorrowIsSunday = new Date(tomorrowDate + "T00:00:00Z").getUTCDay() === 0;
         const tomorrowEntry = pageHistoryByDate[tomorrowDate];
         const tomorrowHasEvent = tomorrowEntry ? !!tomorrowEntry.event : !!dateEventMap[tomorrowDate];
@@ -4250,7 +4260,7 @@ export default function SlotDataTracker() {
         }
         // ②（イベント無し日限定）直近3日差枚平均≥1000
         if (myjagSadaTrendNoEventStats) {
-          const tomorrowDate = addDays(lastDate, 1);
+          const tomorrowDate = nextOpenDate(lastDate);
           const tomorrowEntry = pageHistoryByDate[tomorrowDate];
           const tomorrowHasEvent = tomorrowEntry ? !!tomorrowEntry.event : true; // 未登録日は判定材料自体を出さない（安全側）
           if (tomorrowEntry && !tomorrowHasEvent) {
@@ -4277,7 +4287,7 @@ export default function SlotDataTracker() {
         }
         // ②5日前にY≥85だった
         if (atypeLag5Stats) {
-          const tomorrowDate = addDays(lastDate, 1);
+          const tomorrowDate = nextOpenDate(lastDate);
           const lagDate = addDays(tomorrowDate, -5);
           const lagY = (pageYByDateParam[lagDate] || {})[no];
           if (lagY !== null && lagY !== undefined && lagY >= 85) {
@@ -7388,9 +7398,12 @@ export default function SlotDataTracker() {
             <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
               {(() => {
                 if (sortedHistory.length === 0) return "ピックアップ";
-                const targetDate = addDays(sortedHistory[sortedHistory.length - 1].date, 1);
+                const targetDate = nextOpenDate(sortedHistory[sortedHistory.length - 1].date);
                 const [, m, d] = targetDate.split("-");
-                return `${parseInt(m, 10)}/${parseInt(d, 10)}のピックアップ`;
+                const lastD = sortedHistory[sortedHistory.length - 1].date;
+                const skipped = [];
+                for (let x = addDays(lastD, 1); x < targetDate; x = addDays(x, 1)) skipped.push(`${parseInt(x.slice(5, 7), 10)}/${parseInt(x.slice(8, 10), 10)}`);
+                return `${parseInt(m, 10)}/${parseInt(d, 10)}のピックアップ${skipped.length ? `（${skipped.join("・")}は店休日）` : ""}`;
               })()}
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
