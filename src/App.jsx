@@ -29,6 +29,14 @@ import {
 } from "lucide-react";
 import { storage as rawStorage } from "./storage";
 
+// v6.46: 機種プルダウン（正式名称・おすすめ機種期間・イベント対象機種。台数の多い順、表記ゆれは1つに、手入力も残す）。
+//        イベント対象機種：📅イベント登録で日付ごとに対象機種を指定（slot-date-event-targets-v1、タグをタップで編集）、
+//        「🎯いつも同じ対象機種のイベント」カード（slot-event-targets-v1）。全体データのマトリクスで対象機種のセルを黄色に、
+//        「イベントを選択して過去を見る」にその日の対象機種の平均差枚・マークを表示。（予想エンジン・ピックアップには使っていない）
+// v6.45: データなしの日（slot-no-data-days-v1、共通設定の店休日の下に登録、グラフに赤い帯「なし」、アナスロ/個別台の保存で自動解除）。
+//        ピックアップ予想日は店休日・データなし・民レポだけの日を飛ばし、見出しに理由を表示。入力欄は保存後に次の日（店休日は飛ばす）へ進み、
+//        店休日は入力不可（グレー表示）、民レポにも登録済み表示、個別台は「○○ データ一覧」から機種を自動判定、
+//        アナスロが2機種を1つの名前で出す台は台番号→機種の対応（slot-no-model-map-v1）として個別台の保存時に覚える。
 // v6.44: 民レポとアナスロのずれチェック（共通設定にカード・保存直後の黄色警告・日付一覧に⚠ずれ・取り違えた日の推定）、
 //        機種名の別名（slot-model-aliases-v1、条件がそろった時だけ自動登録、怪しい別名の警告と一括削除）、
 //        台数が合わない機種の期間一覧。機種名の正規化に括弧書き除去・接頭辞の繰り返し除去を追加。バラエティ行に台番号を保持。
@@ -124,6 +132,10 @@ function rawFullTableWeekKey(date) {
 }
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
 const MODEL_ALIASES_KEY = "slot-model-aliases-v1";
+const NO_DATA_DAYS_KEY = "slot-no-data-days-v1"; // v6.45: [{date}]
+const EVENT_TARGETS_KEY = "slot-event-targets-v1"; // v6.46: {イベント名: [機種名]} いつも同じ対象機種のイベント
+const DATE_EVENT_TARGETS_KEY = "slot-date-event-targets-v1"; // v6.46: {日付: {イベント名: [機種名]}} 毎回対象が違うイベント（3×3など）
+const NO_MODEL_MAP_KEY = "slot-no-model-map-v1"; // v6.45: {台番号: {model, anasloName}}
 
 // v6.43: 民レポ（全体データ）の週分割保存。旧キー OVERALL_SUMMARY_KEY は
 // 1つのキーに全日分を入れていたため、貯まると約1MB上限で黙って保存に失敗する
@@ -678,7 +690,7 @@ const DIGIT7_COLOR = "#f6a04d";
 // いた。正しくはコンポーネント全体で使っているdateEventMap（state）を
 // 参照するのが意図だったので、`dateEventMap[tomorrowDate]`に修正。修正後、
 // 同じ統合テストでエラーなく最後まで描画できることを確認。
-const APP_VERSION = "6.44";
+const APP_VERSION = "6.46";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -704,7 +716,22 @@ function addDays(dateStr, days) {
 // v6.42: 店休日を飛ばした「次の営業日」。予想対象日の決定に使う。
 // closedDays（共通の店休日）は描画のたびに下で更新される。
 let CURRENT_CLOSED_DATES = new Set();
+// v6.45: データなしの日（サイト障害などで取れなかった営業日）と、民レポだけがある日（結果はもう分かっている日）も飛ばす
+let CURRENT_NO_DATA_DATES = new Set();
+let CURRENT_MINREPO_ONLY_DATES = new Set();
+function skipReasonOf(d) {
+  if (CURRENT_CLOSED_DATES.has(d)) return "店休日";
+  if (CURRENT_NO_DATA_DATES.has(d)) return "データなし";
+  if (CURRENT_MINREPO_ONLY_DATES.has(d)) return "民レポのみ";
+  return null;
+}
 function nextOpenDate(dateStr) {
+  let d = addDays(dateStr, 1);
+  for (let i = 0; i < 60 && skipReasonOf(d); i++) d = addDays(d, 1);
+  return d;
+}
+// 入力欄の日付を進める用：店休日だけを飛ばす
+function nextEntryDate(dateStr) {
   let d = addDays(dateStr, 1);
   for (let i = 0; i < 60 && CURRENT_CLOSED_DATES.has(d); i++) d = addDays(d, 1);
   return d;
@@ -829,6 +856,20 @@ function normalizeModelNameForMatch(name) {
 }
 // v6.44: 別名（アナスロ側の表記→民レポ側の正式名称）。描画のたびに更新される。
 let CURRENT_MODEL_ALIASES = {};
+// v6.45: アナスロが2機種を1つの名前でまとめて出している台用の「台番号→機種」の上書き。
+// 覚えた時点のアナスロ表記（anasloName）と今の表記が同じ時だけ有効（新台入れ替えで自動的に無効になる）。
+let CURRENT_NO_MODEL_MAP = {};
+function applyNoModelMap(rows) {
+  const m = CURRENT_NO_MODEL_MAP;
+  if (!rows || Object.keys(m).length === 0) return rows;
+  return rows.map((r) => {
+    const o = m[r.no];
+    if (o && o.model && (!o.anasloName || normalizeModelNameForMatch(o.anasloName) === normalizeModelNameForMatch(r.modelName))) {
+      return { ...r, modelName: o.model };
+    }
+    return r;
+  });
+}
 function resolveModelKey(name) {
   const n = normalizeModelNameForMatch(name);
   const a = CURRENT_MODEL_ALIASES[n];
@@ -859,7 +900,8 @@ function groupAnasloByModel(anasloRows, varietyNos) {
   });
   return groups;
 }
-function compareMinrepoAnaslo(overall, anasloRows) {
+function compareMinrepoAnaslo(overall, anasloRowsIn) {
+  const anasloRows = applyNoModelMap(anasloRowsIn);
   const varietyNos = new Set(overall.modelRows.filter((r) => r.isVariety && r.no !== undefined && r.no !== null).map((r) => r.no));
   const groups = groupAnasloByModel(anasloRows, varietyNos);
   const byNo = new Map(anasloRows.map((r) => [r.no, r]));
@@ -912,7 +954,8 @@ function namesSimilar(a, b) {
 }
 const sadaClose = (a, b) => a !== null && a !== undefined && b !== null && b !== undefined && Math.abs(a - b) <= Math.max(30, Math.abs(b) * 0.03);
 // 同じ日の民レポとアナスロを機種ごとに突き合わせる。
-function reconcileSameDay(overall, anasloRows) {
+function reconcileSameDay(overall, anasloRowsIn) {
+  const anasloRows = applyNoModelMap(anasloRowsIn);
   const res = { matched: [], suggestions: [], varietyAliases: [], varietyConflicts: [], countMismatch: [], minrepoOnly: [], anasloOnly: [] };
   if (!overall || !anasloRows || anasloRows.length === 0) return res;
   const nameCount = new Map();
@@ -1133,6 +1176,58 @@ function serializeFullStoreRows(rows) {
 // 合成／BB率／RB率（アナスロの列順「機種名→台番号→G数→差枚」とは違い、
 // 差枚がG数より先、出率が直接入っている点に注意）。ヘッダー行（先頭に
 // 「台番」を含む行、表の途中で繰り返される）と「平均」行はスキップする。
+// v6.45: 民レポ個別台の表は先頭に「○○ データ一覧」の行がある。そこから機種名を読む。
+// v6.46: 機種プルダウン＋手入力つきの機種選択（選んだ機種はプルダウンから消える）。
+// options: [{key, name, count}]（台数の多い順）
+function ModelPicker({ names, onAdd, onRemove, options, placeholder, disabled, icon = "🎯" }) {
+  const [v, setV] = useState("");
+  const add = () => { const t = v.trim(); if (!t) return; onAdd(t); setV(""); };
+  const chosen = new Set((names || []).map((n) => resolveModelKey(n)));
+  const opts = (options || []).filter((o) => !chosen.has(o.key));
+  return (
+    <div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "6px" }}>
+        {(names || []).map((n) => (
+          <span key={n} style={{ display: "inline-flex", alignItems: "center", gap: "4px", fontSize: "11.5px", background: "rgba(232,179,76,0.10)", border: "1px solid #3a3320", borderRadius: "999px", padding: "2px 6px 2px 8px", wordBreak: "break-all" }}>
+            {icon ? `${icon} ` : ""}{n}
+            {!disabled && (
+              <button onClick={() => onRemove(n)} style={{ background: "none", border: "none", color: "#5a6272", cursor: "pointer", padding: 0, display: "flex" }}><X size={10} /></button>
+            )}
+          </span>
+        ))}
+        {(!names || names.length === 0) && <span style={{ fontSize: "11px", color: "#5a6272" }}>未登録</span>}
+      </div>
+      <select
+        value=""
+        disabled={disabled}
+        onChange={(e) => { if (e.target.value) onAdd(e.target.value); }}
+        style={{ width: "100%", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px", padding: "6px 8px", color: "#e7e9ee", fontSize: "12px", marginBottom: "6px", boxSizing: "border-box" }}
+      >
+        <option value="">{opts.length ? `▼ 機種を選んで追加（台数の多い順・${opts.length}機種）` : "（民レポ・アナスロを貼ると機種が選べます）"}</option>
+        {opts.map((o) => <option key={o.key} value={o.name}>{o.name}{o.count ? `（${o.count}台）` : ""}</option>)}
+      </select>
+      <div style={{ display: "flex", gap: "6px" }}>
+        <input
+          value={v}
+          disabled={disabled}
+          onChange={(e) => setV(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
+          placeholder={placeholder || "一覧に無い機種（新台など）は手入力"}
+          style={{ flex: 1, minWidth: 0, background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px", padding: "5px 8px", color: "#e7e9ee", fontSize: "12px" }}
+        />
+        <button onClick={add} disabled={disabled} style={{ fontSize: "12px", background: "none", border: "1px solid #2a323f", borderRadius: "6px", color: "#8b93a3", padding: "5px 10px", cursor: disabled ? "not-allowed" : "pointer", whiteSpace: "nowrap" }}>追加</button>
+      </div>
+    </div>
+  );
+}
+function detectMinRepoIndividualModel(text) {
+  const lines = String(text || "").split(/\r?\n/).slice(0, 6);
+  for (const raw of lines) {
+    const m = raw.trim().normalize("NFKC").match(/^(.+?)\s*データ一覧/);
+    if (m && m[1].trim()) return m[1].trim();
+  }
+  return null;
+}
 function parseMinRepoIndividualTable(text, modelName) {
   const lines = text
     .split(/\r?\n/)
@@ -2490,6 +2585,16 @@ export default function SlotDataTracker() {
   const [overallSummariesLoaded, setOverallSummariesLoaded] = useState(false);
   const [saveError, setSaveError] = useState(null); // v6.43: 保存失敗の赤いバナー
   const [saveWarn, setSaveWarn] = useState(null); // v6.44: ずれ警告（黄）
+  const [eventTargets, setEventTargets] = useState({}); // v6.46
+  const [dateEventTargets, setDateEventTargets] = useState({}); // v6.46
+  const [futureEventTargetModels, setFutureEventTargetModels] = useState([]);
+  const [editTargetsFor, setEditTargetsFor] = useState(null); // {date, tag}
+  const [alwaysTargetEvent, setAlwaysTargetEvent] = useState("");
+  const [noModelMap, setNoModelMap] = useState({});
+  const [noDataDays, setNoDataDays] = useState([]); // v6.45: [{date}] 営業していたのにデータが取れない日
+  const [noDataStart, setNoDataStart] = useState(todayStr());
+  const [noDataEnd, setNoDataEnd] = useState(todayStr());
+  const [noDataStatus, setNoDataStatus] = useState(null);
   const [modelAliases, setModelAliases] = useState({}); // v6.44: {アナスロ側の正規化名: 民レポ側の正式名称}
   const [saveNotice, setSaveNotice] = useState(null);
   const latestRef = useRef({}); // v6.43: 保存失敗時に画面を元に戻すため、最新のstateを保持
@@ -2706,6 +2811,38 @@ export default function SlotDataTracker() {
         setRawFullTableLoaded(true);
       }
       try {
+        const rEt = await storage.get(EVENT_TARGETS_KEY, false);
+        if (rEt && rEt.value) {
+          const val = JSON.parse(rEt.value);
+          if (val && typeof val === "object" && !Array.isArray(val)) setEventTargets(val);
+        }
+        const rDet = await storage.get(DATE_EVENT_TARGETS_KEY, false);
+        if (rDet && rDet.value) {
+          const val = JSON.parse(rDet.value);
+          if (val && typeof val === "object" && !Array.isArray(val)) setDateEventTargets(val);
+        }
+      } catch (e) {
+        // none yet
+      }
+      try {
+        const rNmm = await storage.get(NO_MODEL_MAP_KEY, false);
+        if (rNmm && rNmm.value) {
+          const val = JSON.parse(rNmm.value);
+          if (val && typeof val === "object" && !Array.isArray(val)) setNoModelMap(val);
+        }
+      } catch (e) {
+        // none yet
+      }
+      try {
+        const rNoData = await storage.get(NO_DATA_DAYS_KEY, false);
+        if (rNoData && rNoData.value) {
+          const val = JSON.parse(rNoData.value);
+          if (Array.isArray(val)) setNoDataDays(val);
+        }
+      } catch (e) {
+        // none yet
+      }
+      try {
         const rAlias = await storage.get(MODEL_ALIASES_KEY, false);
         if (rAlias && rAlias.value) {
           const val = JSON.parse(rAlias.value);
@@ -2808,6 +2945,10 @@ export default function SlotDataTracker() {
     }
   }, []);
 
+  const persistEventTargets = useCallback((next) => commitState("いつも同じ対象機種のイベント", () => latestRef.current.eventTargets, setEventTargets, (v) => storage.set(EVENT_TARGETS_KEY, JSON.stringify(v), false), next), []);
+  const persistDateEventTargets = useCallback((next) => commitState("イベントの対象機種", () => latestRef.current.dateEventTargets, setDateEventTargets, (v) => storage.set(DATE_EVENT_TARGETS_KEY, JSON.stringify(v), false), next), []);
+  const persistNoModelMap = useCallback((next) => commitState("台番号と機種の対応", () => latestRef.current.noModelMap, setNoModelMap, (v) => storage.set(NO_MODEL_MAP_KEY, JSON.stringify(v), false), next), []);
+  const persistNoDataDays = useCallback((next) => commitState("データなしの日", () => latestRef.current.noDataDays, setNoDataDays, (v) => storage.set(NO_DATA_DAYS_KEY, JSON.stringify(v), false), next), []);
   const persistModelAliases = useCallback((next) => commitState("機種名の別名", () => latestRef.current.modelAliases, setModelAliases, (v) => storage.set(MODEL_ALIASES_KEY, JSON.stringify(v), false), next), []);
 
   const persistPages = useCallback((next) => commitState("ページ設定", () => latestRef.current.pages, setPages, (v) => storage.set(PAGES_KEY, JSON.stringify(v), false), next), []);
@@ -2847,7 +2988,7 @@ export default function SlotDataTracker() {
       const byDate = new Map(existingHistory.map((h) => [h.date, h]));
       let changed = false;
       dates.forEach((date) => {
-        const rows = rawFullTableRef.current[date] || [];
+        const rows = applyNoModelMap(rawFullTableRef.current[date] || []);
         const matched = rows.filter((r) => nameList.some((n) => modelNamesMatch(r.modelName, n)));
         if (matched.length === 0) return;
         const existingEntry = byDate.get(date);
@@ -2925,9 +3066,13 @@ export default function SlotDataTracker() {
       const autoEvent = existingEntry ? existingEntry.event : (dateEventMap[date] || "").trim();
       const nextEntry = { date, event: autoEvent, machines: finalMachines };
       const nextHistory = existingHistory.filter((h) => h.date !== date).concat([nextEntry]).sort((a, b) => (a.date < b.date ? -1 : 1));
-      await persistPageHistory(pageId, nextHistory);
+      const okSave = await persistPageHistory(pageId, nextHistory);
+      if (okSave && (latestRef.current.noDataDays || []).some((c) => c.date === date)) {
+        persistNoDataDays((latestRef.current.noDataDays || []).filter((c) => c.date !== date));
+      }
+      return okSave;
     },
-    [pageHistories, dateEventMap, persistPageHistory]
+    [pageHistories, dateEventMap, persistPageHistory, persistNoDataDays]
   );
 
   // v6.32: 民レポ個別台データ入力フォームの保存ハンドラ。ページ選択→
@@ -2950,6 +3095,10 @@ export default function SlotDataTracker() {
       setMinRepoIndividualStatus({ type: "error", msg: "機種を選んでください。" });
       return;
     }
+    if (closedDateSet.has(minRepoIndividualDate)) {
+      setMinRepoIndividualStatus({ type: "error", msg: `${minRepoIndividualDate} は店休日です。入力できません。` });
+      return;
+    }
     if (!minRepoIndividualPasteText.trim()) {
       setMinRepoIndividualStatus({ type: "error", msg: "データを貼り付けてください。" });
       return;
@@ -2959,8 +3108,36 @@ export default function SlotDataTracker() {
       setMinRepoIndividualStatus({ type: "error", msg: "有効な行が見つかりませんでした。貼り付け形式を確認してください。" });
       return;
     }
-    await saveMinRepoIndividualEntry(minRepoIndividualPageId, minRepoIndividualDate, modelName, rows);
-    setMinRepoIndividualStatus({ type: "ok", msg: `${minRepoIndividualDate}（${modelName}）を${rows.length}台分保存しました。あとでアナスロにこの日のデータが来ると自動的に上書きされます。` });
+    const okInd = await saveMinRepoIndividualEntry(minRepoIndividualPageId, minRepoIndividualDate, modelName, rows);
+    if (okInd === false) {
+      setMinRepoIndividualStatus({ type: "error", msg: "保存に失敗しました。上の赤い表示を確認してください。" });
+      return;
+    }
+    // v6.45: アナスロが2機種を1つの名前でまとめている台は、台番号→機種の対応として覚える
+    let learnedMsg = "";
+    {
+      const nos = new Set(rows.map((r) => r.no));
+      const dates = Object.keys(rawFullTable).sort().reverse();
+      const add = {};
+      for (const d of dates) {
+        const day = rawFullTable[d];
+        const hit = day.filter((r) => nos.has(r.no));
+        if (hit.length === 0) continue;
+        hit.forEach((a) => {
+          if (modelNamesMatch(a.modelName, modelName)) return;
+          const sameNameCount = day.filter((x) => modelNamesMatch(x.modelName, a.modelName)).length;
+          if (sameNameCount > nos.size) add[a.no] = { model: modelName, anasloName: a.modelName };
+        });
+        break;
+      }
+      const addKeys = Object.keys(add).filter((k) => !noModelMap[k] || noModelMap[k].model !== add[k].model);
+      if (addKeys.length > 0) {
+        persistNoModelMap({ ...noModelMap, ...add });
+        learnedMsg = `（アナスロが別の機種名でまとめている台${addKeys.length}台を、台番号と「${modelName}」の対応として覚えました）`;
+      }
+    }
+    setMinRepoIndividualStatus({ type: "ok", msg: `${minRepoIndividualDate}（${modelName}）を${rows.length}台分保存しました。あとでアナスロにこの日のデータが来ると自動的に上書きされます。${learnedMsg}` });
+    { const nd = nextEntryDate(minRepoIndividualDate); if (nd <= todayStr()) setMinRepoIndividualDate(nd); } // v6.45
   }
 
 
@@ -3087,6 +3264,14 @@ export default function SlotDataTracker() {
       setOverallSummaries(value || []);
     } else if (storageKey === MODEL_ALIASES_KEY) {
       setModelAliases(value || {});
+    } else if (storageKey === EVENT_TARGETS_KEY) {
+      setEventTargets(value || {});
+    } else if (storageKey === DATE_EVENT_TARGETS_KEY) {
+      setDateEventTargets(value || {});
+    } else if (storageKey === NO_MODEL_MAP_KEY) {
+      setNoModelMap(value || {});
+    } else if (storageKey === NO_DATA_DAYS_KEY) {
+      setNoDataDays(value || []);
     } else if (storageKey === CLOSED_DAYS_KEY) {
       setClosedDays(value || []);
     } else if (storageKey === STRONG_EVENTS_KEY) {
@@ -3126,6 +3311,10 @@ export default function SlotDataTracker() {
   }
 
   function handleSaveOverall() {
+    if (closedDateSet.has(overallDate)) {
+      setOverallStatus({ type: "error", msg: `${overallDate} は店休日です。入力できません。` });
+      return;
+    }
     if (!overallDate) {
       setOverallStatus({ type: "error", msg: "日付を入力してください。" });
       return;
@@ -3151,6 +3340,7 @@ export default function SlotDataTracker() {
         msg: `${overallDate} のデータを保存しました（機種${modelRows.length}件・末尾${digitRows.length}件）。`,
       });
       setOverallPasteText("");
+      { const nd = nextEntryDate(overallDate); if (nd <= todayStr()) setOverallDate(nd); } // v6.45: 保存後は次の日（店休日は飛ばす）へ
     });
   }
 
@@ -3283,6 +3473,10 @@ export default function SlotDataTracker() {
       rawFullTable,
       eventNames,
       modelAliases,
+      noDataDays,
+      noModelMap,
+      eventTargets,
+      dateEventTargets,
     };
     const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -3573,8 +3767,15 @@ export default function SlotDataTracker() {
 
   const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
   CURRENT_CLOSED_DATES = closedDateSet; // v6.42: 予想対象日の計算用
-  latestRef.current = { pages, pageHistories, pageRecommends, overallRecommends, eventNames, strongEvents, semiEvents, closedDays, dateEventMap, overallSummaries, modelAliases };
+  latestRef.current = { pages, pageHistories, pageRecommends, overallRecommends, eventNames, strongEvents, semiEvents, closedDays, dateEventMap, overallSummaries, modelAliases, noDataDays, noModelMap, eventTargets, dateEventTargets };
   CURRENT_MODEL_ALIASES = modelAliases;
+  CURRENT_NO_MODEL_MAP = noModelMap;
+  CURRENT_NO_DATA_DATES = new Set(noDataDays.map((c) => c.date));
+  {
+    // 民レポだけがある日（アナスロ・個別台がどのページにも無い日）。レンダー毎に作るが軽い
+    const overallDatesNow = new Set(overallSummaries.map((x) => x.date));
+    CURRENT_MINREPO_ONLY_DATES = new Set([...overallDatesNow].filter((d) => !rawFullTable[d] && !Object.values(pageHistories).some((h) => Array.isArray(h) && h.some((e) => e.date === d))));
+  }
 
   // v6.7: アナスロの保存本体。1週間1キーへの複数日連続保存で途中の日付が
   // 消える競合状態対策として、①ref をawaitの前に同期更新する、②同じ週
@@ -3686,7 +3887,7 @@ export default function SlotDataTracker() {
     for (const page of pages) {
       if (!page.officialName) continue;
       const nameList = splitModelNameList(page.officialName);
-      const matched = rows.filter((r) => nameList.some((n) => modelNamesMatch(r.modelName, n)));
+      const matched = applyNoModelMap(rows).filter((r) => nameList.some((n) => modelNamesMatch(r.modelName, n)));
       if (matched.length === 0) continue;
       const machines = matched.map((r) => ({
         no: r.no,
@@ -3713,14 +3914,17 @@ export default function SlotDataTracker() {
       rows.forEach((r) => { if (seenNos.has(r.no)) dup += 1; seenNos.add(r.no); });
       if (dup > 0) setSaveWarn(`${fullTableDate}：台番号が重複している行が${dup}件あります。同じ表を二重に貼り付けていませんか？（保存はしましたが台数・差枚が倍になっている可能性があります）`);
     }
+    if ((latestRef.current.noDataDays || []).some((c) => c.date === fullTableDate)) {
+      persistNoDataDays((latestRef.current.noDataDays || []).filter((c) => c.date !== fullTableDate));
+    }
     checkDriftAfterSave(fullTableDate, latestRef.current.overallSummaries || [], nextRaw);
     setFullTableStatus({
       type: "ok",
       msg: `${fullTableDate} のデータを保存しました（全${rows.length}台分、うち${updatedPageCount}ページに反映）。`,
     });
     setFullTablePasteText("");
-    setFullTableDate(addDays(fullTableDate, -1));
-  }, [fullTablePasteText, fullTableDate, pages, pageHistories, dateEventMap, closedDateSet, persistPageHistory, checkDriftAfterSave]);
+    { const nd = nextEntryDate(fullTableDate); if (nd <= todayStr()) setFullTableDate(nd); } // v6.45: 保存後は次の日（店休日は飛ばす）へ
+  }, [fullTablePasteText, fullTableDate, pages, pageHistories, dateEventMap, closedDateSet, persistPageHistory, checkDriftAfterSave, persistNoDataDays]);
 
   // this PAGE's own recommend periods, for its own machines' predictions
   const recommendDateSet = useMemo(() => {
@@ -3740,8 +3944,9 @@ export default function SlotDataTracker() {
     const minDate = historyDates[0];
     const maxDate = historyDates[historyDates.length - 1];
     const closedInRange = closedDays.map((c) => c.date).filter((d) => d >= minDate && d <= maxDate);
-    return Array.from(new Set([...historyDates, ...closedInRange])).sort((a, b) => a.localeCompare(b));
-  }, [sortedHistory, closedDays]);
+    const noDataInRange = noDataDays.map((c) => c.date).filter((d) => d >= minDate && d <= maxDate);
+    return Array.from(new Set([...historyDates, ...closedInRange, ...noDataInRange])).sort((a, b) => a.localeCompare(b));
+  }, [sortedHistory, closedDays, noDataDays]);
 
   const visibleTimelineDates = useMemo(() => {
     if (useCustomRange && customStart && customEnd) {
@@ -3790,6 +3995,11 @@ export default function SlotDataTracker() {
     const visibleDates = new Set(visibleTimelineDates);
     return strongDatesInHistory.filter((se) => visibleDates.has(se.date));
   }, [strongDatesInHistory, visibleTimelineDates]);
+
+  const noDataDatesInView = useMemo(() => {
+    const visibleDates = new Set(visibleTimelineDates);
+    return noDataDays.filter((c) => visibleDates.has(c.date));
+  }, [noDataDays, visibleTimelineDates]);
 
   const closedDatesInView = useMemo(() => {
     const visibleDates = new Set(visibleTimelineDates);
@@ -3894,11 +4104,12 @@ export default function SlotDataTracker() {
       const seriesDates = new Set(series.map((s) => s.date));
       const strongInSeries = strongDatesInHistory.filter((se) => seriesDates.has(se.date));
       const closedInSeries = closedDays.filter((c) => seriesDates.has(c.date));
+      const noDataInSeries = noDataDays.filter((c) => seriesDates.has(c.date));
       const digit2InSeries = series.map((s) => s.date).filter((d) => parseInt(d.slice(-2), 10) % 10 === 2);
       const digit7InSeries = series.map((s) => s.date).filter((d) => parseInt(d.slice(-2), 10) % 10 === 7);
-      return { no, totalSada, dataCount, series, strongInSeries, closedInSeries, digit2InSeries, digit7InSeries };
+      return { no, totalSada, dataCount, series, strongInSeries, closedInSeries, noDataInSeries, digit2InSeries, digit7InSeries };
     });
-  }, [selectedMachines, visibleTimelineDates, historyByDate, strongDatesInHistory, closedDays]);
+  }, [selectedMachines, visibleTimelineDates, historyByDate, strongDatesInHistory, closedDays, noDataDays]);
 
   // "○のつく日" (e.g. digit 2 → the 2nd/12th/22nd) average 差枚 per machine,
   // computed across this page's entire recorded history (not limited by range)
@@ -4872,6 +5083,7 @@ export default function SlotDataTracker() {
       const d = driftTable[o.date];
       if (!d || d.level !== "ok") return;
       reconcileSameDay(o, rows).suggestions.forEach((sg) => {
+        if (/差枚順/.test(sg.minrepoName)) return; // 並べ替えボタンの文言が混ざった古い民レポ（修正前に保存された分）は候補にしない
         const k = normalizeModelNameForMatch(sg.anasloName);
         if (modelAliases[k]) return;
         const key = `${k}=>${sg.minrepoName}`;
@@ -4977,6 +5189,46 @@ export default function SlotDataTracker() {
 
   // past occurrences of the selected event, reusing dailyStoreTotals (which
   // already has totals + ☆◎◯▲ marks computed per date)
+  // v6.46: その日のイベントの対象機種。日付ごとの指定（3×3など）があればそれを優先し、
+  // 無ければ「いつも同じ対象機種のイベント」の設定を使う。
+  const overallSortedSummariesForPicker = useMemo(() => [...overallSummaries].sort((a, b) => a.date.localeCompare(b.date)), [overallSummaries]);
+  const targetModelsOn = useCallback((date) => {
+    const out = [];
+    splitEventNames(dateEventMap[date] || "").forEach((ev) => {
+      const byDate = dateEventTargets[date] && dateEventTargets[date][ev];
+      const list = byDate !== undefined ? byDate : (eventTargets[ev] || []);
+      list.forEach((m) => out.push({ event: ev, model: m, key: resolveModelKey(m) }));
+    });
+    return out;
+  }, [dateEventMap, dateEventTargets, eventTargets]);
+  const targetKeySetOn = useCallback((date) => new Set(targetModelsOn(date).map((t) => t.key)), [targetModelsOn]);
+
+  // 機種プルダウンの選択肢：今のデータに出てくる機種（アナスロの最新日＋民レポの最新日）を台数の多い順に。表記ゆれは1つにまとめる。
+  const modelPickerOptions = useMemo(() => {
+    const map = new Map();
+    const dates = Object.keys(rawFullTable).sort();
+    if (dates.length > 0) {
+      const rows = applyNoModelMap(rawFullTable[dates[dates.length - 1]] || []);
+      rows.forEach((r) => {
+        if (!r.modelName) return;
+        const k = resolveModelKey(r.modelName);
+        if (!map.has(k)) map.set(k, { key: k, name: r.modelName, count: 0 });
+        map.get(k).count += 1;
+      });
+    }
+    if (overallSortedSummariesForPicker.length > 0) {
+      const last = overallSortedSummariesForPicker[overallSortedSummariesForPicker.length - 1];
+      last.modelRows.forEach((r) => {
+        const k = resolveModelKey(r.name);
+        const n = r.isVariety ? 1 : r.total || 0;
+        if (!map.has(k)) map.set(k, { key: k, name: r.name, count: n });
+        else if (map.get(k).count === 0) map.get(k).count = n;
+        else map.get(k).name = r.name; // 表示名は民レポ側（正式名称）に寄せる
+      });
+    }
+    return Array.from(map.values()).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  }, [rawFullTable, overallSortedSummariesForPicker]);
+
   const eventHistoryResults = useMemo(() => {
     if (!eventHistorySelection) return [];
     return dailyStoreTotals.filter((d) => d.event && splitEventNames(d.event).includes(eventHistorySelection));
@@ -5280,6 +5532,46 @@ export default function SlotDataTracker() {
     persistSemiEvents(semiEvents.filter((s) => s.name !== name));
   }
 
+  // v6.45: データなしの日の登録（開始日〜終了日をまとめて）。アナスロがすでにある日・店休日は登録しない。
+  function handleAddNoDataRange() {
+    if (!noDataStart || !noDataEnd || noDataEnd < noDataStart) {
+      setNoDataStatus({ type: "error", msg: "開始日と終了日を正しく入力してください（終了日は開始日以降）。" });
+      return;
+    }
+    const days = enumerateDateRange(noDataStart, noDataEnd);
+    if (days.length > 62) {
+      setNoDataStatus({ type: "error", msg: "一度に登録できるのは62日分までです。" });
+      return;
+    }
+    const have = new Set(noDataDays.map((c) => c.date));
+    const added = [];
+    const skippedClosed = [];
+    const skippedData = [];
+    days.forEach((d) => {
+      if (have.has(d)) return;
+      if (closedDateSet.has(d)) { skippedClosed.push(d); return; }
+      if (rawFullTable[d] && rawFullTable[d].length > 0) { skippedData.push(d); return; }
+      added.push(d);
+    });
+    if (added.length === 0) {
+      setNoDataStatus({ type: "error", msg: `登録できる日がありません（店休日${skippedClosed.length}日・アナスロがある日${skippedData.length}日は登録できません）。` });
+      return;
+    }
+    pushUndoEntry(`データなしの日 ${added.length}日分を登録`, NO_DATA_DAYS_KEY, noDataDays);
+    persistNoDataDays([...noDataDays, ...added.map((d) => ({ date: d }))]).then((ok) => {
+      if (!ok) return;
+      setNoDataStatus({
+        type: "ok",
+        msg: `${added.length}日分を登録しました` + (skippedClosed.length || skippedData.length ? `（店休日${skippedClosed.length}日・アナスロがある日${skippedData.length}日は除外）` : "") + "。",
+      });
+    });
+  }
+
+  function handleRemoveNoDataDay(date) {
+    pushUndoEntry(`データなしの日 ${date} を解除`, NO_DATA_DAYS_KEY, noDataDays);
+    persistNoDataDays(noDataDays.filter((c) => c.date !== date));
+  }
+
   function handleAddClosedDay() {
     if (!closedDate) {
       setClosedStatus({ type: "error", msg: "日付を入力してください。" });
@@ -5385,6 +5677,13 @@ export default function SlotDataTracker() {
     const combined = joinEventNames([...existingNames, name]);
     await upsertDateEvent(futureEventDate, combined);
     rememberEventName(name);
+    if (futureEventTargetModels.length > 0) {
+      await persistDateEventTargets({
+        ...dateEventTargets,
+        [futureEventDate]: { ...(dateEventTargets[futureEventDate] || {}), [name]: futureEventTargetModels },
+      });
+      setFutureEventTargetModels([]);
+    }
     const msg =
       existingNames.length > 0
         ? `${futureEventDate} に「${name}」を追加しました（登録済み：${combined}）。既に保存済みの全ページのデータも更新しました。`
@@ -5395,6 +5694,16 @@ export default function SlotDataTracker() {
   }
 
   async function handleRemoveDateEvent(date, tagName) {
+    if (dateEventTargets[date]) {
+      const nextDet = { ...dateEventTargets };
+      if (tagName) {
+        const inner = { ...nextDet[date] };
+        delete inner[tagName];
+        if (Object.keys(inner).length === 0) delete nextDet[date]; else nextDet[date] = inner;
+      } else delete nextDet[date];
+      pushUndoEntry(`イベントの対象機種 ${date} を削除`, DATE_EVENT_TARGETS_KEY, dateEventTargets);
+      persistDateEventTargets(nextDet);
+    }
     const existingNames = splitEventNames(dateEventMap[date]);
     const remainingNames = tagName ? existingNames.filter((n) => n !== tagName) : [];
     const remainingComposite = joinEventNames(remainingNames);
@@ -5556,7 +5865,7 @@ export default function SlotDataTracker() {
     );
   }
 
-  function renderMarkGrid(dates, rows, marksMap, rowLabelFn, varietyCells, rowStartDateMap) {
+  function renderMarkGrid(dates, rows, marksMap, rowLabelFn, varietyCells, rowStartDateMap, targetCellFn) {
     if (rows.length === 0 || dates.length === 0) {
       return <div style={{ fontSize: "12px", color: "#5a6272" }}>表示できるデータがまだありません。</div>;
     }
@@ -5593,15 +5902,16 @@ export default function SlotDataTracker() {
                   const beforeGenerationStart = rowStartDateMap && rowStartDateMap[row] && d < rowStartDateMap[row];
                   const mark = !beforeGenerationStart && marksMap[row] && marksMap[row][d];
                   const isVarietyCell = varietyCells && varietyCells.has(`${d}|${row}`);
+                  const isTargetCell = !!(targetCellFn && targetCellFn(row, d));
                   return (
                     <td
                       key={d}
                       className="mono"
-                      title={beforeGenerationStart ? "この台番号は別の機種でした" : (isVarietyCell ? "バラエティコーナー（1台設置）" : undefined)}
+                      title={beforeGenerationStart ? "この台番号は別の機種でした" : (isTargetCell ? "イベントの対象機種" : (isVarietyCell ? "バラエティコーナー（1台設置）" : undefined))}
                       style={{
                         padding: "4px 3px", textAlign: "center", color: mark ? markColor(mark) : "#2a323f", borderBottom: "1px solid #1c2129",
-                        background: isVarietyCell ? "rgba(122,162,247,0.18)" : undefined,
-                        boxShadow: isVarietyCell ? "inset 0 0 0 1px rgba(122,162,247,0.5)" : undefined,
+                        background: isTargetCell ? "rgba(232,179,76,0.30)" : (isVarietyCell ? "rgba(122,162,247,0.18)" : undefined),
+                        boxShadow: isTargetCell ? "inset 0 0 0 1px rgba(232,179,76,0.7)" : (isVarietyCell ? "inset 0 0 0 1px rgba(122,162,247,0.5)" : undefined),
                       }}
                     >
                       {mark || "・"}
@@ -5936,6 +6246,15 @@ export default function SlotDataTracker() {
                 }}
               />
             </div>
+            {closedDateSet.has(overallDate) ? (
+              <div style={{ fontSize: "12px", color: "#c7cbd4", marginBottom: "10px", padding: "7px 8px", background: "#232b37", border: "1px solid #2a323f", borderRadius: "6px" }}>
+                🚫 {overallDate} は店休日です。入力できません。
+              </div>
+            ) : (
+              <div style={{ fontSize: "11px", marginBottom: "10px", color: overallSummaries.some((x) => x.date === overallDate) ? "#9ece6a" : "#5a6272" }}>
+                {overallSummaries.some((x) => x.date === overallDate) ? "この日は登録済み（保存すると上書き）" : "この日はまだ未登録です"}
+              </div>
+            )}
             {dateEventMap[overallDate] && (
               <div style={{
                 fontSize: "12px", color: "#e8b34c", marginBottom: "10px", padding: "7px 8px",
@@ -5950,6 +6269,7 @@ export default function SlotDataTracker() {
               className="mono scrollbar"
               value={overallPasteText}
               onChange={(e) => setOverallPasteText(e.target.value)}
+              disabled={closedDateSet.has(overallDate)}
               placeholder={"機種\t平均差枚\t平均G数\t勝率\t出率\nLアズールレーン THE ANIMATION\t3,500\t3,596\t2/4\t132.4%\n...\n末尾別データ\n末尾\t平均差枚\t平均G数\t勝率\t出率\n0\t868\t5,513\t24/56\t105.2%\n..."}
               rows={12}
               style={{
@@ -5960,9 +6280,11 @@ export default function SlotDataTracker() {
             />
             <button
               onClick={handleSaveOverall}
+              disabled={closedDateSet.has(overallDate)}
               style={{
                 width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: closedDateSet.has(overallDate) ? "not-allowed" : "pointer",
+                opacity: closedDateSet.has(overallDate) ? 0.4 : 1,
               }}
             >
               この日のデータを保存
@@ -5994,11 +6316,20 @@ export default function SlotDataTracker() {
                 <div style={{ marginTop: "4px", fontSize: "11px", color: rawFullTable[fullTableDate] ? "#9ece6a" : "#5a6272" }}>
                   {rawFullTable[fullTableDate] ? `この日は登録済み（${rawFullTable[fullTableDate].length}台分）` : "この日はまだ未登録です"}
                 </div>
+                {closedDateSet.has(fullTableDate) && (
+                  <div style={{ marginTop: "6px", fontSize: "12px", color: "#c7cbd4", padding: "7px 8px", background: "#232b37", border: "1px solid #2a323f", borderRadius: "6px" }}>
+                    🚫 {fullTableDate} は店休日です。入力できません。
+                  </div>
+                )}
+                {noDataDays.some((c) => c.date === fullTableDate) && !closedDateSet.has(fullTableDate) && (
+                  <div style={{ marginTop: "6px", fontSize: "11px", color: "#e5697a" }}>📭 この日は「データなしの日」に登録されています（保存すると自動で外れます）</div>
+                )}
               </div>
               <textarea
                 className="mono scrollbar"
                 value={fullTablePasteText}
                 onChange={(e) => setFullTablePasteText(e.target.value)}
+                disabled={closedDateSet.has(fullTableDate)}
                 placeholder={"機種名\t台番号\tG数\t差枚\tBB\tRB\t合成確率\tBB確率\tRB確率\nモンキーターンV\t185\t4,318\t169\t40\t15\t1/78.5\t1/108.0\t1/287.9\n..."}
                 rows={10}
                 style={{
@@ -6009,9 +6340,11 @@ export default function SlotDataTracker() {
               />
               <button
                 onClick={() => handleSaveFullTable()}
+                disabled={closedDateSet.has(fullTableDate)}
                 style={{
                   width: "100%", background: "#4fd1c5", color: "#0b1f1c", border: "none", borderRadius: "8px",
-                  padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                  padding: "10px", fontWeight: 700, fontSize: "13px", cursor: closedDateSet.has(fullTableDate) ? "not-allowed" : "pointer",
+                  opacity: closedDateSet.has(fullTableDate) ? 0.4 : 1,
                 }}
               >
                 この日の一括データを保存
@@ -6259,7 +6592,24 @@ export default function SlotDataTracker() {
             <textarea
               className="mono scrollbar"
               value={minRepoIndividualPasteText}
-              onChange={(e) => setMinRepoIndividualPasteText(e.target.value)}
+              onChange={(e) => {
+                const text = e.target.value;
+                setMinRepoIndividualPasteText(text);
+                // v6.45: 先頭の「○○ データ一覧」から機種名を自動判定（複数機種ページなら機種を自動で選ぶ）
+                const detected = detectMinRepoIndividualModel(text);
+                if (detected) {
+                  const pg = pages.find((p) => p.id === minRepoIndividualPageId);
+                  const opts = pg ? splitModelNameList(pg.officialName || "") : [];
+                  const hit = opts.find((n) => modelNamesMatch(n, detected));
+                  if (hit) {
+                    if (opts.length > 1) setMinRepoIndividualModelName(hit);
+                    setMinRepoIndividualStatus({ type: "ok", msg: `貼り付けた表の機種「${detected}」を判定しました。` });
+                  } else if (pg) {
+                    setMinRepoIndividualStatus({ type: "error", msg: `貼り付けた表は「${detected}」ですが、選んでいるページの機種に含まれていません。ページを確認してください。` });
+                  }
+                }
+              }}
+              disabled={closedDateSet.has(minRepoIndividualDate)}
               placeholder={"台番\t差枚\tG数\t出率\tBB\tRB\t合成\tBB率\tRB率\n110\t-3,303\t5,856\t81.2%\t0\t13\t1/450\t-\t1/450\n..."}
               rows={10}
               style={{
@@ -6268,11 +6618,18 @@ export default function SlotDataTracker() {
                 boxSizing: "border-box", marginBottom: "10px",
               }}
             />
+            {closedDateSet.has(minRepoIndividualDate) && (
+              <div style={{ fontSize: "12px", color: "#c7cbd4", marginBottom: "10px", padding: "7px 8px", background: "#232b37", border: "1px solid #2a323f", borderRadius: "6px" }}>
+                🚫 {minRepoIndividualDate} は店休日です。入力できません。
+              </div>
+            )}
             <button
               onClick={handleSaveMinRepoIndividual}
+              disabled={closedDateSet.has(minRepoIndividualDate)}
               style={{
                 width: "100%", background: "#e8b34c", color: "#1b1508", border: "none", borderRadius: "8px",
-                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: "pointer",
+                padding: "10px", fontWeight: 700, fontSize: "13px", cursor: closedDateSet.has(minRepoIndividualDate) ? "not-allowed" : "pointer",
+                opacity: closedDateSet.has(minRepoIndividualDate) ? 0.4 : 1,
               }}
             >
               この日・この機種のデータを保存
@@ -6510,6 +6867,14 @@ export default function SlotDataTracker() {
             </div>
             <div style={{ marginBottom: "10px" }}>
               <label style={{ fontSize: "11px", color: "#8b93a3" }}>機種名</label>
+              <select
+                value=""
+                onChange={(e) => { if (e.target.value) setOverallRecommendModelName(e.target.value); }}
+                style={{ width: "100%", marginTop: "4px", marginBottom: "6px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px", padding: "6px 8px", color: "#e7e9ee", fontSize: "12px", boxSizing: "border-box" }}
+              >
+                <option value="">▼ 機種を選ぶ（台数の多い順・{modelPickerOptions.length}機種）</option>
+                {modelPickerOptions.map((o) => <option key={o.key} value={o.name}>{o.name}{o.count ? `（${o.count}台）` : ""}</option>)}
+              </select>
               <input
                 type="text"
                 list={MODEL_NAME_DATALIST_ID}
@@ -6755,6 +7120,15 @@ export default function SlotDataTracker() {
                 }}
               />
             </div>
+            <div style={{ marginBottom: "8px" }}>
+              <div style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "4px" }}>対象機種（任意・3×3のように、この日だけ対象が決まるイベント用）</div>
+              <ModelPicker
+                names={futureEventTargetModels}
+                options={modelPickerOptions}
+                onAdd={(n) => setFutureEventTargetModels((prev) => (prev.some((x) => resolveModelKey(x) === resolveModelKey(n)) ? prev : [...prev, n]))}
+                onRemove={(n) => setFutureEventTargetModels((prev) => prev.filter((x) => x !== n))}
+              />
+            </div>
             <button
               onClick={handleAddFutureEvent}
               style={{
@@ -6775,7 +7149,7 @@ export default function SlotDataTracker() {
                 .sort((a, b) => b[0].localeCompare(a[0]))
                 .map(([d, composite]) => (
                   <div key={d} style={{
-                    display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
+                    display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", fontSize: "12px",
                     background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "5px 8px", gap: "8px",
                   }}>
                     <span className="mono" style={{ color: "#7aa2f7", flexShrink: 0 }}>{d}</span>
@@ -6785,7 +7159,18 @@ export default function SlotDataTracker() {
                           display: "inline-flex", alignItems: "center", gap: "4px",
                           background: "#1b212b", borderRadius: "4px", padding: "2px 6px", color: "#c7cbd4",
                         }}>
-                          {tag}
+                          <span
+                            onClick={() => setEditTargetsFor(editTargetsFor && editTargetsFor.date === d && editTargetsFor.tag === tag ? null : { date: d, tag })}
+                            style={{ cursor: "pointer", textDecoration: "underline dotted", textUnderlineOffset: "3px" }}
+                            title="タップで対象機種を編集"
+                          >
+                            {tag}
+                            {(() => {
+                              const byDate = dateEventTargets[d] && dateEventTargets[d][tag];
+                              const n = byDate !== undefined ? byDate.length : (eventTargets[tag] || []).length;
+                              return n > 0 ? <span style={{ marginLeft: "3px", color: "#e8b34c" }}>🎯{n}</span> : null;
+                            })()}
+                          </span>
                           <button
                             onClick={() => handleRemoveDateEvent(d, tag)}
                             style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272", padding: 0, display: "flex" }}
@@ -6796,12 +7181,79 @@ export default function SlotDataTracker() {
                         </span>
                       ))}
                     </span>
+                    {editTargetsFor && editTargetsFor.date === d && (
+                      <div style={{ flexBasis: "100%", marginTop: "6px", paddingTop: "6px", borderTop: "1px solid #232b37" }}>
+                        <div style={{ fontSize: "11px", color: "#8b93a3", marginBottom: "4px" }}>
+                          {d}「{editTargetsFor.tag}」の対象機種
+                          {!(dateEventTargets[d] && dateEventTargets[d][editTargetsFor.tag] !== undefined) && (eventTargets[editTargetsFor.tag] || []).length > 0 ? "（今は『いつも同じ対象機種』の設定を使っています。変更するとこの日だけの設定になります）" : ""}
+                        </div>
+                        {(() => {
+                          const tag = editTargetsFor.tag;
+                          const byDate = dateEventTargets[d] && dateEventTargets[d][tag];
+                          const cur = byDate !== undefined ? byDate : (eventTargets[tag] || []);
+                          const save = (list) => persistDateEventTargets({ ...dateEventTargets, [d]: { ...(dateEventTargets[d] || {}), [tag]: list } });
+                          return (
+                            <ModelPicker
+                              names={cur}
+                              options={modelPickerOptions}
+                              onAdd={(n) => { if (!cur.some((x) => resolveModelKey(x) === resolveModelKey(n))) save([...cur, n]); }}
+                              onRemove={(n) => save(cur.filter((x) => x !== n))}
+                            />
+                          );
+                        })()}
+                      </div>
+                    )}
                   </div>
                 ))}
               {Object.keys(dateEventMap).length === 0 && (
                 <div style={{ fontSize: "11px", color: "#5a6272" }}>登録されたイベントはまだありません。</div>
               )}
             </div>
+          </div>
+
+          {/* v6.46: いつも同じ対象機種のイベント */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              🎯 いつも同じ対象機種のイベント
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px", lineHeight: 1.6 }}>
+              「毎回この機種が対象」のイベントを登録します（例：イベント名「○○の日」→ 対象は ○○）。登録しておくと、そのイベントがある日に自動で対象機種として扱われます。3×3のように毎回対象が変わるイベントは、上の「イベント登録」で日付ごとに対象機種を指定してください。
+            </div>
+            <select
+              value={alwaysTargetEvent}
+              onChange={(e) => setAlwaysTargetEvent(e.target.value)}
+              style={{ width: "100%", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px", padding: "7px 8px", color: "#e7e9ee", fontSize: "12px", marginBottom: "8px", boxSizing: "border-box" }}
+            >
+              <option value="">イベント名を選択...</option>
+              {allKnownEventNames.map((n) => (
+                <option value={n} key={n}>{n}{(eventTargets[n] || []).length > 0 ? `（対象${eventTargets[n].length}機種）` : ""}</option>
+              ))}
+            </select>
+            {alwaysTargetEvent && (
+              <ModelPicker
+                names={eventTargets[alwaysTargetEvent] || []}
+                options={modelPickerOptions}
+                onAdd={(n) => {
+                  const cur = eventTargets[alwaysTargetEvent] || [];
+                  if (cur.some((x) => resolveModelKey(x) === resolveModelKey(n))) return;
+                  persistEventTargets({ ...eventTargets, [alwaysTargetEvent]: [...cur, n] });
+                }}
+                onRemove={(n) => {
+                  const cur = eventTargets[alwaysTargetEvent] || [];
+                  const list = cur.filter((x) => x !== n);
+                  const next = { ...eventTargets };
+                  if (list.length === 0) delete next[alwaysTargetEvent]; else next[alwaysTargetEvent] = list;
+                  persistEventTargets(next);
+                }}
+              />
+            )}
+            {Object.keys(eventTargets).length > 0 && (
+              <div style={{ marginTop: "10px", fontSize: "11px", color: "#8b93a3", display: "flex", flexDirection: "column", gap: "4px", wordBreak: "break-all" }}>
+                {Object.entries(eventTargets).map(([ev, list]) => (
+                  <div key={ev}>🎯 <span style={{ color: "#c7cbd4" }}>{ev}</span> → {list.join("、")}</div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* v6.44: 民レポとアナスロのずれチェック／機種名の別名 */}
@@ -6974,6 +7426,47 @@ export default function SlotDataTracker() {
               {closedDays.length === 0 && (
                 <div style={{ fontSize: "11px", color: "#5a6272" }}>登録された店休日はまだありません。</div>
               )}
+            </div>
+
+          </div>
+
+          {/* v6.45: データなしの日（営業していたのにデータが取れない日） */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              📭 データなしの日
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px", lineHeight: 1.6 }}>
+              営業していたのに、サイト障害などでデータが取れなかった日を登録します。全ページのグラフに赤い帯「なし」で表示され、ピックアップの予想日はこの日を飛ばします。アナスロがすでにある日・店休日は登録できません。アナスロか個別台を保存すると、その日の印は自動で外れます。
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginBottom: "8px", alignItems: "flex-end" }}>
+              <div style={{ flex: "1 1 130px" }}>
+                <label style={{ fontSize: "11px", color: "#8b93a3" }}>開始日</label>
+                <input type="date" value={noDataStart} onChange={(e) => { setNoDataStart(e.target.value); if (!noDataEnd || noDataEnd < e.target.value) setNoDataEnd(e.target.value); }}
+                  style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px", padding: "7px 6px", color: "#e7e9ee", fontSize: "12px" }} />
+              </div>
+              <div style={{ flex: "1 1 130px" }}>
+                <label style={{ fontSize: "11px", color: "#8b93a3" }}>終了日</label>
+                <input type="date" value={noDataEnd} onChange={(e) => setNoDataEnd(e.target.value)}
+                  style={{ display: "block", width: "100%", boxSizing: "border-box", marginTop: "4px", background: "#12161d", border: "1px solid #2a323f", borderRadius: "6px", padding: "7px 6px", color: "#e7e9ee", fontSize: "12px" }} />
+              </div>
+              <button onClick={handleAddNoDataRange}
+                style={{ background: "#7a2e2e", color: "#ffd9d9", border: "none", borderRadius: "6px", padding: "9px 14px", fontWeight: 700, fontSize: "12px", cursor: "pointer" }}>
+                登録
+              </button>
+            </div>
+            {noDataStatus && (
+              <div style={{ marginBottom: "8px", fontSize: "11px", color: noDataStatus.type === "ok" ? "#9ece6a" : "#e5697a" }}>{noDataStatus.msg}</div>
+            )}
+            <div className="scrollbar" style={{ maxHeight: "140px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+              {[...noDataDays].sort((a, b) => b.date.localeCompare(a.date)).map((c) => (
+                <div key={c.date} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: "12px", background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "5px 8px" }}>
+                  <span className="mono" style={{ color: "#e5697a" }}>{c.date}　なし</span>
+                  <button onClick={() => handleRemoveNoDataDay(c.date)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}>
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+              {noDataDays.length === 0 && <div style={{ fontSize: "11px", color: "#5a6272" }}>登録されたデータなしの日はまだありません。</div>}
             </div>
           </div>
 
@@ -7168,6 +7661,25 @@ export default function SlotDataTracker() {
                         {"　"}G数{d.avgGsu === null ? "―" : fmtNum(Math.round(d.avgGsu))}
                       </span>
                     </div>
+                    {(() => {
+                      const ts = targetModelsOn(d.date).filter((t) => t.event === eventHistorySelection);
+                      if (ts.length === 0) return null;
+                      const sm = overallSortedSummaries.find((x) => x.date === d.date);
+                      return (
+                        <div style={{ fontSize: "11px", marginBottom: "4px", color: "#e8b34c", wordBreak: "break-all" }}>
+                          {ts.map((t) => {
+                            const row = sm ? sm.modelRows.find((r) => resolveModelKey(r.name) === t.key) : null;
+                            const mk = row ? classifyMinRepoMark(row) : null;
+                            return (
+                              <div key={t.key}>
+                                🎯 {t.model}：{row && row.avgSada !== null && row.avgSada !== undefined ? `平均${row.avgSada >= 0 ? "+" : ""}${fmtNum(Math.round(row.avgSada))}枚` : "民レポに記載なし"}
+                                {mk ? <span style={{ marginLeft: "4px", color: markColor(mk) }}>{mk}</span> : null}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
                     {d.marks.length > 0 && (
                       <div style={{ fontSize: "11px" }}>
                         {d.marks.map((m, i) => (
@@ -7272,7 +7784,7 @@ export default function SlotDataTracker() {
               機種名を台数の多い順に並べ、日付ごとの☆◎◯▲を一覧表示します。イベントを選ぶと、そのイベントがあった日付だけに絞り込めます（複数選択可）。何も選ばない時は直近30日分を表示します。
             </div>
             {renderEventMultiSelect(overallGridEventFilter, setOverallGridEventFilter)}
-            {renderMarkGrid(overallGridDates, overallGridRows, overallGridMarks, (name) => name, overallGridVarietyCells)}
+            {renderMarkGrid(overallGridDates, overallGridRows, overallGridMarks, (name) => name, overallGridVarietyCells, undefined, (row, d) => targetKeySetOn(d).has(resolveModelKey(row)))}
           </div>
 
 
@@ -7371,6 +7883,23 @@ export default function SlotDataTracker() {
             <span style={{ fontSize: "11px", color: "#5a6272" }}>未設定です。下の欄から機種名を追加してください。</span>
           )}
         </div>
+        <select
+          value=""
+          disabled={!unlocked}
+          onChange={(e) => { if (e.target.value) addOfficialNameToPage(activePageId, e.target.value); }}
+          style={{ width: "100%", background: unlocked ? "#12161d" : "#0d1015", border: "1px solid #2a323f", borderRadius: "6px", padding: "6px 8px", color: unlocked ? "#e7e9ee" : "#5a6272", fontSize: "12px", marginBottom: "8px", boxSizing: "border-box" }}
+        >
+          {(() => {
+            const chosen = new Set(splitModelNameList(currentPage ? currentPage.officialName || "" : "").map((n) => resolveModelKey(n)));
+            const opts = modelPickerOptions.filter((o) => !chosen.has(o.key));
+            return (
+              <>
+                <option value="">{opts.length ? `▼ 機種を選んで追加（台数の多い順・${opts.length}機種）` : "（民レポ・アナスロを貼ると機種が選べます）"}</option>
+                {opts.map((o) => <option key={o.key} value={o.name}>{o.name}{o.count ? `（${o.count}台）` : ""}</option>)}
+              </>
+            );
+          })()}
+        </select>
         <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
           <input
             type="text"
@@ -7666,6 +8195,15 @@ export default function SlotDataTracker() {
                         label={{ value: "休", position: "insideTop", fill: "#c7cbd4", fontSize: 10 }} />
                     );
                   })}
+                  {noDataDatesInView.map((c) => {
+                    const dateList = chartData.map((d) => d.date);
+                    const band = getBandRange(dateList, c.date);
+                    if (!band) return null;
+                    return (
+                      <ReferenceArea key={"nodata-" + c.date} x1={band.x1} x2={band.x2} fill="#e5697a" fillOpacity={0.22} stroke="none"
+                        label={{ value: "なし", position: "insideTop", fill: "#ff9a9a", fontSize: 10 }} />
+                    );
+                  })}
                   {digit2DatesInView.map((d) => (
                     <ReferenceLine key={"d2-" + d} x={d} stroke={DIGIT2_COLOR} strokeDasharray="2 2" strokeOpacity={0.55}
                       label={{ value: "2", position: "top", fill: DIGIT2_COLOR, fontSize: 9 }} />
@@ -7860,6 +8398,12 @@ export default function SlotDataTracker() {
                             if (!band) return null;
                             return <ReferenceArea key={"m-closed-" + c.date} x1={band.x1} x2={band.x2} fill="#5a6272" fillOpacity={0.28} stroke="none" />;
                           })}
+                          {s.noDataInSeries.map((c) => {
+                            const dateList = s.series.map((d) => d.date);
+                            const band = getBandRange(dateList, c.date);
+                            if (!band) return null;
+                            return <ReferenceArea key={"m-nodata-" + c.date} x1={band.x1} x2={band.x2} fill="#e5697a" fillOpacity={0.22} stroke="none" />;
+                          })}
                           {s.digit2InSeries.map((d) => (
                             <ReferenceLine key={"m-d2-" + d} x={d} stroke={DIGIT2_COLOR} strokeDasharray="2 2" strokeOpacity={0.5} strokeWidth={1} />
                           ))}
@@ -7961,9 +8505,14 @@ export default function SlotDataTracker() {
                 const targetDate = nextOpenDate(sortedHistory[sortedHistory.length - 1].date);
                 const [, m, d] = targetDate.split("-");
                 const lastD = sortedHistory[sortedHistory.length - 1].date;
-                const skipped = [];
-                for (let x = addDays(lastD, 1); x < targetDate; x = addDays(x, 1)) skipped.push(`${parseInt(x.slice(5, 7), 10)}/${parseInt(x.slice(8, 10), 10)}`);
-                return `${parseInt(m, 10)}/${parseInt(d, 10)}のピックアップ${skipped.length ? `（${skipped.join("・")}は店休日）` : ""}`;
+                const byReason = {};
+                for (let x = addDays(lastD, 1); x < targetDate; x = addDays(x, 1)) {
+                  const why = skipReasonOf(x);
+                  if (!why) continue;
+                  (byReason[why] = byReason[why] || []).push(`${parseInt(x.slice(5, 7), 10)}/${parseInt(x.slice(8, 10), 10)}`);
+                }
+                const notes = Object.entries(byReason).map(([why, ds]) => `${ds.join("・")}は${why}`);
+                return `${parseInt(m, 10)}/${parseInt(d, 10)}のピックアップ${notes.length ? `（${notes.join("、")}）` : ""}`;
               })()}
             </div>
             <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px" }}>
