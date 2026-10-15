@@ -27,7 +27,42 @@ import {
   Lock,
   X,
 } from "lucide-react";
-import { storage } from "./storage";
+import { storage as rawStorage } from "./storage";
+
+// v6.44: 民レポとアナスロのずれチェック（共通設定にカード・保存直後の黄色警告・日付一覧に⚠ずれ・取り違えた日の推定）、
+//        機種名の別名（slot-model-aliases-v1、条件がそろった時だけ自動登録、怪しい別名の警告と一括削除）、
+//        台数が合わない機種の期間一覧。機種名の正規化に括弧書き除去・接頭辞の繰り返し除去を追加。バラエティ行に台番号を保持。
+// v6.43: 保存の安全化。storage.js本体には手を入れず、ここで包む。
+//  - 同じキーへの書き込みは必ず順番に行う（Promiseのキュー）
+//  - 書く前にサイズを測り、約1MB（Firestoreの1フィールド上限）を超えるなら書かずにエラー
+//  - 失敗は必ずthrowする（呼び出し側が「保存しました」を出さないため）
+const MAX_VALUE_BYTES = 1000000;
+function byteLength(str) {
+  try { return new TextEncoder().encode(str).length; } catch (e) { return str.length * 3; }
+}
+const storageWriteQueues = new Map();
+function enqueueStorageWrite(key, task) {
+  const prev = storageWriteQueues.get(key) || Promise.resolve();
+  const run = prev.catch(() => null).then(task);
+  const tail = run.catch(() => null);
+  storageWriteQueues.set(key, tail);
+  tail.then(() => { if (storageWriteQueues.get(key) === tail) storageWriteQueues.delete(key); });
+  return run;
+}
+const storage = {
+  get: (key, shared) => rawStorage.get(key, shared),
+  set: (key, value, shared) =>
+    enqueueStorageWrite(key, async () => {
+      const size = byteLength(typeof value === "string" ? value : String(value));
+      if (size > MAX_VALUE_BYTES) {
+        throw new Error(`データが大きすぎて保存できません（${Math.round(size / 1000)}KB／上限約1000KB）`);
+      }
+      const res = await rawStorage.set(key, value, shared);
+      if (!res) throw new Error("保存の応答がありませんでした");
+      return res;
+    }),
+  delete: (key, shared) => enqueueStorageWrite(key, async () => rawStorage.delete(key, shared)),
+};
 
 const PAGES_KEY = "slot-pages-v1";
 const historyKey = (pageId) => `slot-history-${pageId}`;
@@ -88,6 +123,126 @@ function rawFullTableWeekKey(date) {
   return `${RAW_FULLTABLE_KEY_PREFIX}week:${weekStartOf(date)}`;
 }
 const UNDO_HISTORY_KEY = "slot-undo-history-v1";
+const MODEL_ALIASES_KEY = "slot-model-aliases-v1";
+
+// v6.43: 民レポ（全体データ）の週分割保存。旧キー OVERALL_SUMMARY_KEY は
+// 1つのキーに全日分を入れていたため、貯まると約1MB上限で黙って保存に失敗する
+// 恐れがあった。週（月曜起点）ごとのキー＋索引キーに分ける。
+const OVERALL_SUMMARY_WEEK_PREFIX = "slot-overall-summary-v1:week:";
+const OVERALL_SUMMARY_INDEX_KEY = "slot-overall-summary-index-v1";
+const overallWeekSnapshot = {}; // weekStart -> 最後に保存した（または読み込んだ）JSON文字列
+const overallIndexWeeks = new Set(); // 索引に載っている週
+let overallWriteChain = Promise.resolve();
+
+function groupSummariesByWeek(list) {
+  const buckets = {};
+  list.forEach((s) => {
+    const w = weekStartOf(s.date);
+    if (!buckets[w]) buckets[w] = [];
+    buckets[w].push(s);
+  });
+  Object.values(buckets).forEach((arr) => arr.sort((a, b) => a.date.localeCompare(b.date)));
+  return buckets;
+}
+
+// 変わった週だけ書く → 索引 → 空になった週を削除。途中で失敗したらthrow。
+function writeOverallSummariesToStorage(next) {
+  const run = overallWriteChain.catch(() => null).then(async () => {
+    const buckets = groupSummariesByWeek(next);
+    const weeks = Object.keys(buckets).sort();
+    for (const w of weeks) {
+      const json = JSON.stringify(buckets[w]);
+      if (overallWeekSnapshot[w] === json) continue;
+      await storage.set(OVERALL_SUMMARY_WEEK_PREFIX + w, json, false);
+      overallWeekSnapshot[w] = json;
+    }
+    const emptied = Object.keys(overallWeekSnapshot).filter((w) => !buckets[w]);
+    const indexSet = new Set([...overallIndexWeeks, ...weeks]);
+    emptied.forEach((w) => indexSet.delete(w));
+    const indexJson = JSON.stringify(Array.from(indexSet).sort());
+    await storage.set(OVERALL_SUMMARY_INDEX_KEY, indexJson, false);
+    overallIndexWeeks.clear();
+    indexSet.forEach((w) => overallIndexWeeks.add(w));
+    for (const w of emptied) {
+      await storage.delete(OVERALL_SUMMARY_WEEK_PREFIX + w, false);
+      delete overallWeekSnapshot[w];
+    }
+    return true;
+  });
+  overallWriteChain = run.catch(() => null);
+  return run;
+}
+
+// 読み込み＋旧キーからの移行。旧キーは、週キーへの書き込みを読み戻して
+// 確認できるまで消さない（確認できたら "[]" にする）。
+async function loadOverallSummariesFromStorage() {
+  let weeks = null;
+  try {
+    const idx = await storage.get(OVERALL_SUMMARY_INDEX_KEY, false);
+    if (idx && idx.value) {
+      const parsed = JSON.parse(idx.value);
+      if (Array.isArray(parsed)) weeks = parsed;
+    }
+  } catch (e) {
+    throw new Error(`民レポの索引の読み込みに失敗しました：${e && e.message ? e.message : "不明"}`);
+  }
+  const loaded = [];
+  const failed = [];
+  if (weeks) {
+    const results = await Promise.all(
+      weeks.map(async (w) => {
+        try {
+          const r = await storage.get(OVERALL_SUMMARY_WEEK_PREFIX + w, false);
+          if (!r || !r.value) return { w, data: [] };
+          const data = JSON.parse(r.value);
+          return { w, data: Array.isArray(data) ? data : [] };
+        } catch (e) {
+          return { w, failed: true };
+        }
+      })
+    );
+    results.forEach((r) => {
+      overallIndexWeeks.add(r.w);
+      if (r.failed) { failed.push(r.w); return; }
+      overallWeekSnapshot[r.w] = JSON.stringify(r.data);
+      loaded.push(...r.data);
+    });
+  }
+  if (failed.length > 0) {
+    // 読めなかった週がある。旧キーの移行は行わず、読めた分だけ返す（書き込みは索引を壊さない作り）
+    const err = new Error(`民レポの一部（${failed.join(", ")}）の読み込みに失敗しました。再読み込みしてください。`);
+    err.partial = loaded;
+    throw err;
+  }
+  // 旧キー
+  let legacy = [];
+  try {
+    const old = await storage.get(OVERALL_SUMMARY_KEY, false);
+    if (old && old.value) {
+      const parsed = JSON.parse(old.value);
+      if (Array.isArray(parsed)) legacy = parsed;
+    }
+  } catch (e) {
+    legacy = [];
+  }
+  if (legacy.length === 0) return { list: loaded, migrated: 0 };
+  const have = new Set(loaded.map((x) => x.date));
+  const merged = [...loaded, ...legacy.filter((x) => x && x.date && !have.has(x.date))];
+  await writeOverallSummariesToStorage(merged);
+  // 読み戻して確認
+  const idx2 = await storage.get(OVERALL_SUMMARY_INDEX_KEY, false);
+  const weeks2 = idx2 && idx2.value ? JSON.parse(idx2.value) : [];
+  const back = [];
+  for (const w of weeks2) {
+    const r = await storage.get(OVERALL_SUMMARY_WEEK_PREFIX + w, false);
+    if (r && r.value) back.push(...JSON.parse(r.value));
+  }
+  const backDates = new Set(back.map((x) => x.date));
+  const ok = merged.every((x) => backDates.has(x.date));
+  if (!ok) throw new Error("民レポの週分割への移行を確認できませんでした（旧データはそのまま残してあります）");
+  await storage.set(OVERALL_SUMMARY_KEY, "[]", false);
+  return { list: merged, migrated: legacy.length };
+}
 const DATALIST_ID = "slot-event-name-options";
 const MODEL_NAME_DATALIST_ID = "slot-model-name-options";
 const FULLTABLE_MODEL_NAME_DATALIST_ID = "slot-fulltable-model-name-options";
@@ -507,6 +662,9 @@ const DIGIT7_COLOR = "#f6a04d";
 // 方式（hitsSoFarを1個ずつ加算）に書き換えてO(日数)に軽量化。他の新規
 // 判定材料（カバネリ・マイジャグ・喰種）や機種別サマリー側
 // （computeOverallSummarySignals）には同様の重い書き方は無いことを確認済み。
+// v6.43: 保存の安全化。storageを包んで（同一キーは順番書き込み・約1MB超は書かずにエラー・失敗は必ずthrow）、
+//        各persistは失敗時に画面を元に戻して赤バナーで通知。民レポ（全体データ）を週ごとのキー
+//        （slot-overall-summary-v1:week:YYYY-MM-DD）＋索引に分割し、旧キーは読み戻し確認後に空にする移行処理を追加。
 // v6.42: 予想対象日を「最終データ日の翌日」から「次の営業日（店休日を飛ばす）」に変更。見出しと日付系シグナル（曜日・月初月末・日付末尾・イベント・先週同曜日）に反映。
 // v6.41: v6.40の軽量化だけでは再現しなかった（Safariでも同じ症状）ため、
 // jsdom＋react-dom/clientで実際のブラウザマウント〜useEffectのデータ読込
@@ -520,7 +678,7 @@ const DIGIT7_COLOR = "#f6a04d";
 // いた。正しくはコンポーネント全体で使っているdateEventMap（state）を
 // 参照するのが意図だったので、`dateEventMap[tomorrowDate]`に修正。修正後、
 // 同じ統合テストでエラーなく最後まで描画できることを確認。
-const APP_VERSION = "6.42";
+const APP_VERSION = "6.44";
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -657,16 +815,212 @@ function markColor(mark) {
 // ダッシュや波ダッシュの字体違いだけで不一致になっていた）。
 function normalizeModelNameForMatch(name) {
   let s = (name || "").normalize("NFKC"); // 全角英数記号→半角、互換文字を統一
-  s = s.replace(/^(スマスロ|Sマイ|パチスロ|[SL])\s*/u, ""); // 機種名接頭辞を除去
+  s = s.replace(/[(（][^)）]*[)）]/gu, ""); // v6.44: 読みがな等の括弧書きを除去
   s = s.replace(/[〜～~]/gu, "~"); // 波ダッシュ類を統一
   s = s.replace(/[‐‑–—ー−―]/gu, "-"); // ダッシュ・長音記号類を統一
   s = s.replace(/\s+/gu, ""); // 空白（全角含む）を全部除去
+  // v6.44: 接頭辞を繰り返し除去（「スマスロ」「パチスロ」「スロット」「Sマイ」「S/L」）
+  for (let k = 0; k < 5; k++) {
+    const before = s;
+    s = s.replace(/^(スマスロ|Sマイ|パチスロ|スロット|[SLsl](?=[^a-zA-Z]|$))/u, "");
+    if (s === before) break;
+  }
   return s.toLowerCase().trim();
+}
+// v6.44: 別名（アナスロ側の表記→民レポ側の正式名称）。描画のたびに更新される。
+let CURRENT_MODEL_ALIASES = {};
+function resolveModelKey(name) {
+  const n = normalizeModelNameForMatch(name);
+  const a = CURRENT_MODEL_ALIASES[n];
+  return a ? normalizeModelNameForMatch(a) : n;
 }
 function modelNamesMatch(a, b) {
   if (!a || !b) return false;
   if (a === b) return true;
-  return normalizeModelNameForMatch(a) === normalizeModelNameForMatch(b);
+  return resolveModelKey(a) === resolveModelKey(b);
+}
+
+// =============================================================================
+// v6.44: 民レポとアナスロのずれチェック／機種名の照合（玉屋本店 v0.3.8 から移植、
+// プラザ2のデータ形式に合わせた）。民レポ＝overallSummaries の1日分
+// {modelRows:[{name,avgSada,avgGsu,total,isVariety,no?}]}、アナスロ＝rawFullTable[date]
+// の行 [{modelName,no,gsu,sada}]。
+// =============================================================================
+const DRIFT_OK = 100;
+const DRIFT_BAD = 400;
+const isIdleAnasloRow = (r) => !(r.gsu > 0) && !r.sada;
+function groupAnasloByModel(anasloRows, varietyNos) {
+  const groups = new Map();
+  anasloRows.forEach((r) => {
+    if (varietyNos.has(r.no)) return; // バラエティ欄の台は機種別の台数に入れない
+    const k = resolveModelKey(r.modelName);
+    if (!groups.has(k)) groups.set(k, { key: k, name: r.modelName, rows: [] });
+    groups.get(k).rows.push(r);
+  });
+  return groups;
+}
+function compareMinrepoAnaslo(overall, anasloRows) {
+  const varietyNos = new Set(overall.modelRows.filter((r) => r.isVariety && r.no !== undefined && r.no !== null).map((r) => r.no));
+  const groups = groupAnasloByModel(anasloRows, varietyNos);
+  const byNo = new Map(anasloRows.map((r) => [r.no, r]));
+  let mTotal = 0, mCount = 0, hidden = 0, errSum = 0, w = 0;
+  const aTotal = anasloRows.reduce((a, r) => a + (r.sada || 0), 0);
+  overall.modelRows.forEach((r) => {
+    const n = r.isVariety ? 1 : r.total || 0;
+    mCount += n;
+    if (r.avgSada === null || r.avgSada === undefined) { hidden += n; return; }
+    mTotal += r.avgSada * n;
+    if (r.isVariety && r.no !== undefined && r.no !== null) {
+      const a = byNo.get(r.no);
+      if (a && a.sada !== null && a.sada !== undefined) { errSum += Math.abs(a.sada - r.avgSada); w += 1; }
+      return;
+    }
+    const total = r.isVariety ? 1 : r.total;
+    let rows = (groups.get(resolveModelKey(r.name)) || {}).rows;
+    if (rows && rows.length !== total) { const act = rows.filter((x) => !isIdleAnasloRow(x)); rows = act.length === total ? act : null; }
+    if (!rows) return;
+    const vals = rows.map((x) => x.sada).filter((v) => v !== null && v !== undefined);
+    if (vals.length !== rows.length) return;
+    errSum += Math.abs(vals.reduce((a, b) => a + b, 0) / vals.length - r.avgSada) * total;
+    w += total;
+  });
+  return { mTotal, aTotal, diff: aTotal - mTotal, mCount, aCount: anasloRows.length, hidden, err: w ? errSum / w : null, matched: w };
+}
+function driftLevel(c) {
+  if (!c || c.err === null || c.matched < 20) return "unknown";
+  if (c.err <= DRIFT_OK) return "ok";
+  if (c.err <= DRIFT_BAD) return "warn";
+  return "bad";
+}
+// 機種名が似ているか（正規化した名前の最長共通部分が3文字以上かつ短い方の4割以上、または包含）
+function namesSimilar(a, b) {
+  const x = normalizeModelNameForMatch(a).replace(/[’'"]/g, ""), y = normalizeModelNameForMatch(b).replace(/[’'"]/g, "");
+  if (!x || !y) return false;
+  if (x.includes(y) || y.includes(x)) return true;
+  let best = 0;
+  const prev = new Array(y.length + 1).fill(0);
+  for (let i = 1; i <= x.length; i++) {
+    let diag = 0;
+    for (let j = 1; j <= y.length; j++) {
+      const tmp = prev[j];
+      prev[j] = x[i - 1] === y[j - 1] ? diag + 1 : 0;
+      if (prev[j] > best) best = prev[j];
+      diag = tmp;
+    }
+  }
+  return best >= 3 && best >= 0.4 * Math.min(x.length, y.length);
+}
+const sadaClose = (a, b) => a !== null && a !== undefined && b !== null && b !== undefined && Math.abs(a - b) <= Math.max(30, Math.abs(b) * 0.03);
+// 同じ日の民レポとアナスロを機種ごとに突き合わせる。
+function reconcileSameDay(overall, anasloRows) {
+  const res = { matched: [], suggestions: [], varietyAliases: [], varietyConflicts: [], countMismatch: [], minrepoOnly: [], anasloOnly: [] };
+  if (!overall || !anasloRows || anasloRows.length === 0) return res;
+  const nameCount = new Map();
+  anasloRows.forEach((r) => { const k = resolveModelKey(r.modelName); nameCount.set(k, (nameCount.get(k) || 0) + 1); });
+  const varietyNos = new Set(overall.modelRows.filter((r) => r.isVariety && r.no !== undefined && r.no !== null).map((r) => r.no));
+  const groups = groupAnasloByModel(anasloRows, varietyNos);
+  const byNo = new Map(anasloRows.map((r) => [r.no, r]));
+  const avg = (arr, f) => {
+    const v = arr.map(f).filter((x) => x !== null && x !== undefined);
+    return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+  };
+  const usedGroups = new Set();
+  const unmatchedMinrepo = [];
+  overall.modelRows.forEach((row) => {
+    if (row.isVariety && row.no !== undefined && row.no !== null) {
+      const a = byNo.get(row.no);
+      if (!a) { res.minrepoOnly.push(row); return; }
+      const ak = resolveModelKey(a.modelName);
+      const same = sadaClose(a.sada, row.avgSada);
+      if (ak !== resolveModelKey(row.name)) {
+        // 自動登録は「差枚がほぼ同じ」かつ「名前が似ている」時だけ（台移動の日・日付の取り違えによる誤登録対策）。
+        if (same && namesSimilar(a.modelName, row.name) && (nameCount.get(ak) || 0) <= 1) {
+          res.varietyAliases.push({ anasloName: a.modelName, minrepoName: row.name, no: row.no });
+        } else res.varietyConflicts.push({ no: row.no, minrepoName: row.name, anasloName: a.modelName, sameData: same });
+      }
+      return;
+    }
+    const k = resolveModelKey(row.name);
+    const g = groups.get(k);
+    const total = row.isVariety ? 1 : row.total;
+    if (!g) { unmatchedMinrepo.push(row); return; }
+    usedGroups.add(k);
+    let rows = g.rows;
+    let idleNos = [];
+    if (total !== g.rows.length) {
+      const active = g.rows.filter((r) => !isIdleAnasloRow(r));
+      if (active.length === total) { idleNos = g.rows.filter(isIdleAnasloRow).map((r) => r.no); rows = active; }
+    }
+    const item = { name: row.name, key: k, mCount: total, aCount: g.rows.length, mAvg: row.avgSada, aAvg: avg(rows, (r) => r.sada), idleNos };
+    res.matched.push(item);
+    if (total !== rows.length) res.countMismatch.push(item);
+  });
+  const freeGroups = [...groups.values()].filter((g) => !usedGroups.has(g.key));
+  unmatchedMinrepo.forEach((row) => {
+    const total = row.isVariety ? 1 : row.total;
+    const cands = freeGroups.filter((g) => {
+      if (g.rows.length !== total) return false;
+      const aAvg = avg(g.rows, (r) => r.sada);
+      if (aAvg === null || row.avgSada === null || row.avgSada === undefined) return false;
+      return Math.abs(aAvg - row.avgSada) <= Math.max(50, Math.abs(row.avgSada) * 0.03);
+    });
+    if (cands.length === 1) {
+      const g = cands[0];
+      res.suggestions.push({ minrepoName: row.name, anasloName: g.name, count: total, mAvg: row.avgSada, aAvg: avg(g.rows, (r) => r.sada) });
+    } else res.minrepoOnly.push(row);
+  });
+  res.countMismatch.forEach((it) => {
+    const extra = it.aCount - it.mCount;
+    const combo = res.minrepoOnly.find((r) => !r.isVariety && r.total === extra);
+    if (combo) it.comboWith = { name: combo.name, count: combo.total };
+  });
+  const suggested = new Set(res.suggestions.map((x) => resolveModelKey(x.anasloName)));
+  res.anasloOnly = freeGroups.filter((g) => !suggested.has(g.key)).map((g) => ({ name: g.name, count: g.rows.length }));
+  return res;
+}
+// 全期間のずれ一覧。各日について民レポとアナスロが両方あるものだけ判定する。
+function computeDriftTable(overallSummaries, rawFullTable) {
+  const out = {};
+  const byDate = {};
+  overallSummaries.forEach((o) => { byDate[o.date] = o; });
+  Object.keys(rawFullTable).forEach((d) => {
+    const o = byDate[d];
+    const rows = rawFullTable[d];
+    if (!o || !rows || rows.length === 0) return;
+    const c = compareMinrepoAnaslo(o, rows);
+    const level = driftLevel(c);
+    let guess = null;
+    if (level === "warn" || level === "bad") {
+      for (let k = -7; k <= 7 && !guess; k++) {
+        if (k === 0) continue;
+        const o2 = byDate[addDays(d, k)];
+        if (!o2) continue;
+        const c2 = compareMinrepoAnaslo(o2, rows);
+        if (driftLevel(c2) === "ok") guess = o2.date;
+      }
+    }
+    out[d] = { c, level, guess };
+  });
+  return out;
+}
+// 機種ごとの「民レポとアナスロで台数が合わない期間」。同じ台数の組み合わせが続いた期間は1行にまとめる。
+function computeCountMismatchHistory(overallSummaries, rawFullTable) {
+  const dates = overallSummaries.map((o) => o.date).filter((d) => rawFullTable[d] && rawFullTable[d].length > 0).sort();
+  const byDate = {};
+  overallSummaries.forEach((o) => { byDate[o.date] = o; });
+  const perModel = new Map();
+  dates.forEach((d) => {
+    const rec = reconcileSameDay(byDate[d], rawFullTable[d]);
+    rec.countMismatch.forEach((it) => {
+      if (!perModel.has(it.key)) perModel.set(it.key, { name: it.name, runs: [] });
+      const m = perModel.get(it.key);
+      const last = m.runs[m.runs.length - 1];
+      if (last && last.mCount === it.mCount && last.aCount === it.aCount && last.endIdx === dates.indexOf(d) - 1) {
+        last.end = d; last.endIdx = dates.indexOf(d);
+      } else m.runs.push({ start: d, end: d, mCount: it.mCount, aCount: it.aCount, endIdx: dates.indexOf(d), combo: it.comboWith ? it.comboWith.name : null });
+    });
+  });
+  return Array.from(perModel.values()).sort((a, b) => b.runs[b.runs.length - 1].end.localeCompare(a.runs[a.runs.length - 1].end));
 }
 
 // v6.8.18: shared 5-段階 strength scale (赤＞黄＞緑＞青＞灰、高いほど赤) —
@@ -855,6 +1209,7 @@ function parseSummaryTable(text) {
       continue; // header
     }
     if (line.includes("末尾") && line.includes("平均差枚")) continue; // digit-table header
+    if (line.includes("差枚順") && line.includes("G数順")) continue; // v6.44: 並べ替えボタンの文言が機種名に混ざるのを防ぐ
     if (line === "末尾別データ") continue; // section title
     if (line.includes("バラエティ") && line.includes("1台設置機種")) continue; // section title
 
@@ -873,8 +1228,10 @@ function parseSummaryTable(text) {
       const avgGsu = cols[3] === "-" || cols[3] === "" ? null : parseInt(cols[3].replace(/,/g, ""), 10);
       const shutsu = cols[4] === "-" ? 99.9 : cols[4] === "" ? null : parseFloat(cols[4].replace("%", ""));
       if (!name) continue;
+      const varietyNo = parseInt((cols[1] || "").normalize("NFKC").replace(/[^0-9]/g, ""), 10);
       rows.push({
         name,
+        ...(Number.isNaN(varietyNo) ? {} : { no: varietyNo }), // v6.44: ずれチェックで台番号を使う
         avgSada: Number.isNaN(avgSada) ? null : avgSada,
         avgGsu: Number.isNaN(avgGsu) ? null : avgGsu,
         wins: null,
@@ -2131,6 +2488,11 @@ export default function SlotDataTracker() {
   //      irregular entries, one snapshot per date ----
   const [overallSummaries, setOverallSummaries] = useState([]); // [{date,event,modelRows,digitRows}]
   const [overallSummariesLoaded, setOverallSummariesLoaded] = useState(false);
+  const [saveError, setSaveError] = useState(null); // v6.43: 保存失敗の赤いバナー
+  const [saveWarn, setSaveWarn] = useState(null); // v6.44: ずれ警告（黄）
+  const [modelAliases, setModelAliases] = useState({}); // v6.44: {アナスロ側の正規化名: 民レポ側の正式名称}
+  const [saveNotice, setSaveNotice] = useState(null);
+  const latestRef = useRef({}); // v6.43: 保存失敗時に画面を元に戻すため、最新のstateを保持
   const [overallDate, setOverallDate] = useState(todayStr());
   const [overallPasteText, setOverallPasteText] = useState("");
   const [overallStatus, setOverallStatus] = useState(null);
@@ -2286,13 +2648,12 @@ export default function SlotDataTracker() {
         // none yet
       }
       try {
-        const r6 = await storage.get(OVERALL_SUMMARY_KEY, false);
-        if (r6 && r6.value) {
-          const val = JSON.parse(r6.value);
-          if (Array.isArray(val)) setOverallSummaries(val);
-        }
+        const { list, migrated } = await loadOverallSummariesFromStorage();
+        setOverallSummaries(list);
+        if (migrated > 0) setSaveNotice(`民レポ${migrated}日分を週ごとの保存に移行しました。`);
       } catch (e) {
-        // none yet
+        if (e && e.partial) setOverallSummaries(e.partial);
+        setSaveError(e && e.message ? e.message : "民レポの読み込みに失敗しました。");
       } finally {
         setOverallSummariesLoaded(true);
       }
@@ -2343,6 +2704,15 @@ export default function SlotDataTracker() {
         setRawFullTableStatus({ type: "error", msg: `アナスロの生データ読み込み中に予期しないエラーが発生しました：${e && e.message ? e.message : "不明なエラー"}` });
       } finally {
         setRawFullTableLoaded(true);
+      }
+      try {
+        const rAlias = await storage.get(MODEL_ALIASES_KEY, false);
+        if (rAlias && rAlias.value) {
+          const val = JSON.parse(rAlias.value);
+          if (val && typeof val === "object" && !Array.isArray(val)) setModelAliases(val);
+        }
+      } catch (e) {
+        // none yet
       }
       try {
         const r7 = await storage.get(UNDO_HISTORY_KEY, false);
@@ -2423,24 +2793,32 @@ export default function SlotDataTracker() {
     setOfficialNameInput("");
   }, [activePageId]);
 
-  const persistPages = useCallback(async (next) => {
-    setPages(next);
+  // v6.43: 先に画面を更新し、保存に失敗したら元に戻して赤いバナーで知らせる。
+  // 成功したかどうかをtrue/falseで返す（呼び出し側は「保存しました」を成功時だけ出す）。
+  const commitState = useCallback(async (label, getPrev, setter, write, next) => {
+    const prevVal = getPrev();
+    setter(next);
     try {
-      await storage.set(PAGES_KEY, JSON.stringify(next), false);
+      await write(next);
+      return true;
     } catch (e) {
-      // ignore
+      if (getPrev() === next || getPrev() === undefined) setter(prevVal === undefined ? [] : prevVal);
+      setSaveError(`${label}の保存に失敗しました：${e && e.message ? e.message : "不明なエラー"}（画面の表示は元に戻しました）`);
+      return false;
     }
   }, []);
 
-  const persistPageHistory = useCallback(async (pageId, next) => {
-    setPageHistories((prev) => ({ ...prev, [pageId]: next }));
-    try {
-      const res = await storage.set(historyKey(pageId), JSON.stringify(next), false);
-      if (!res) setStatus({ type: "error", msg: "保存に失敗しました。もう一度お試しください。" });
-    } catch (e) {
-      setStatus({ type: "error", msg: "保存中にエラーが発生しました。" });
-    }
-  }, []);
+  const persistModelAliases = useCallback((next) => commitState("機種名の別名", () => latestRef.current.modelAliases, setModelAliases, (v) => storage.set(MODEL_ALIASES_KEY, JSON.stringify(v), false), next), []);
+
+  const persistPages = useCallback((next) => commitState("ページ設定", () => latestRef.current.pages, setPages, (v) => storage.set(PAGES_KEY, JSON.stringify(v), false), next), []);
+
+  const persistPageHistory = useCallback((pageId, next) => commitState(
+    "台データ",
+    () => (latestRef.current.pageHistories || {})[pageId],
+    (val) => setPageHistories((prev) => ({ ...prev, [pageId]: val })),
+    (v) => storage.set(historyKey(pageId), JSON.stringify(v), false),
+    next
+  ), []);
 
   // v6.7: 新しいページ登録・正式名称の設定/変更のたびに呼ばれ、アナスロに
   // すでに貯まっている過去日について、その正式名称に一致する機種名の行を
@@ -2657,87 +3035,40 @@ export default function SlotDataTracker() {
     setFullTableDuplicateCheckResults(pairs);
   }, []);
 
-  const persistPageRecommends = useCallback(async (pageId, next) => {
-    setPageRecommends((prev) => ({ ...prev, [pageId]: next }));
-    try {
-      await storage.set(recommendKey(pageId), JSON.stringify(next), false);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
+  const persistPageRecommends = useCallback((pageId, next) => commitState(
+    "おすすめ機種期間",
+    () => (latestRef.current.pageRecommends || {})[pageId],
+    (val) => setPageRecommends((prev) => ({ ...prev, [pageId]: val })),
+    (v) => storage.set(recommendKey(pageId), JSON.stringify(v), false),
+    next
+  ), []);
 
-  const persistOverallRecommends = useCallback(async (next) => {
-    setOverallRecommends(next);
-    try {
-      await storage.set(OVERALL_RECOMMEND_KEY, JSON.stringify(next), false);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
+  const persistOverallRecommends = useCallback((next) => commitState("おすすめ機種", () => latestRef.current.overallRecommends, setOverallRecommends, (v) => storage.set(OVERALL_RECOMMEND_KEY, JSON.stringify(v), false), next), []);
 
-  const persistEventNames = useCallback(async (next) => {
-    setEventNames(next);
-    try {
-      await storage.set(EVENT_NAMES_KEY, JSON.stringify(next), false);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
+  const persistEventNames = useCallback((next) => commitState("イベント名", () => latestRef.current.eventNames, setEventNames, (v) => storage.set(EVENT_NAMES_KEY, JSON.stringify(v), false), next), []);
 
-  const persistStrongEvents = useCallback(async (next) => {
-    setStrongEvents(next);
-    try {
-      await storage.set(STRONG_EVENTS_KEY, JSON.stringify(next), false);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
+  const persistStrongEvents = useCallback((next) => commitState("強いイベント", () => latestRef.current.strongEvents, setStrongEvents, (v) => storage.set(STRONG_EVENTS_KEY, JSON.stringify(v), false), next), []);
 
-  const persistSemiEvents = useCallback(async (next) => {
-    setSemiEvents(next);
-    try {
-      await storage.set(SEMI_EVENTS_KEY, JSON.stringify(next), false);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
+  const persistSemiEvents = useCallback((next) => commitState("準イベント", () => latestRef.current.semiEvents, setSemiEvents, (v) => storage.set(SEMI_EVENTS_KEY, JSON.stringify(v), false), next), []);
 
-  const persistClosedDays = useCallback(async (next) => {
-    setClosedDays(next);
-    try {
-      await storage.set(CLOSED_DAYS_KEY, JSON.stringify(next), false);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
+  const persistClosedDays = useCallback((next) => commitState("店休日", () => latestRef.current.closedDays, setClosedDays, (v) => storage.set(CLOSED_DAYS_KEY, JSON.stringify(v), false), next), []);
 
-  const persistDateEventMap = useCallback(async (next) => {
-    setDateEventMap(next);
-    try {
-      await storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
+  const persistDateEventMap = useCallback((next) => commitState("イベント登録", () => latestRef.current.dateEventMap, setDateEventMap, (v) => storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(v), false), next), []);
 
-  const persistOverallSummaries = useCallback(async (next) => {
-    setOverallSummaries(next);
-    try {
-      await storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false);
-    } catch (e) {
-      // ignore
-    }
-  }, []);
+  const persistOverallSummaries = useCallback((next) => commitState("民レポ", () => latestRef.current.overallSummaries, setOverallSummaries, (v) => writeOverallSummariesToStorage(v), next), []);
 
   // ---- undo history: call this with the CURRENT (about-to-be-overwritten)
   //      value right before any destructive write, so it can be restored
   //      with one click later. Shown in a fixed panel regardless of tab. ----
-  const persistUndoHistory = useCallback(async (next) => {
+  const persistUndoHistory = useCallback(async (nextIn) => {
+    // v6.43: 操作履歴は古い値を丸ごと持つので、1MBを超えないよう古い順に捨てる
+    let next = nextIn;
+    while (next.length > 1 && byteLength(JSON.stringify(next)) > 900000) next = next.slice(0, -1);
     setUndoHistory(next);
     try {
       await storage.set(UNDO_HISTORY_KEY, JSON.stringify(next), false);
     } catch (e) {
-      // ignore
+      setSaveError(`操作履歴の保存に失敗しました：${e && e.message ? e.message : "不明なエラー"}`);
     }
   }, []);
 
@@ -2754,6 +3085,8 @@ export default function SlotDataTracker() {
       setPages(value || []);
     } else if (storageKey === OVERALL_SUMMARY_KEY) {
       setOverallSummaries(value || []);
+    } else if (storageKey === MODEL_ALIASES_KEY) {
+      setModelAliases(value || {});
     } else if (storageKey === CLOSED_DAYS_KEY) {
       setClosedDays(value || []);
     } else if (storageKey === STRONG_EVENTS_KEY) {
@@ -2775,9 +3108,14 @@ export default function SlotDataTracker() {
 
   async function handleRestoreUndo(entry) {
     try {
-      await storage.set(entry.storageKey, JSON.stringify(entry.previousValue), false);
+      if (entry.storageKey === OVERALL_SUMMARY_KEY) {
+        await writeOverallSummariesToStorage(entry.previousValue || []);
+      } else {
+        await storage.set(entry.storageKey, JSON.stringify(entry.previousValue), false);
+      }
     } catch (e) {
-      // ignore, still update local state below so the user sees the restore
+      setSaveError(`元に戻す保存に失敗しました：${e && e.message ? e.message : "不明なエラー"}`);
+      return;
     }
     applyRestoredValue(entry.storageKey, entry.previousValue);
     persistUndoHistory(undoHistory.filter((h) => h.id !== entry.id));
@@ -2802,12 +3140,18 @@ export default function SlotDataTracker() {
       ...overallSummaries.filter((s) => s.date !== overallDate),
       { date: overallDate, event: eventForDate, modelRows, digitRows },
     ];
-    persistOverallSummaries(next);
-    setOverallStatus({
-      type: "ok",
-      msg: `${overallDate} のデータを保存しました（機種${modelRows.length}件・末尾${digitRows.length}件）。`,
+    persistOverallSummaries(next).then((ok) => {
+      if (!ok) {
+        setOverallStatus({ type: "error", msg: `${overallDate} の保存に失敗しました。上の赤い表示を確認してください。` });
+        return;
+      }
+      checkDriftAfterSave(overallDate, next, rawFullTableRef.current);
+      setOverallStatus({
+        type: "ok",
+        msg: `${overallDate} のデータを保存しました（機種${modelRows.length}件・末尾${digitRows.length}件）。`,
+      });
+      setOverallPasteText("");
     });
-    setOverallPasteText("");
   }
 
   function handleDeleteOverall(date) {
@@ -2938,6 +3282,7 @@ export default function SlotDataTracker() {
       overallSummaries,
       rawFullTable,
       eventNames,
+      modelAliases,
     };
     const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -2957,7 +3302,7 @@ export default function SlotDataTracker() {
     async (date, name) => {
       setDateEventMap((prev) => {
         const next = { ...prev, [date]: name };
-        storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch(() => {});
+        storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch((e) => setSaveError(`イベント登録の保存に失敗しました：${e && e.message ? e.message : "不明"}`));
         return next;
       });
       // retroactively patch every OTHER page's already-saved record for this
@@ -2977,7 +3322,7 @@ export default function SlotDataTracker() {
         const nextHist = hist.map((h, i) => (i === idx ? { ...h, event: name } : h));
         loadedHistoryRef.current.add(p.id);
         setPageHistories((prev) => ({ ...prev, [p.id]: nextHist }));
-        storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch(() => {});
+        storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch((e) => setSaveError(`台データの保存に失敗しました：${e && e.message ? e.message : "不明"}`));
       }
       // also patch 全体データ（機種別サマリー・末尾別データ）— this was missing,
       // so events registered/edited after an overall-data day was saved never
@@ -2986,7 +3331,7 @@ export default function SlotDataTracker() {
         const idx = prevSummaries.findIndex((s) => s.date === date);
         if (idx === -1 || prevSummaries[idx].event === name) return prevSummaries;
         const next = prevSummaries.map((s, i) => (i === idx ? { ...s, event: name } : s));
-        storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false).catch(() => {});
+        writeOverallSummariesToStorage(next).catch((e) => setSaveError(`民レポの保存に失敗しました：${e && e.message ? e.message : "不明"}`));
         return next;
       });
     },
@@ -3228,11 +3573,40 @@ export default function SlotDataTracker() {
 
   const closedDateSet = useMemo(() => new Set(closedDays.map((c) => c.date)), [closedDays]);
   CURRENT_CLOSED_DATES = closedDateSet; // v6.42: 予想対象日の計算用
+  latestRef.current = { pages, pageHistories, pageRecommends, overallRecommends, eventNames, strongEvents, semiEvents, closedDays, dateEventMap, overallSummaries, modelAliases };
+  CURRENT_MODEL_ALIASES = modelAliases;
 
   // v6.7: アナスロの保存本体。1週間1キーへの複数日連続保存で途中の日付が
   // 消える競合状態対策として、①ref をawaitの前に同期更新する、②同じ週
   // キーへの書き込みは必ずキューで順番待ちさせる、の両方を行う（雑餉隈で
   // 実際にこれでデータを消失した事故があったための対策）。
+  // v6.44: 民レポ・アナスロのどちらかを保存した直後に、その日のずれを調べる。
+  // ずれていたら黄色の警告、ずれていなければ「名前は違うが同じ台」の別名を条件つきで自動登録する。
+  const checkDriftAfterSave = useCallback((date, overallList, rawTable) => {
+    const o = overallList.find((x) => x.date === date);
+    const rows = rawTable[date];
+    if (!o || !rows || rows.length === 0) return;
+    const c = compareMinrepoAnaslo(o, rows);
+    const level = driftLevel(c);
+    if (level === "warn" || level === "bad") {
+      const dt = computeDriftTable(overallList, rawTable)[date];
+      setSaveWarn(`${date}：民レポとアナスロが${level === "bad" ? "大きく" : "少し"}ずれています（1台あたり約${Math.round(c.err)}枚）。日付の取り違えがないか確認してください。` + (dt && dt.guess ? `（このデータは ${dt.guess} の民レポとぴったり合います）` : ""));
+      return;
+    }
+    if (level === "ok") {
+      const rec = reconcileSameDay(o, rows);
+      const add = {};
+      rec.varietyAliases.forEach((v) => {
+        const k = normalizeModelNameForMatch(v.anasloName);
+        if (!(latestRef.current.modelAliases || {})[k]) add[k] = v.minrepoName;
+      });
+      if (Object.keys(add).length > 0) {
+        persistModelAliases({ ...(latestRef.current.modelAliases || {}), ...add });
+        setSaveNotice(`機種名の別名を登録しました：${Object.entries(add).map(([k, v]) => `${k}→${v}`).join("、")}`);
+      }
+    }
+  }, [persistModelAliases]);
+
   const handleSaveFullTable = useCallback(async (options) => {
     const force = options && options.force;
     if (closedDateSet.has(fullTableDate)) {
@@ -3332,13 +3706,21 @@ export default function SlotDataTracker() {
       updatedPageCount += 1;
     }
 
+    {
+      // v6.44: 同じ台番号が2回以上入っていないか（二重に貼り付けると台数も差枚も倍になる）
+      const seenNos = new Set();
+      let dup = 0;
+      rows.forEach((r) => { if (seenNos.has(r.no)) dup += 1; seenNos.add(r.no); });
+      if (dup > 0) setSaveWarn(`${fullTableDate}：台番号が重複している行が${dup}件あります。同じ表を二重に貼り付けていませんか？（保存はしましたが台数・差枚が倍になっている可能性があります）`);
+    }
+    checkDriftAfterSave(fullTableDate, latestRef.current.overallSummaries || [], nextRaw);
     setFullTableStatus({
       type: "ok",
       msg: `${fullTableDate} のデータを保存しました（全${rows.length}台分、うち${updatedPageCount}ページに反映）。`,
     });
     setFullTablePasteText("");
     setFullTableDate(addDays(fullTableDate, -1));
-  }, [fullTablePasteText, fullTableDate, pages, pageHistories, dateEventMap, closedDateSet, persistPageHistory]);
+  }, [fullTablePasteText, fullTableDate, pages, pageHistories, dateEventMap, closedDateSet, persistPageHistory, checkDriftAfterSave]);
 
   // this PAGE's own recommend periods, for its own machines' predictions
   const recommendDateSet = useMemo(() => {
@@ -4474,6 +4856,41 @@ export default function SlotDataTracker() {
     () => [...overallSummaries].sort((a, b) => a.date.localeCompare(b.date)),
     [overallSummaries]
   );
+  // v6.44: 民レポとアナスロのずれ・台数不一致・怪しい別名
+  const driftTable = useMemo(() => computeDriftTable(overallSummaries, rawFullTable), [overallSummaries, rawFullTable, modelAliases]);
+  const countMismatchHistory = useMemo(() => computeCountMismatchHistory(overallSummaries, rawFullTable), [overallSummaries, rawFullTable, modelAliases]);
+  const suspiciousAliases = useMemo(
+    () => Object.entries(modelAliases).filter(([k, v]) => !namesSimilar(k, v)).map(([k, v]) => ({ key: k, value: v })),
+    [modelAliases]
+  );
+  // 名前違いの候補（ずれが無い日だけから集める）
+  const aliasSuggestions = useMemo(() => {
+    const seen = new Map();
+    overallSummaries.forEach((o) => {
+      const rows = rawFullTable[o.date];
+      if (!rows || rows.length === 0) return;
+      const d = driftTable[o.date];
+      if (!d || d.level !== "ok") return;
+      reconcileSameDay(o, rows).suggestions.forEach((sg) => {
+        const k = normalizeModelNameForMatch(sg.anasloName);
+        if (modelAliases[k]) return;
+        const key = `${k}=>${sg.minrepoName}`;
+        if (!seen.has(key)) seen.set(key, { ...sg, key: k, dates: [] });
+        seen.get(key).dates.push(o.date);
+      });
+    });
+    return Array.from(seen.values());
+  }, [overallSummaries, rawFullTable, driftTable, modelAliases]);
+  const driftBadDates = useMemo(
+    () => Object.entries(driftTable).filter(([, v]) => v.level === "warn" || v.level === "bad").sort((a, b) => b[0].localeCompare(a[0])),
+    [driftTable]
+  );
+  const driftOnlyOneSide = useMemo(() => {
+    const o = new Set(overallSummaries.map((x) => x.date));
+    const a = new Set(Object.keys(rawFullTable));
+    return { onlyMinrepo: [...o].filter((d) => !a.has(d)).length, onlyAnaslo: [...a].filter((d) => !o.has(d)).length };
+  }, [overallSummaries, rawFullTable]);
+
 
   // every model name that has ever appeared in a 機種別サマリー snapshot —
   // used as autocomplete options for 正式名称 and for the model-name-based
@@ -4990,7 +5407,7 @@ export default function SlotDataTracker() {
       } else {
         delete next[date];
       }
-      storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch(() => {});
+      storage.set(DATE_EVENT_MAP_KEY, JSON.stringify(next), false).catch((e) => setSaveError(`イベント登録の保存に失敗しました：${e && e.message ? e.message : "不明"}`));
       return next;
     });
     for (const p of pages) {
@@ -5008,13 +5425,13 @@ export default function SlotDataTracker() {
       const nextHist = hist.map((h, i) => (i === idx ? { ...h, event: remainingComposite } : h));
       loadedHistoryRef.current.add(p.id);
       setPageHistories((prev) => ({ ...prev, [p.id]: nextHist }));
-      storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch(() => {});
+      storage.set(historyKey(p.id), JSON.stringify(nextHist), false).catch((e) => setSaveError(`台データの保存に失敗しました：${e && e.message ? e.message : "不明"}`));
     }
     setOverallSummaries((prevSummaries) => {
       const idx = prevSummaries.findIndex((s) => s.date === date);
       if (idx === -1 || !prevSummaries[idx].event) return prevSummaries;
       const next = prevSummaries.map((s, i) => (i === idx ? { ...s, event: remainingComposite } : s));
-      storage.set(OVERALL_SUMMARY_KEY, JSON.stringify(next), false).catch(() => {});
+      writeOverallSummariesToStorage(next).catch((e) => setSaveError(`民レポの保存に失敗しました：${e && e.message ? e.message : "不明"}`));
       return next;
     });
   }
@@ -5364,6 +5781,24 @@ export default function SlotDataTracker() {
         boxSizing: "border-box",
       }}
     >
+      {(saveError || saveNotice || saveWarn) && (
+        <div
+          style={{
+            position: "sticky", top: 0, zIndex: 50, marginBottom: "12px", padding: "10px 12px", borderRadius: "10px",
+            fontSize: "12px", fontWeight: 700, display: "flex", gap: "8px", alignItems: "flex-start", wordBreak: "break-all",
+            background: saveError ? "#3a1a1a" : saveWarn ? "#33291a" : "#16301f", border: `1px solid ${saveError ? "#7a2e2e" : saveWarn ? "#8a6a22" : "#2e7a46"}`,
+            color: saveError ? "#ff9a9a" : saveWarn ? "#f0c36a" : "#8fe0a8",
+          }}
+        >
+          <span style={{ flex: 1 }}>{saveError ? `⚠ ${saveError}` : saveWarn ? `⚠ ${saveWarn}` : `✓ ${saveNotice}`}</span>
+          <button
+            onClick={() => { setSaveError(null); setSaveNotice(null); setSaveWarn(null); }}
+            style={{ background: "transparent", border: "none", color: "inherit", cursor: "pointer", fontSize: "14px" }}
+          >
+            ×
+          </button>
+        </div>
+      )}
       <datalist id={DATALIST_ID}>
         {eventNames.map((n) => (
           <option value={n} key={n} />
@@ -5689,6 +6124,9 @@ export default function SlotDataTracker() {
                     }}>
                     <div>
                       <span className="mono">{date}</span>
+                      {driftTable[date] && (driftTable[date].level === "warn" || driftTable[date].level === "bad") && (
+                        <span style={{ marginLeft: "6px", color: driftTable[date].level === "bad" ? "#ff9a9a" : "#f0c36a", fontWeight: 700 }} title="民レポとアナスロがずれています">⚠ずれ</span>
+                      )}
                       {s && s.event && (() => {
                         const names = splitEventNames(s.event);
                         const isStrong = names.some((n) => strongEventColorByName[n]);
@@ -6363,6 +6801,128 @@ export default function SlotDataTracker() {
               {Object.keys(dateEventMap).length === 0 && (
                 <div style={{ fontSize: "11px", color: "#5a6272" }}>登録されたイベントはまだありません。</div>
               )}
+            </div>
+          </div>
+
+          {/* v6.44: 民レポとアナスロのずれチェック／機種名の別名 */}
+          <div className="card" style={{ padding: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>
+              民レポとアナスロのずれチェック
+            </div>
+            <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "10px", lineHeight: 1.6 }}>
+              同じ日の民レポとアナスロを機種ごとに突き合わせ、1台あたりの平均差枚のずれを出します（同じ日なら数十枚、違う日だと数百〜千枚以上）。日付の取り違えを見つけるためのものです。
+            </div>
+
+            {suspiciousAliases.length > 0 && (
+              <div style={{ background: "#3a1a1a", border: "1px solid #7a2e2e", borderRadius: "8px", padding: "10px", marginBottom: "10px" }}>
+                <div style={{ fontSize: "12px", fontWeight: 700, color: "#ff9a9a", marginBottom: "6px" }}>
+                  ⚠ 名前が似ていない別名があります（誤登録の可能性）
+                </div>
+                {suspiciousAliases.map((a) => (
+                  <div key={a.key} style={{ fontSize: "11px", color: "#e7e9ee", wordBreak: "break-all" }}>{a.key} → {a.value}</div>
+                ))}
+                <button
+                  onClick={() => {
+                    pushUndoEntry("怪しい別名をまとめて削除", MODEL_ALIASES_KEY, modelAliases);
+                    const bad = new Set(suspiciousAliases.map((a) => a.key));
+                    const next = {};
+                    Object.entries(modelAliases).forEach(([k, v]) => { if (!bad.has(k)) next[k] = v; });
+                    persistModelAliases(next);
+                  }}
+                  style={{ marginTop: "8px", fontSize: "11px", color: "#ff9a9a", background: "none", border: "1px solid #7a2e2e", borderRadius: "6px", padding: "4px 10px", cursor: "pointer" }}
+                >
+                  まとめて削除（操作履歴から元に戻せます）
+                </button>
+              </div>
+            )}
+
+            <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "6px" }}>
+              ずれている日（{driftBadDates.length}件）
+              <span style={{ marginLeft: "8px", fontWeight: 400, color: "#5a6272" }}>
+                民レポだけの日 {driftOnlyOneSide.onlyMinrepo}／アナスロだけの日 {driftOnlyOneSide.onlyAnaslo}
+              </span>
+            </div>
+            {driftBadDates.length === 0 && <div style={{ fontSize: "12px", color: "#5a6272", marginBottom: "10px" }}>ずれている日はありません。</div>}
+            <div className="scrollbar" style={{ maxHeight: "220px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px", marginBottom: "12px" }}>
+              {driftBadDates.map(([date, v]) => (
+                <div key={date} style={{ background: "#12161d", border: `1px solid ${v.level === "bad" ? "#7a2e2e" : "#8a6a22"}`, borderRadius: "6px", padding: "6px 8px", fontSize: "11px", display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", justifyContent: "space-between" }}>
+                  <div style={{ wordBreak: "break-all" }}>
+                    <span className="mono">{date}</span>
+                    <span style={{ marginLeft: "6px", color: v.level === "bad" ? "#ff9a9a" : "#f0c36a", fontWeight: 700 }}>
+                      {v.level === "bad" ? "大きくずれ" : "少しずれ"}（1台あたり約{Math.round(v.c.err)}枚）
+                    </span>
+                    <div style={{ color: "#8b93a3" }}>
+                      総差枚 民レポ {Math.round(v.c.mTotal).toLocaleString()}／アナスロ {Math.round(v.c.aTotal).toLocaleString()}・{v.c.mCount}台／{v.c.aCount}台
+                    </div>
+                    {v.guess && <div style={{ color: "#9ece6a" }}>→ このアナスロは {v.guess} の民レポとぴったり合います</div>}
+                  </div>
+                  <button
+                    onClick={() => {
+                      const s0 = overallSummaries.find((x) => x.date === date);
+                      if (s0) handleEditOverall(s0);
+                      loadFullTableForDate(date);
+                    }}
+                    style={{ fontSize: "11px", color: "#7aa2f7", background: "none", border: "1px solid #2a323f", borderRadius: "6px", padding: "3px 8px", cursor: "pointer" }}
+                  >
+                    入力欄に読み込む
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "6px" }}>機種名の別名</div>
+            {aliasSuggestions.length > 0 && (
+              <div style={{ marginBottom: "8px" }}>
+                <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "4px" }}>名前違いの候補（台数と平均差枚が一致するもの）</div>
+                {aliasSuggestions.map((sg) => (
+                  <div key={sg.key + sg.minrepoName} style={{ display: "flex", flexWrap: "wrap", gap: "6px", alignItems: "center", fontSize: "11px", marginBottom: "4px", wordBreak: "break-all" }}>
+                    <span>アナスロ「{sg.anasloName}」＝ 民レポ「{sg.minrepoName}」（{sg.count}台・{sg.dates.length}日）</span>
+                    <button
+                      onClick={() => persistModelAliases({ ...modelAliases, [sg.key]: sg.minrepoName })}
+                      style={{ fontSize: "11px", color: "#9ece6a", background: "none", border: "1px solid #2a323f", borderRadius: "6px", padding: "3px 8px", cursor: "pointer" }}
+                    >
+                      同じ機種として登録
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            {Object.keys(modelAliases).length === 0 && aliasSuggestions.length === 0 && (
+              <div style={{ fontSize: "12px", color: "#5a6272", marginBottom: "8px" }}>登録された別名はありません。</div>
+            )}
+            {Object.entries(modelAliases).map(([k, v]) => (
+              <div key={k} style={{ display: "flex", gap: "6px", alignItems: "center", fontSize: "11px", marginBottom: "4px", wordBreak: "break-all" }}>
+                <span style={{ flex: 1 }}>{k} → {v}</span>
+                <button
+                  onClick={() => {
+                    pushUndoEntry(`別名 ${k} を削除`, MODEL_ALIASES_KEY, modelAliases);
+                    const next = { ...modelAliases };
+                    delete next[k];
+                    persistModelAliases(next);
+                  }}
+                  style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }}
+                  title="この別名を削除"
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+            ))}
+
+            <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", margin: "12px 0 6px" }}>
+              台数が合わない機種（{countMismatchHistory.length}機種）
+            </div>
+            {countMismatchHistory.length === 0 && <div style={{ fontSize: "12px", color: "#5a6272" }}>台数が合わない機種はありません。</div>}
+            <div className="scrollbar" style={{ maxHeight: "200px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+              {countMismatchHistory.map((m) => (
+                <div key={m.name} style={{ background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "6px 8px", fontSize: "11px", wordBreak: "break-all" }}>
+                  <div style={{ fontWeight: 700 }}>{m.name}</div>
+                  {m.runs.slice(-4).map((r) => (
+                    <div key={r.start} style={{ color: "#8b93a3" }}>
+                      {r.start === r.end ? r.start : `${r.start}〜${r.end}`}：民レポ {r.mCount}台／アナスロ {r.aCount}台{r.combo ? `（民レポの「${r.combo}」と合わせると合うかも）` : ""}
+                    </div>
+                  ))}
+                </div>
+              ))}
             </div>
           </div>
 
