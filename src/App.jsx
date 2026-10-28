@@ -29,6 +29,10 @@ import {
 } from "lucide-react";
 import { storage as rawStorage } from "./storage";
 
+// v6.49: タブ（ページ）の並び替え（共通設定の▲▼・各ページ名の横の◀▶）／スプレッドシートに色付け（共通設定の一番上・ロック中も可。全ページ一括でS〜Dのランクを書き出す）。
+// v6.48: 台番号→機種の対応を覚える条件を厳しくした（同じ日のアナスロと差枚が6割以上一致した時だけ）。
+// v6.48: 個別台データの取り消し（個別入力カードに登録済み一覧と取り消しボタン。アナスロ由来の台は消さない・操作履歴で元に戻せる）。
+// v6.47: 民レポ個別台の貼り付けで、BB・RBの無い4列（台番／差枚／G数／出率）の表も読めるように修正（SAO2で「形式が違う」と弾かれていた）。
 // v6.46: 機種プルダウン（正式名称・おすすめ機種期間・イベント対象機種。台数の多い順、表記ゆれは1つに、手入力も残す）。
 //        イベント対象機種：📅イベント登録で日付ごとに対象機種を指定（slot-date-event-targets-v1、タグをタップで編集）、
 //        「🎯いつも同じ対象機種のイベント」カード（slot-event-targets-v1）。全体データのマトリクスで対象機種のセルを黄色に、
@@ -690,7 +694,9 @@ const DIGIT7_COLOR = "#f6a04d";
 // いた。正しくはコンポーネント全体で使っているdateEventMap（state）を
 // 参照するのが意図だったので、`dateEventMap[tomorrowDate]`に修正。修正後、
 // 同じ統合テストでエラーなく最後まで描画できることを確認。
-const APP_VERSION = "6.46";
+const APP_VERSION = "6.49";
+const SHEET_COLOR_SCRIPT = "/**\n * プラザ本店II トラッカー → 台番の配置図に色をつける（Google Apps Script）\n * 使い方\n *   1) アプリの「🔧 共通設定」→「🎨 スプレッドシートに色付け」で「②ランクをコピー」\n *   2) スプレッドシートに「ランク」というタブを作り、A1 に貼り付け（毎回、前の分に上書き）\n *   3) メニュー「🎨 プラザ」→「ランクの色をつける」\n * 配置図の「数字だけのマス」で、台番がランク表にあるマスの背景色だけを変えます。\n * 行・列は増やしません。罫線・文字・太字はそのまま。台番以外のマス（My、喰種 などの文字）は触りません。\n */\nconst LAYOUT_SHEET = '';          // 配置図のタブ名。空なら「ランク」以外で一番左のタブ\nconst RANK_SHEET = 'ランク';      // アプリの書き出しを貼るタブ\nconst COLORS = {                  // ランクの色（好みで変更可）\n  S: '#ff6b6b', // 赤\n  A: '#ffa94d', // オレンジ\n  B: '#ffe066', // 黄色\n  C: '#8ce99a', // 緑\n  D: '#a5d8ff', // 水色\n  E: '#ced4da', // 灰色\n};\nconst RESET_COLOR = '#ffffff';    // ランク表に無い台番のマスの色（前回の色を消す）。消したくなければ null\nconst MIN_NO = 50, MAX_NO = 999;   // 台番とみなす数字の範囲（プラザは68〜860番台。年号の2026などを塗らないため）\n\nfunction onOpen() {\n  SpreadsheetApp.getUi().createMenu('🎨 プラザ')\n    .addItem('ランクの色をつける', 'colorByRank')\n    .addItem('色を消す（台番のマスだけ）', 'clearRankColors')\n    .addToUi();\n}\n\nfunction layoutSheet_() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  if (LAYOUT_SHEET) return ss.getSheetByName(LAYOUT_SHEET);\n  return ss.getSheets().find(function (s) { return s.getName() !== RANK_SHEET; });\n}\n\nfunction readRanks_() {\n  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RANK_SHEET);\n  if (!sh) throw new Error('「' + RANK_SHEET + '」タブがありません。作ってアプリの書き出しを貼ってください。');\n  const vals = sh.getDataRange().getValues();\n  const map = {};\n  vals.forEach(function (r) {\n    const no = parseInt(String(r[0]).trim(), 10);\n    const g = String(r[1]).trim().toUpperCase();\n    if (no && COLORS[g]) map[no] = g;\n  });\n  return map;\n}\n\nfunction isNo_(v) {\n  const t = String(v).trim();\n  if (!/^\\d+$/.test(t)) return null;\n  const n = parseInt(t, 10);\n  return n >= MIN_NO && n <= MAX_NO ? n : null;\n}\n\nfunction paint_(ranks) {\n  const sh = layoutSheet_();\n  const rg = sh.getDataRange();\n  const vals = rg.getValues();\n  const bgs = rg.getBackgrounds();\n  let hit = 0, reset = 0;\n  for (let i = 0; i < vals.length; i++) {\n    for (let j = 0; j < vals[i].length; j++) {\n      const no = isNo_(vals[i][j]);\n      if (no === null) continue;\n      const g = ranks ? ranks[no] : null;\n      if (g) { bgs[i][j] = COLORS[g]; hit++; }\n      else if (RESET_COLOR !== null) { bgs[i][j] = RESET_COLOR; reset++; }\n    }\n  }\n  rg.setBackgrounds(bgs);\n  return { sheet: sh.getName(), hit: hit, reset: reset };\n}\n\nfunction colorByRank() {\n  const ranks = readRanks_();\n  const n = Object.keys(ranks).length;\n  if (!n) { SpreadsheetApp.getUi().alert('「' + RANK_SHEET + '」にランクが見つかりません（A列＝台番、B列＝S〜D）。'); return; }\n  const r = paint_(ranks);\n  SpreadsheetApp.getActiveSpreadsheet().toast('「' + r.sheet + '」の ' + r.hit + ' マスに色をつけました（ランク表 ' + n + ' 台）', '🎨 プラザ', 5);\n}\n\nfunction clearRankColors() {\n  const r = paint_(null);\n  SpreadsheetApp.getActiveSpreadsheet().toast('「' + r.sheet + '」の台番 ' + r.reset + ' マスの色を消しました', '🎨 プラザ', 5);\n}\n";
+const SHEET_COLOR_NAMES = { S: "赤", A: "オレンジ", B: "黄", C: "緑", D: "水色" };
 
 const RANGE_OPTIONS = [
   { key: 10, label: "10日足" },
@@ -1237,8 +1243,10 @@ function parseMinRepoIndividualTable(text, modelName) {
   const rows = [];
   for (const line of lines) {
     if (line.startsWith("台番")) continue; // header row（表の途中で繰り返される）
-    const cols = line.split("\t").map((c) => c.trim());
-    if (cols.length < 6) continue;
+    let cols = line.split("\t").map((c) => c.trim());
+    // v6.47: 台番／差枚／G数／出率の4列だけの表（BB・RBなし。SAO2など）も読む。タブが無く空白区切りで貼られた場合も読む。
+    if (cols.length < 4) cols = line.split(/\s+/).map((c) => c.trim());
+    if (cols.length < 4) continue;
     const [noStr, sadaStr, gsuStr, shutsuStr, bbStr, rbStr, gouseiStr, bbRateStr, rbRateStr] = cols;
     if (noStr === "平均") continue;
     const no = parseInt(String(noStr).replace(/,/g, ""), 10);
@@ -2583,6 +2591,9 @@ export default function SlotDataTracker() {
   //      irregular entries, one snapshot per date ----
   const [overallSummaries, setOverallSummaries] = useState([]); // [{date,event,modelRows,digitRows}]
   const [overallSummariesLoaded, setOverallSummariesLoaded] = useState(false);
+  const [rankBusy, setRankBusy] = useState(false); // v6.49: スプレッドシート色付け
+  const [rankExport, setRankExport] = useState(null);
+  const [rankCopyMsg, setRankCopyMsg] = useState("");
   const [saveError, setSaveError] = useState(null); // v6.43: 保存失敗の赤いバナー
   const [saveWarn, setSaveWarn] = useState(null); // v6.44: ずれ警告（黄）
   const [eventTargets, setEventTargets] = useState({}); // v6.46
@@ -2654,6 +2665,7 @@ export default function SlotDataTracker() {
   const [minRepoIndividualDate, setMinRepoIndividualDate] = useState(todayStr());
   const [minRepoIndividualPasteText, setMinRepoIndividualPasteText] = useState("");
   const [minRepoIndividualStatus, setMinRepoIndividualStatus] = useState(null);
+  const [confirmDeleteIndividual, setConfirmDeleteIndividual] = useState(null); // v6.48: "date|modelName"
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteDate, setConfirmDeleteDate] = useState(null);
   const [dateListOpen, setDateListOpen] = useState(true);
@@ -3117,18 +3129,27 @@ export default function SlotDataTracker() {
     let learnedMsg = "";
     {
       const nos = new Set(rows.map((r) => r.no));
-      const dates = Object.keys(rawFullTable).sort().reverse();
       const add = {};
-      for (const d of dates) {
-        const day = rawFullTable[d];
-        const hit = day.filter((r) => nos.has(r.no));
-        if (hit.length === 0) continue;
-        hit.forEach((a) => {
-          if (modelNamesMatch(a.modelName, modelName)) return;
-          const sameNameCount = day.filter((x) => modelNamesMatch(x.modelName, a.modelName)).length;
-          if (sameNameCount > nos.size) add[a.no] = { model: modelName, anasloName: a.modelName };
+      // 誤登録対策：同じ日のアナスロがあり、個別入力の差枚とほぼ一致する台が6割以上ある時だけ覚える
+      // （日付やページを取り違えて貼った時に、別の機種の台番号を覚えてしまわないため）
+      const day = rawFullTable[minRepoIndividualDate];
+      if (day && day.length > 0) {
+        const byNo = new Map(day.map((r) => [r.no, r]));
+        const sadaOf = new Map(rows.map((r) => [r.no, r.sada]));
+        let comparable = 0, close = 0;
+        sadaOf.forEach((sd, no) => {
+          const a = byNo.get(no);
+          if (!a || a.sada === null || a.sada === undefined || sd === null) return;
+          comparable += 1;
+          if (Math.abs(a.sada - sd) <= Math.max(30, Math.abs(sd) * 0.03)) close += 1;
         });
-        break;
+        if (comparable > 0 && close / comparable >= 0.6) {
+          day.filter((r) => nos.has(r.no)).forEach((a) => {
+            if (modelNamesMatch(a.modelName, modelName)) return;
+            const sameNameCount = day.filter((x) => modelNamesMatch(x.modelName, a.modelName)).length;
+            if (sameNameCount > nos.size) add[a.no] = { model: modelName, anasloName: a.modelName };
+          });
+        }
       }
       const addKeys = Object.keys(add).filter((k) => !noModelMap[k] || noModelMap[k].model !== add[k].model);
       if (addKeys.length > 0) {
@@ -3546,6 +3567,18 @@ export default function SlotDataTracker() {
     persistPages(next);
     setActivePageId(next[next.length - 1].id);
     setViewMode("page");
+  }
+
+  // v6.49: ページ（タブ）の並び順。dir＝-1で左（上）へ、+1で右（下）へ
+  function handleMovePage(pageId, dir) {
+    const base = latestRef.current.pages;
+    const i = base.findIndex((p) => p.id === pageId);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= base.length) return;
+    const next = [...base];
+    [next[i], next[j]] = [next[j], next[i]];
+    latestRef.current = { ...latestRef.current, pages: next }; // 連続で押しても取りこぼさない
+    persistPages(next);
   }
 
   function handleRenamePage(pageId, name) {
@@ -5060,6 +5093,85 @@ export default function SlotDataTracker() {
     return sortPickResults(computeSignalsForPage(activeMachineNumbers, sortedHistory, historyByDate, activePageRecommends, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, globalBaseRateA, pageXByDate, pageYByDate, currentPage ? currentPage.name : null, noCurrentGenerationStartDate));
   }, [activeMachineNumbers, sortedHistory, strongDateSet, semiDateSet, strongEventNameSet, semiEventNameSet, historyByDate, dateEventMap, activePageRecommends, globalBaseRateA, pageXByDate, pageYByDate, currentPage, noCurrentGenerationStartDate]);
 
+  // v6.49: スプレッドシートに色付け。全ページ分のピックアップ（ランクはプラザのS〜D）をボタンを押した時だけ計算する。
+  async function copyTextSafe(text, label) {
+    let ok = false;
+    try { if (navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(text); ok = true; } } catch (e) { ok = false; }
+    if (!ok) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch (e) { ok = false; }
+    }
+    setRankCopyMsg(ok ? `${label}をコピーしました` : `コピーできませんでした。下の枠を長押し（選択）してコピーしてください`);
+    setTimeout(() => setRankCopyMsg(""), 4000);
+  }
+  function buildRankExport() {
+    try {
+      const rows = [];
+      const used = new Set();
+      const skipped = [];
+      const count = {};
+      let targetDate = "";
+      pages.forEach((pg) => {
+        const hist = pageHistories[pg.id];
+        if (hist === undefined) { skipped.push(`${pg.name || "無題"}（読み込み中）`); return; }
+        if (!Array.isArray(hist) || hist.length === 0) return;
+        const sh = [...hist].sort((a, b) => a.date.localeCompare(b.date));
+        const lastDay = sh[sh.length - 1];
+        const active = Array.from(new Set(lastDay.machines.map((m) => m.no))).sort((a, b) => a - b);
+        const byDate = {};
+        sh.forEach((h) => { byDate[h.date] = h; });
+        const xBy = sh.length < 15 ? null : computeXForPageGenerationAware(sh);
+        const yBy = xBy ? computeXPercentiles(xBy) : null;
+        if (!yBy) { skipped.push(`${pg.name || "無題"}（データ不足）`); return; }
+        // ページの強い／準イベント日
+        const sDates = new Set(), mDates = new Set();
+        sh.forEach((h) => {
+          if (!h.event) return;
+          const names = splitEventNames(h.event);
+          if (names.some((n) => strongEventNameSet.has(n))) sDates.add(h.date);
+          else if (names.some((n) => semiEventNameSet.has(n))) mDates.add(h.date);
+        });
+        // この機種の機種別おすすめ期間
+        const own = pageRecommends[pg.id] || [];
+        let linked = [];
+        if (pg.officialName) {
+          const nameList = splitModelNameList(pg.officialName);
+          Object.keys(overallRecommends).forEach((name) => { if (nameList.some((n) => modelNamesMatch(name, n))) linked = linked.concat(overallRecommends[name] || []); });
+        }
+        const recs = linked.length > 0 ? [...own, ...linked] : own;
+        // 現在の機種名になった日
+        const mh = {};
+        sh.forEach((h) => h.machines.forEach((m) => { (mh[m.no] = mh[m.no] || []).push({ date: h.date, modelName: m.modelName }); }));
+        const startBy = {};
+        Object.entries(mh).forEach(([no, es]) => {
+          const latest = es[es.length - 1].modelName; let sd = es[es.length - 1].date;
+          for (let i = es.length - 1; i >= 0; i--) { const e = es[i]; if (!e.modelName || !latest || e.modelName !== latest) break; sd = e.date; }
+          startBy[no] = sd;
+        });
+        const picks = sortPickResults(computeSignalsForPage(active, sh, byDate, recs, sDates, mDates, strongEventNameSet, semiEventNameSet, globalBaseRateA, xBy, yBy, pg.name, startBy));
+        const t = nextOpenDate(lastDay.date);
+        if (t > targetDate) targetDate = t;
+        picks.forEach((pk) => {
+          if (!pk.grade || used.has(pk.no)) return; // 同じ台番が2ページに出たら最初の1つだけ
+          used.add(pk.no);
+          rows.push({ no: pk.no, grade: pk.grade, points: Math.round(pk.totalPoints), page: pg.name || "" });
+          count[pk.grade] = (count[pk.grade] || 0) + 1;
+        });
+      });
+      rows.sort((a, b) => a.no - b.no);
+      const text = [`台番\tランク\t点数\t機種\t予想日 ${targetDate}`, ...rows.map((r) => `${r.no}\t${r.grade}\t${r.points}\t${r.page}`)].join("\n");
+      setRankExport({ text, target: targetDate, n: rows.length, count, skipped });
+    } catch (e) {
+      setRankExport({ text: "", target: "", n: 0, count: {}, skipped: [`作成に失敗しました：${e && e.message ? e.message : e}`] });
+    }
+    setRankBusy(false);
+  }
+
   // store-wide 機種別サマリー / 末尾別データ, reusing the exact same signal
   // engine (it doesn't care whether "no" is a machine number, a model name,
   // or a last-digit label — it just needs {date, sada, gsu} per entity)
@@ -5469,6 +5581,26 @@ export default function SlotDataTracker() {
     results.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
     return results.slice(0, 20);
   }, [machineSelectorOptions, sortedHistory]);
+
+  // v6.48: 民レポ個別台データ（source:"minrepo"）の取り消し。間違った日付に貼った時用。
+  // その日・その機種の「個別入力由来の台」だけを消す（アナスロ由来の台は消さない）。操作履歴から元に戻せる。
+  async function handleDeleteIndividualEntry(pageId, date, modelName) {
+    const hist = pageHistories[pageId];
+    if (!hist) {
+      setMinRepoIndividualStatus({ type: "error", msg: "このページのデータがまだ読み込まれていません。ページを開いてからもう一度お試しください。" });
+      return;
+    }
+    const entry = hist.find((h) => h.date === date);
+    if (!entry) return;
+    const remaining = entry.machines.filter((m) => !(m.source === "minrepo" && m.modelName === modelName));
+    const removed = entry.machines.length - remaining.length;
+    if (removed === 0) return;
+    pushUndoEntry(`個別台データ ${date}（${modelName}・${removed}台）を取り消し`, historyKey(pageId), hist);
+    const nextHist = remaining.length === 0 ? hist.filter((h) => h.date !== date) : hist.map((h) => (h.date === date ? { ...h, machines: remaining } : h));
+    const ok = await persistPageHistory(pageId, nextHist);
+    setConfirmDeleteIndividual(null);
+    if (ok) setMinRepoIndividualStatus({ type: "ok", msg: `${date}（${modelName}）の個別台データ${removed}台分を取り消しました。` });
+  }
 
   function handleDeleteDate(date) {
     persistPageHistory(activePageId, currentHistory.filter((h) => h.date !== date));
@@ -6206,8 +6338,46 @@ export default function SlotDataTracker() {
 
       {viewMode === "common" ? (
         <div style={{ maxWidth: "760px" }}>
+          {/* v6.49: スプレッドシートに色付け（書き出すだけでデータは変えないのでロック中でも使える） */}
+          {pages.length > 0 && (
+            <div className="card" style={{ padding: "18px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>🎨 スプレッドシートに色付け（ピックアップのランク）</div>
+              <div style={{ fontSize: "11px", color: "#5a6272", lineHeight: 1.6, marginBottom: "8px" }}>
+                全ページのピックアップのランク（台番・ランク）を書き出します。スプレッドシートの「ランク」タブのA1に貼り、メニュー「🎨 プラザ → ランクの色をつける」で、配置図の台番のマスに色だけつきます（行・列は増やしません）。色：{Object.entries(SHEET_COLOR_NAMES).map(([g, c]) => `${g}＝${c}`).join("・")}
+              </div>
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", margin: "8px 0" }}>
+                <button disabled={rankBusy} onClick={() => { setRankBusy(true); setTimeout(buildRankExport, 30); }} style={{ padding: "8px 12px", borderRadius: "8px", border: "1px solid #2a323f", background: "#181d27", color: "#c7cbd4", fontSize: "12px", cursor: "pointer" }}>{rankBusy ? "作成中…" : "① ランクを作る"}</button>
+                {rankExport && rankExport.text && <button onClick={() => copyTextSafe(rankExport.text, "ランク")} style={{ padding: "8px 12px", borderRadius: "8px", border: "1px solid #4fd1c5", background: "#12302d", color: "#4fd1c5", fontSize: "12px", cursor: "pointer" }}>② ランクをコピー</button>}
+                <button onClick={() => copyTextSafe(SHEET_COLOR_SCRIPT, "スクリプト")} style={{ padding: "8px 12px", borderRadius: "8px", border: "1px solid #2a323f", background: "transparent", color: "#8b93a3", fontSize: "12px", cursor: "pointer" }}>スクリプトをコピー（初回だけ）</button>
+              </div>
+              {rankCopyMsg && <div style={{ fontSize: "12px", color: "#9ece6a", marginBottom: "6px" }}>{rankCopyMsg}</div>}
+              {rankExport && rankExport.skipped.length > 0 && <div style={{ fontSize: "11px", color: "#e8b34c", marginBottom: "6px" }}>除外：{rankExport.skipped.join("、")}（少し待ってからもう一度「①」を押してください）</div>}
+              {rankExport && rankExport.text && (
+                <div>
+                  <div style={{ fontSize: "12px", color: "#c7cbd4", marginBottom: "6px" }}>予想日 {rankExport.target}：{rankExport.n}台（{["S", "A", "B", "C", "D"].filter((g) => rankExport.count[g]).map((g) => `${g}${rankExport.count[g]}`).join("・")}）</div>
+                  <textarea readOnly value={rankExport.text} onFocus={(e) => e.target.select()} style={{ width: "100%", boxSizing: "border-box", height: "90px", fontSize: "11px", background: "#12161d", color: "#c7cbd4", border: "1px solid #2a323f", borderRadius: "6px", fontFamily: "monospace" }} />
+                </div>
+              )}
+            </div>
+          )}
           {unlocked ? (
             <>
+          {pages.length > 1 && (
+            <div className="card" style={{ padding: "18px" }}>
+              <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "4px", color: "#c7cbd4" }}>📑 ページ（タブ）の並び順</div>
+              <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "6px" }}>▲▼で入れ替えると、上のタブの並びがすぐ変わります。</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                {pages.map((pg, i) => (
+                  <div key={pg.id} style={{ display: "flex", alignItems: "center", gap: "6px", padding: "4px 6px", border: "1px solid #2a323f", borderRadius: "6px" }}>
+                    <span className="mono" style={{ width: "20px", color: "#5a6272", fontSize: "12px" }}>{i + 1}</span>
+                    <span style={{ flex: 1, minWidth: 0, fontSize: "13px", color: "#c7cbd4", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pg.name || "（無題）"}</span>
+                    <button aria-label={`${pg.name}を上へ`} disabled={i === 0} onClick={() => handleMovePage(pg.id, -1)} style={{ padding: "4px 12px", fontSize: "13px", borderRadius: "6px", border: "1px solid #2a323f", background: "transparent", color: "#8b93a3", cursor: "pointer", opacity: i === 0 ? 0.3 : 1 }}>▲</button>
+                    <button aria-label={`${pg.name}を下へ`} disabled={i === pages.length - 1} onClick={() => handleMovePage(pg.id, 1)} style={{ padding: "4px 12px", fontSize: "13px", borderRadius: "6px", border: "1px solid #2a323f", background: "transparent", color: "#8b93a3", cursor: "pointer", opacity: i === pages.length - 1 ? 0.3 : 1 }}>▼</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {/* v6.9.10: 民レポのデータ入力・登録済み日付一覧を「全体データ」
               タブから移動。共通設定を暗証番号解除の唯一の窓口にする整理の
               一環（各ページ・各タブに個別の解除フォームを置かない） */}
@@ -6639,6 +6809,50 @@ export default function SlotDataTracker() {
                 {minRepoIndividualStatus.msg}
               </div>
             )}
+
+            {/* v6.48: 個別入力の取り消し（間違った日付に貼った時） */}
+            {minRepoIndividualPageId && (() => {
+              const hist = pageHistories[minRepoIndividualPageId] || [];
+              const items = [];
+              hist.forEach((h) => {
+                const byModel = {};
+                h.machines.forEach((m) => { if (m.source === "minrepo") byModel[m.modelName] = (byModel[m.modelName] || 0) + 1; });
+                Object.entries(byModel).forEach(([model, n]) => items.push({ date: h.date, model, n }));
+              });
+              items.sort((a, b) => b.date.localeCompare(a.date));
+              return (
+                <div style={{ marginTop: "14px", borderTop: "1px solid #2a323f", paddingTop: "12px" }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "#c7cbd4", marginBottom: "6px" }}>
+                    個別入力の登録済み（このページ・{items.length}件）
+                    <span style={{ marginLeft: "6px", fontWeight: 400, color: "#5a6272", fontSize: "11px" }}>間違った日付に貼った時は、ここで取り消せます</span>
+                  </div>
+                  {items.length === 0 && <div style={{ fontSize: "11px", color: "#5a6272" }}>個別入力のデータはありません。</div>}
+                  <div className="scrollbar" style={{ maxHeight: "200px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "6px" }}>
+                    {items.map((it) => {
+                      const k = `${it.date}|${it.model}`;
+                      return (
+                        <div key={k} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: "6px", fontSize: "12px", background: "#12161d", border: "1px solid #232b37", borderRadius: "6px", padding: "5px 8px" }}>
+                          <span style={{ wordBreak: "break-all" }}>
+                            <span className="mono">{it.date}</span>
+                            <span style={{ marginLeft: "6px", color: "#8b93a3" }}>{it.model}・{it.n}台</span>
+                          </span>
+                          {confirmDeleteIndividual === k ? (
+                            <span style={{ display: "flex", gap: "8px" }}>
+                              <button onClick={() => handleDeleteIndividualEntry(minRepoIndividualPageId, it.date, it.model)} style={{ fontSize: "11px", color: "#e5697a", background: "none", border: "none", cursor: "pointer", fontWeight: 700 }}>取り消す</button>
+                              <button onClick={() => setConfirmDeleteIndividual(null)} style={{ fontSize: "11px", color: "#8b93a3", background: "none", border: "none", cursor: "pointer" }}>やめる</button>
+                            </span>
+                          ) : (
+                            <button onClick={() => setConfirmDeleteIndividual(k)} style={{ background: "none", border: "none", cursor: "pointer", color: "#5a6272" }} title="この個別入力を取り消す">
+                              <Trash2 size={13} />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
 
           {/* export everything for offline analysis / backtesting */}
@@ -7833,7 +8047,7 @@ export default function SlotDataTracker() {
       ) : (
         <>
       {/* machine model name (manual entry) for current page */}
-      <div style={{ marginBottom: "8px", display: "flex", alignItems: "center", gap: "8px" }}>
+      <div style={{ marginBottom: "8px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
         <Pencil size={14} color="#5a6272" />
         <input
           type="text"
@@ -7848,9 +8062,15 @@ export default function SlotDataTracker() {
             borderBottom: "1px dashed #2a323f",
             color: "#e7e9ee",
             padding: "4px 2px",
-            minWidth: "260px",
+            minWidth: "200px",
           }}
         />
+        {unlocked && pages.length > 1 && (
+          <>
+            <button disabled={pages[0] && pages[0].id === activePageId} onClick={() => handleMovePage(activePageId, -1)} title="タブを左へ" style={{ padding: "4px 8px", fontSize: "12px", borderRadius: "6px", border: "1px solid #2a323f", background: "transparent", color: "#8b93a3", cursor: "pointer" }}>◀ 左へ</button>
+            <button disabled={pages.length > 0 && pages[pages.length - 1].id === activePageId} onClick={() => handleMovePage(activePageId, 1)} title="タブを右へ" style={{ padding: "4px 8px", fontSize: "12px", borderRadius: "6px", border: "1px solid #2a323f", background: "transparent", color: "#8b93a3", cursor: "pointer" }}>右へ ▶</button>
+          </>
+        )}
       </div>
       <div style={{ marginBottom: "18px" }}>
         <div style={{ fontSize: "11px", color: "#5a6272", marginBottom: "6px" }}>
